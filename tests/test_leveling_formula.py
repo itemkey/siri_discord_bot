@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from siri_bot.leveling.formula import (
     FormulaConfig,
     first_place_changed,
+    format_progress_bar,
     is_cooldown_available,
     level_for_total_xp,
     progress_for_total_xp,
@@ -33,6 +34,11 @@ class LevelingFormulaTests(unittest.TestCase):
         self.assertEqual(progress.current_level_xp, 20)
         self.assertEqual(progress.next_level_xp, 155)
         self.assertEqual(progress.total_xp, 120)
+
+    def test_format_progress_bar(self) -> None:
+        self.assertEqual(format_progress_bar(0, 100), "░░░░░░░░░░ 0%")
+        self.assertEqual(format_progress_bar(62, 100), "██████░░░░ 62%")
+        self.assertEqual(format_progress_bar(100, 100), "██████████ 100%")
 
     def test_linear_formula(self) -> None:
         config = FormulaConfig(preset="linear", a=99, b=10, c=50)
@@ -76,4 +82,3 @@ class LevelingFormulaTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

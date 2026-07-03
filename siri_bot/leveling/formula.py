@@ -8,6 +8,7 @@ from typing import Iterable, Mapping, Sequence
 SUPPORTED_FORMULAS = {"linear", "quadratic"}
 SUPPORTED_REWARD_MODES = {"accumulative", "highest_only"}
 BOOSTER_CAP = 5.0
+DEFAULT_PROGRESS_BAR_WIDTH = 10
 
 
 @dataclass(frozen=True)
@@ -73,6 +74,17 @@ def progress_for_total_xp(total_xp: int, config: FormulaConfig) -> LevelProgress
     return LevelProgress(level=level, current_level_xp=0, next_level_xp=1, total_xp=max(0, total_xp))
 
 
+def format_progress_bar(current_xp: int, next_level_xp: int, width: int = DEFAULT_PROGRESS_BAR_WIDTH) -> str:
+    safe_width = max(1, width)
+    safe_next_level_xp = max(1, next_level_xp)
+    safe_current_xp = min(max(0, current_xp), safe_next_level_xp)
+    ratio = safe_current_xp / safe_next_level_xp
+    filled = min(safe_width, round(ratio * safe_width))
+    empty = safe_width - filled
+
+    return f"{'█' * filled}{'░' * empty} {round(ratio * 100)}%"
+
+
 def reward_roles_for_level(rewards: Sequence[tuple[int, int]], level: int, mode: str) -> set[int]:
     eligible = [(reward_level, role_id) for reward_level, role_id in rewards if reward_level <= level]
     if not eligible:
@@ -105,4 +117,3 @@ def is_cooldown_available(now: datetime, available_at: datetime | None) -> bool:
 
 def first_place_changed(previous_user_id: int | None, current_user_id: int | None) -> bool:
     return previous_user_id != current_user_id
-
