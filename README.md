@@ -12,14 +12,17 @@ Discord-бот на `discord.py`, готовый к запуску в Docker. К
 - `/remind` - напоминание в канал через заданное время.
 - `/say` - отправка сообщения в канал от имени бота. Только для админов.
 - `/purge` - удаление последних сообщений в текущем канале. Нужно право `Manage Messages`.
+- `/rank` и `/leaderboard` - leveling, XP и таблица лидеров.
+- `/leveling ...` - админ-настройки XP, формулы, role rewards, boosters и level-up сообщений.
 
 ## Настройка
 
 1. Создай приложение и бота в Discord Developer Portal.
 2. При приглашении включи scopes `bot` и `applications.commands`.
-3. Выдай нужные права: `Send Messages`, `Embed Links`, а для `/purge` ещё `Manage Messages`.
+3. Выдай нужные права: `Send Messages`, `Embed Links`, `Add Reactions`, `Read Message History`, а для `/purge`, role rewards и first place role ещё `Manage Messages` и `Manage Roles`.
 4. Скопируй `.env.example` в `.env` и заполни `DISCORD_TOKEN`.
 5. Для быстрой регистрации команд укажи `GUILD_ID` своего Discord-сервера. Без него команды будут глобальными и могут появляться до часа.
+6. Leveling использует PostgreSQL. В Docker Compose база поднимается автоматически, а данные лежат в volume `postgres-data`.
 
 ## Запуск в Docker
 
@@ -71,6 +74,8 @@ docker compose up -d --build
 docker compose logs -f discord-bot
 ```
 
+Если `.env` был создан до появления leveling, добавь в него переменные из `.env.example`: `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD` и `DATABASE_URL`.
+
 Остановка:
 
 ```bash
@@ -85,6 +90,35 @@ python -m venv .venv
 pip install -r requirements.txt
 python -m siri_bot.bot
 ```
+
+Для локального запуска leveling нужен PostgreSQL и `DATABASE_URL` в `.env`.
+
+## Leveling
+
+По умолчанию включены:
+
+- Message XP: 15-25 XP раз в 60 секунд.
+- Voice XP: 2 XP в минуту, если пользователь не один в voice и не в AFK-канале.
+- Reaction XP: 2 XP автору сообщения за реакцию другого пользователя.
+- Formula: `quadratic`, где XP до следующего уровня = `5*L^2 + 50*L + 100`.
+
+Публичные команды:
+
+- `/rank [user]`
+- `/leaderboard [page]`
+
+Основные админ-команды:
+
+- `/leveling settings`
+- `/leveling enable`
+- `/leveling formula`
+- `/leveling xp-options`
+- `/leveling first-place-role`
+- `/leveling reward add/remove/list/mode`
+- `/leveling levelup channel/message/disable`
+- `/leveling booster add/remove/list`
+- `/leveling member add-xp/set-xp/reset`
+- `/leveling reset-confirm`
 
 ## Админ-доступ
 

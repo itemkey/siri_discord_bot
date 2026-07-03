@@ -17,6 +17,9 @@ LOGGER = logging.getLogger(__name__)
 class SiriBot(commands.Bot):
     def __init__(self, settings: Settings) -> None:
         intents = discord.Intents.default()
+        intents.guild_messages = True
+        intents.reactions = True
+        intents.voice_states = True
         super().__init__(command_prefix=settings.command_prefix, intents=intents)
         self.settings = settings
         self.tree.on_error = self.on_tree_error

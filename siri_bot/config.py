@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 @dataclass(frozen=True)
 class Settings:
     token: str
+    database_url: str
     guild_id: int | None = None
     owner_id: int | None = None
     admin_role_ids: frozenset[int] = field(default_factory=frozenset)
@@ -26,6 +27,10 @@ def load_settings() -> Settings:
 
     return Settings(
         token=token,
+        database_url=os.getenv(
+            "DATABASE_URL",
+            "postgresql://siri:siri_password_change_me@localhost:5432/siri_discord_bot",
+        ).strip(),
         guild_id=_optional_int("GUILD_ID"),
         owner_id=_optional_int("OWNER_ID"),
         admin_role_ids=_int_set(os.getenv("ADMIN_ROLE_IDS", "")),
