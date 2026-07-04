@@ -83,7 +83,8 @@ class Bunker(commands.Cog):
         self.bot = bot
         self.repository = repository
         self.pool = pool
-        self._private_panels: dict[tuple[str, int, int, int], Any] = {}
+        self._setup_private_panels: dict[tuple[int, int, int], Any] = {}
+        self._game_private_panels: dict[tuple[int, int, int], Any] = {}
         self.bot.add_view(BunkerSetupIdleView(self))
         self.bot.add_view(BunkerPublicGameView(self))
         self.phase_tick.start()
@@ -203,11 +204,7 @@ class Bunker(commands.Cog):
 
     @bunker_group.command(name="settings", description="Показать настройки текущей партии.")
     async def settings_command(self, interaction: discord.Interaction) -> None:
-        game = await self._require_game_channel(interaction)
-        if game is None:
-            return
-
-        await interaction.response.send_message(embed=_settings_embed(game.settings), ephemeral=True)
+        await self.open_game_panel(interaction, screen="settings")
 
     @bunker_group.command(name="pause", description="Поставить текущую партию на паузу.")
     async def pause_command(self, interaction: discord.Interaction) -> None:
@@ -271,63 +268,146 @@ class Bunker(commands.Cog):
 
     @bunker_group.command(name="packs", description="Показать встроенный контент-пак Бункера.")
     async def packs_command(self, interaction: discord.Interaction) -> None:
-        await interaction.response.send_message(embed=_packs_embed(), ephemeral=True)
+        await self.open_game_panel(interaction, screen="packs")
 
-    async def open_game_panel(self, interaction: discord.Interaction, *, status: str | None = None) -> None:
+    async def open_game_panel(self, interaction: discord.Interaction, *, screen: str = "main", status: str | None = None) -> None:
         game = await self._game_from_interaction_channel(interaction)
         if game is None:
             await interaction.response.send_message("Эта панель работает в игровом text-канале бункера.", ephemeral=True)
             return
 
-        await self.send_or_edit_private_panel(interaction, game, status=status)
+        await self.send_or_edit_private_panel(interaction, game, screen=screen, status=status)
 
     async def send_or_edit_private_panel(
         self,
         interaction: discord.Interaction,
         game: BunkerGame,
         *,
+        screen: str = "main",
         status: str | None = None,
         embed: discord.Embed | None = None,
         view: discord.ui.View | None = None,
     ) -> None:
-        panel_key = self._private_panel_key(interaction, game)
-        players = await self.repository.list_players(game.id)
-        player = next((candidate for candidate in players if candidate.user_id == interaction.user.id), None)
-        is_operator = await self._is_bunker_operator(interaction)
-        embed = embed or _private_panel_embed(game, players, player, is_operator=is_operator, status=status)
-        view = view or BunkerPrivatePlayerPanelView(self, game, player, is_operator=is_operator)
-        active = self._private_panels.get(panel_key)
+        panel_key = self._game_panel_key(interaction, game)
+        if embed is None or view is None:
+            default_embed, default_view = await self._game_panel_payload(interaction, game, screen=screen, status=status)
+            embed = embed or default_embed
+            view = view or default_view
 
-        if active is None:
-            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-            try:
-                self._private_panels[panel_key] = await interaction.original_response()
-            except discord.HTTPException:
-                LOGGER.info("Could not remember bunker private panel.", exc_info=True)
-            return
-
-        await interaction.response.defer(ephemeral=True)
-        try:
-            await active.edit(embed=embed, view=view)
-        except discord.HTTPException:
-            message = await interaction.followup.send(embed=embed, view=view, ephemeral=True, wait=True)
-            self._private_panels[panel_key] = message
+        await self._send_or_edit_private_message(
+            interaction,
+            self._game_private_panels,
+            panel_key,
+            embed=embed,
+            view=view,
+        )
 
     async def update_current_game_panel(
         self,
         interaction: discord.Interaction,
         game: BunkerGame,
         *,
+        screen: str = "main",
         status: str | None = None,
         embed: discord.Embed | None = None,
         view: discord.ui.View | None = None,
     ) -> None:
+        if embed is None or view is None:
+            default_embed, default_view = await self._game_panel_payload(interaction, game, screen=screen, status=status)
+            embed = embed or default_embed
+            view = view or default_view
+        await interaction.response.edit_message(content=None, embed=embed, view=view)
+
+    async def _game_panel_payload(
+        self,
+        interaction: discord.Interaction,
+        game: BunkerGame,
+        *,
+        screen: str,
+        status: str | None = None,
+    ) -> tuple[discord.Embed, discord.ui.View | None]:
         players = await self.repository.list_players(game.id)
         player = next((candidate for candidate in players if candidate.user_id == interaction.user.id), None)
         is_operator = await self._is_bunker_operator(interaction)
-        embed = embed or _private_panel_embed(game, players, player, is_operator=is_operator, status=status)
-        view = view or BunkerPrivatePlayerPanelView(self, game, player, is_operator=is_operator)
-        await interaction.response.edit_message(embed=embed, view=view)
+        back_view = BunkerPanelBackView(self, game.id)
+
+        if screen == "settings":
+            embed = _settings_embed(game.settings)
+            if status:
+                embed.description = status
+            return embed, back_view
+        if screen == "rules":
+            embed = _rules_embed()
+            if status:
+                embed.set_footer(text=status)
+            return embed, back_view
+        if screen == "packs":
+            embed = _packs_embed()
+            if status:
+                embed.set_footer(text=status)
+            return embed, back_view
+        if screen == "card":
+            if player is None or player.card is None:
+                return _status_embed("Карточка появится после старта игры."), back_view
+            return discord.Embed(title="Твоя карточка Бункера", description=format_card(player.card), color=discord.Color.dark_teal()), back_view
+        if screen == "reveal":
+            if player is None:
+                return _status_embed("Ты не участник этого бункера."), back_view
+            if game.state != GameState.REVEAL_PHASE:
+                return _status_embed("Сейчас не фаза раскрытия."), back_view
+            if player.is_eliminated:
+                return _status_embed("Выгнанные игроки уже не раскрывают характеристики."), back_view
+            stats = selectable_reveal_stats(player)
+            if not stats:
+                return _status_embed("Ты уже раскрыл все обычные характеристики."), back_view
+            return _status_embed("Выбери характеристику для публичного раскрытия."), BunkerRevealView(self, game.id, interaction.user.id, stats)
+        if screen == "vote":
+            if player is None or player.is_eliminated:
+                return _status_embed("Голосовать могут только живые участники."), back_view
+            if game.state != GameState.VOTING_PHASE:
+                return _status_embed("Сейчас не фаза голосования."), back_view
+            alive_players = [candidate for candidate in players if candidate.is_alive]
+            return _status_embed("Кого выгнать из бункера?"), BunkerVoteView(self, game, alive_players, interaction.user.id)
+        if screen == "action":
+            if player is None or player.card is None:
+                return _status_embed("Спец-действие появится после выдачи карточки."), back_view
+            if player.used_special_action:
+                return _status_embed("Эта карта уже использована."), back_view
+            return _status_embed(f"Твое действие: {player.card.special_action}. Использовать сейчас?"), BunkerActionView(self, game.id, player.user_id)
+
+        return _private_panel_embed(game, players, player, is_operator=is_operator, status=status), BunkerPrivatePlayerPanelView(self, game, player, is_operator=is_operator)
+
+    async def _send_or_edit_private_message(
+        self,
+        interaction: discord.Interaction,
+        registry: dict[tuple[int, int, int], Any],
+        key: tuple[int, int, int],
+        *,
+        embed: discord.Embed,
+        view: discord.ui.View | None,
+    ) -> None:
+        active_message = registry.get(key)
+        if active_message is None:
+            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+            try:
+                registry[key] = await interaction.original_response()
+            except discord.HTTPException:
+                LOGGER.info("Could not remember bunker private panel.", exc_info=True)
+            return
+
+        if _same_discord_message(active_message, getattr(interaction, "message", None)):
+            try:
+                await interaction.response.edit_message(content=None, embed=embed, view=view)
+                return
+            except discord.HTTPException:
+                LOGGER.info("Could not edit current bunker private panel.", exc_info=True)
+
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await active_message.edit(content=None, embed=embed, view=view)
+        except discord.HTTPException:
+            message = await interaction.followup.send(embed=embed, view=view, ephemeral=True, wait=True)
+            registry[key] = message
 
     async def panel_join_game(self, interaction: discord.Interaction, game_id: int) -> None:
         game = await self.repository.get_game(game_id)
@@ -387,64 +467,35 @@ class Bunker(commands.Cog):
 
     async def panel_card(self, interaction: discord.Interaction, game_id: int) -> None:
         game = await self.repository.get_game(game_id)
-        player = await self.repository.get_player(game_id, interaction.user.id) if game else None
-        if game is None or player is None or player.card is None:
-            await interaction.response.edit_message(embed=_status_embed("Карточка появится после старта игры."), view=BunkerPanelBackView(self, game_id))
+        if game is None:
+            await interaction.response.edit_message(embed=_status_embed("Партия не найдена."), view=None)
             return
 
-        embed = discord.Embed(title="Твоя карточка Бункера", description=format_card(player.card), color=discord.Color.dark_teal())
-        await interaction.response.edit_message(embed=embed, view=BunkerPanelBackView(self, game_id))
+        await self.update_current_game_panel(interaction, game, screen="card")
 
     async def panel_reveal(self, interaction: discord.Interaction, game_id: int) -> None:
         game = await self.repository.get_game(game_id)
-        player = await self.repository.get_player(game_id, interaction.user.id) if game else None
-        if game is None or player is None:
-            await interaction.response.edit_message(embed=_status_embed("Ты не участник этого бункера."), view=BunkerPanelBackView(self, game_id))
-            return
-        if game.state != GameState.REVEAL_PHASE:
-            await interaction.response.edit_message(embed=_status_embed("Сейчас не фаза раскрытия."), view=BunkerPanelBackView(self, game_id))
+        if game is None:
+            await interaction.response.edit_message(embed=_status_embed("Партия не найдена."), view=None)
             return
 
-        stats = selectable_reveal_stats(player)
-        if not stats:
-            await interaction.response.edit_message(embed=_status_embed("Ты уже раскрыл все обычные характеристики."), view=BunkerPanelBackView(self, game_id))
-            return
-
-        await interaction.response.edit_message(
-            embed=_status_embed("Выбери характеристику для публичного раскрытия."),
-            view=BunkerRevealView(self, game.id, interaction.user.id, stats),
-        )
+        await self.update_current_game_panel(interaction, game, screen="reveal")
 
     async def panel_vote(self, interaction: discord.Interaction, game_id: int) -> None:
         game = await self.repository.get_game(game_id)
-        player = await self.repository.get_player(game_id, interaction.user.id) if game else None
-        if game is None or player is None or player.is_eliminated:
-            await interaction.response.edit_message(embed=_status_embed("Голосовать могут только живые участники."), view=BunkerPanelBackView(self, game_id))
-            return
-        if game.state != GameState.VOTING_PHASE:
-            await interaction.response.edit_message(embed=_status_embed("Сейчас не фаза голосования."), view=BunkerPanelBackView(self, game_id))
+        if game is None:
+            await interaction.response.edit_message(embed=_status_embed("Партия не найдена."), view=None)
             return
 
-        players = [candidate for candidate in await self.repository.list_players(game.id) if candidate.is_alive]
-        await interaction.response.edit_message(
-            embed=_status_embed("Кого выгнать из бункера?"),
-            view=BunkerVoteView(self, game, players, interaction.user.id),
-        )
+        await self.update_current_game_panel(interaction, game, screen="vote")
 
     async def panel_action(self, interaction: discord.Interaction, game_id: int) -> None:
         game = await self.repository.get_game(game_id)
-        player = await self.repository.get_player(game_id, interaction.user.id) if game else None
-        if game is None or player is None or player.card is None:
-            await interaction.response.edit_message(embed=_status_embed("Спец-действие появится после выдачи карточки."), view=BunkerPanelBackView(self, game_id))
-            return
-        if player.used_special_action:
-            await interaction.response.edit_message(embed=_status_embed("Эта карта уже использована."), view=BunkerPanelBackView(self, game_id))
+        if game is None:
+            await interaction.response.edit_message(embed=_status_embed("Партия не найдена."), view=None)
             return
 
-        await interaction.response.edit_message(
-            embed=_status_embed(f"Твое действие: {player.card.special_action}. Использовать сейчас?"),
-            view=BunkerActionView(self, game.id, player.user_id),
-        )
+        await self.update_current_game_panel(interaction, game, screen="action")
 
     async def panel_add_fake_players(self, interaction: discord.Interaction, game_id: int) -> None:
         if not await self._is_bunker_operator(interaction):
@@ -494,7 +545,7 @@ class Bunker(commands.Cog):
             await interaction.response.edit_message(embed=_status_embed("Партия не найдена."), view=None)
             return
 
-        await interaction.response.send_message("Закрываю временные каналы.", ephemeral=True)
+        await interaction.response.edit_message(embed=_status_embed("Закрываю временные каналы."), view=None)
         await self.repository.finish_game(game.id)
         voice_channel = await self._fetch_voice_channel(game.voice_channel_id)
         text_channel = await self._fetch_text_channel(game.game_text_channel_id)
@@ -529,17 +580,17 @@ class Bunker(commands.Cog):
 
         active = await self.repository.get_active_game_by_setup(setup.id)
         if active is not None:
-            await interaction.response.send_message("В этой комнате уже построен активный бункер.", ephemeral=True)
+            await self.send_or_edit_setup_status(interaction, setup, "В этой комнате уже построен активный бункер.")
             return
 
         guild = interaction.guild
         if guild is None or not isinstance(interaction.user, discord.Member):
-            await interaction.response.send_message("Бункер можно строить только на сервере.", ephemeral=True)
+            await self.send_or_edit_setup_status(interaction, setup, "Бункер можно строить только на сервере.")
             return
 
         setup_channel = guild.get_channel(setup.setup_channel_id)
         if not isinstance(setup_channel, discord.TextChannel):
-            await interaction.response.send_message("Setup-канал больше недоступен.", ephemeral=True)
+            await self.send_or_edit_setup_status(interaction, setup, "Setup-канал больше недоступен.")
             return
 
         settings = normalize_settings(await self.repository.get_draft(setup.id, interaction.user.id))
@@ -553,7 +604,7 @@ class Bunker(commands.Cog):
         try:
             operator_role = await self._operator_role(guild) if is_admin_game else None
             if is_admin_game and operator_role is None:
-                await interaction.response.send_message("Сначала назначь operator-role через /opbunker role.", ephemeral=True)
+                await self.send_or_edit_setup_status(interaction, setup, "Сначала назначь operator-role через /opbunker role.")
                 return
             if operator_role is not None:
                 text_overwrites = build_admin_text_overwrites(guild, operator_role, [interaction.user])
@@ -592,12 +643,13 @@ class Bunker(commands.Cog):
                 await text_channel.delete(reason="Bunker duplicate build rollback")
             if voice_channel is not None:
                 await voice_channel.delete(reason="Bunker duplicate build rollback")
-            await interaction.response.send_message("В этой комнате уже есть активная партия.", ephemeral=True)
+            await self.send_or_edit_setup_status(interaction, setup, "В этой комнате уже есть активная партия.")
             return
         except discord.Forbidden:
-            await interaction.response.send_message(
+            await self.send_or_edit_setup_status(
+                interaction,
+                setup,
                 "Не хватает прав Discord. Нужны Manage Channels и права на создание text/voice каналов.",
-                ephemeral=True,
             )
             return
 
@@ -608,10 +660,7 @@ class Bunker(commands.Cog):
 
         moved = await self._move_member_to_voice(interaction.user, voice_channel)
         suffix = "Я перенес тебя в голосовой." if moved else f"Я открыл доступ к {voice_channel.mention}; зайди туда вручную, если сейчас не был в voice."
-        await interaction.response.send_message(
-            f"Бункер построен: {text_channel.mention}. {suffix}",
-            ephemeral=True,
-        )
+        await self.send_or_edit_setup_status(interaction, setup, f"Бункер построен: {text_channel.mention}. {suffix}")
 
     async def join_from_setup(self, interaction: discord.Interaction) -> None:
         setup = await self._setup_from_interaction_message(interaction)
@@ -736,67 +785,29 @@ class Bunker(commands.Cog):
         return "Игра началась. Карточки доступны через 'Моя карточка'."
 
     async def show_card(self, interaction: discord.Interaction) -> None:
-        game = await self._require_game_channel(interaction)
-        if game is None:
-            return
-
-        player = await self._require_player(interaction, game)
-        if player is None:
-            return
-
-        if player.card is None:
-            await interaction.response.send_message("Карточка появится после старта игры.", ephemeral=True)
-            return
-
-        embed = discord.Embed(title="Твоя карточка Бункера", description=format_card(player.card), color=discord.Color.dark_teal())
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await self.open_game_panel(interaction, screen="card")
 
     async def show_reveal_menu(self, interaction: discord.Interaction) -> None:
-        game = await self._require_game_channel(interaction)
-        if game is None:
-            return
-
-        if game.state != GameState.REVEAL_PHASE:
-            await interaction.response.send_message("Сейчас не фаза раскрытия.", ephemeral=True)
-            return
-
-        player = await self._require_player(interaction, game)
-        if player is None:
-            return
-
-        if player.is_eliminated:
-            await interaction.response.send_message("Выгнанные игроки уже не раскрывают характеристики.", ephemeral=True)
-            return
-
-        stats = selectable_reveal_stats(player)
-        if not stats:
-            await interaction.response.send_message("Ты уже раскрыл все обычные характеристики.", ephemeral=True)
-            return
-
-        await interaction.response.send_message(
-            "Выбери характеристику для публичного раскрытия.",
-            view=BunkerRevealView(self, game.id, interaction.user.id, stats),
-            ephemeral=True,
-        )
+        await self.open_game_panel(interaction, screen="reveal")
 
     async def reveal_selected_stat(self, interaction: discord.Interaction, game_id: int, user_id: int, stat: str) -> None:
         if interaction.user.id != user_id:
-            await interaction.response.send_message("Это меню не для тебя.", ephemeral=True)
+            await interaction.response.edit_message(embed=_status_embed("Это меню не для тебя."), view=BunkerPanelBackView(self, game_id))
             return
 
         game = await self.repository.get_game(game_id)
         if game is None:
-            await interaction.response.send_message("Партия не найдена.", ephemeral=True)
+            await interaction.response.edit_message(embed=_status_embed("Партия не найдена."), view=None)
             return
 
         player = await self.repository.get_player(game_id, user_id)
         if player is None:
-            await interaction.response.send_message("Ты не участник этой партии.", ephemeral=True)
+            await interaction.response.edit_message(embed=_status_embed("Ты не участник этой партии."), view=BunkerPanelBackView(self, game_id))
             return
 
         ok, message = reveal_stat(player, stat)
         if not ok:
-            await interaction.response.send_message(message, ephemeral=True)
+            await interaction.response.edit_message(embed=_status_embed(message), view=BunkerPanelBackView(self, game_id))
             return
 
         await self.repository.reveal_stat(game_id, user_id, stat)
@@ -806,34 +817,16 @@ class Bunker(commands.Cog):
         await self.update_current_game_panel(interaction, fresh, status="Раскрыто.")
 
     async def show_vote_menu(self, interaction: discord.Interaction) -> None:
-        game = await self._require_game_channel(interaction)
-        if game is None:
-            return
-
-        if game.state != GameState.VOTING_PHASE:
-            await interaction.response.send_message("Сейчас не фаза голосования.", ephemeral=True)
-            return
-
-        player = await self._require_player(interaction, game)
-        if player is None or player.is_eliminated:
-            await interaction.response.send_message("Голосовать могут только живые участники.", ephemeral=True)
-            return
-
-        players = [player for player in await self.repository.list_players(game.id) if player.is_alive]
-        await interaction.response.send_message(
-            "Кого выгнать из бункера?",
-            view=BunkerVoteView(self, game, players, interaction.user.id),
-            ephemeral=True,
-        )
+        await self.open_game_panel(interaction, screen="vote")
 
     async def save_vote(self, interaction: discord.Interaction, game_id: int, voter_id: int, raw_target: str) -> None:
         if interaction.user.id != voter_id:
-            await interaction.response.send_message("Это меню не для тебя.", ephemeral=True)
+            await interaction.response.edit_message(embed=_status_embed("Это меню не для тебя."), view=BunkerPanelBackView(self, game_id))
             return
 
         game = await self.repository.get_game(game_id)
         if game is None:
-            await interaction.response.send_message("Партия не найдена.", ephemeral=True)
+            await interaction.response.edit_message(embed=_status_embed("Партия не найдена."), view=None)
             return
 
         if raw_target == "abstain":
@@ -848,41 +841,21 @@ class Bunker(commands.Cog):
         await self.update_current_game_panel(interaction, game, status=message)
 
     async def show_action_menu(self, interaction: discord.Interaction) -> None:
-        game = await self._require_game_channel(interaction)
-        if game is None:
-            return
-
-        player = await self._require_player(interaction, game)
-        if player is None:
-            return
-
-        if player.card is None:
-            await interaction.response.send_message("Спец-действие появится после выдачи карточки.", ephemeral=True)
-            return
-
-        if player.used_special_action:
-            await interaction.response.send_message("Эта карта уже использована.", ephemeral=True)
-            return
-
-        await interaction.response.send_message(
-            f"Твое действие: {player.card.special_action}. Использовать сейчас?",
-            view=BunkerActionView(self, game.id, player.user_id),
-            ephemeral=True,
-        )
+        await self.open_game_panel(interaction, screen="action")
 
     async def use_special_action(self, interaction: discord.Interaction, game_id: int, user_id: int) -> None:
         if interaction.user.id != user_id:
-            await interaction.response.send_message("Это действие не для тебя.", ephemeral=True)
+            await interaction.response.edit_message(embed=_status_embed("Это действие не для тебя."), view=BunkerPanelBackView(self, game_id))
             return
 
         game = await self.repository.get_game(game_id)
         player = await self.repository.get_player(game_id, user_id)
         if game is None or player is None or player.card is None:
-            await interaction.response.send_message("Не нашел действие.", ephemeral=True)
+            await interaction.response.edit_message(embed=_status_embed("Не нашел действие."), view=BunkerPanelBackView(self, game_id))
             return
 
         if player.used_special_action:
-            await interaction.response.send_message("Эта карта уже использована.", ephemeral=True)
+            await interaction.response.edit_message(embed=_status_embed("Эта карта уже использована."), view=BunkerPanelBackView(self, game_id))
             return
 
         event = await self._apply_special_action(game, player)
@@ -898,20 +871,20 @@ class Bunker(commands.Cog):
             return
 
         if game.state != GameState.CHAOS_PHASE:
-            await interaction.response.send_message("Сейчас не фаза хаоса.", ephemeral=True)
+            await self.send_or_edit_private_panel(interaction, game, status="Сейчас не фаза хаоса.")
             return
 
         await self._trigger_chaos_event(game)
         await self.refresh_game_message(game.id)
-        await interaction.response.send_message("Хаос зафиксирован на табло.", ephemeral=True)
+        await self.send_or_edit_private_panel(interaction, game, status="Хаос зафиксирован на табло.")
 
     async def show_rules(self, interaction: discord.Interaction) -> None:
-        await interaction.response.send_message(embed=_rules_embed(), ephemeral=True)
+        await self.open_game_panel(interaction, screen="rules")
 
     async def show_packs(self, interaction: discord.Interaction) -> None:
-        await interaction.response.send_message(embed=_packs_embed(), ephemeral=True)
+        await self.open_game_panel(interaction, screen="packs")
 
-    async def show_setup_settings(self, interaction: discord.Interaction) -> None:
+    async def open_setup_panel(self, interaction: discord.Interaction, *, screen: str = "settings", status: str | None = None) -> None:
         setup = await self._setup_from_interaction_message(interaction)
         if setup is None:
             await interaction.response.send_message("Эта панель не привязана к комнате.", ephemeral=True)
@@ -920,10 +893,49 @@ class Bunker(commands.Cog):
         settings = normalize_settings(await self.repository.get_draft(setup.id, interaction.user.id))
         await self.repository.save_draft(setup.id, interaction.user.id, settings)
         is_operator = await self._is_bunker_operator(interaction)
-        await interaction.response.send_message(
-            embed=_settings_embed(settings),
-            view=BunkerSettingsView(self, setup.id, interaction.user.id, settings, is_operator=is_operator),
-            ephemeral=True,
+
+        if screen == "rules":
+            embed = _rules_embed()
+            view: discord.ui.View | None = BunkerSetupNavView(self, setup.id, interaction.user.id, settings, screen=screen, is_operator=is_operator)
+        elif screen == "packs":
+            embed = _packs_embed()
+            view = BunkerSetupNavView(self, setup.id, interaction.user.id, settings, screen=screen, is_operator=is_operator)
+        else:
+            embed = _settings_embed(settings)
+            view = BunkerSettingsView(self, setup.id, interaction.user.id, settings, is_operator=is_operator)
+
+        if status:
+            if embed.description:
+                embed.description = f"{status}\n\n{embed.description}"
+            else:
+                embed.description = status
+
+        await self._send_or_edit_private_message(
+            interaction,
+            self._setup_private_panels,
+            self._setup_panel_key(interaction, setup),
+            embed=embed,
+            view=view,
+        )
+
+    async def show_setup_rules(self, interaction: discord.Interaction) -> None:
+        await self.open_setup_panel(interaction, screen="rules")
+
+    async def show_setup_packs(self, interaction: discord.Interaction) -> None:
+        await self.open_setup_panel(interaction, screen="packs")
+
+    async def show_setup_settings(self, interaction: discord.Interaction) -> None:
+        await self.open_setup_panel(interaction, screen="settings")
+
+    async def send_or_edit_setup_status(self, interaction: discord.Interaction, setup, message: str) -> None:
+        settings = normalize_settings(await self.repository.get_draft(setup.id, interaction.user.id))
+        is_operator = await self._is_bunker_operator(interaction)
+        await self._send_or_edit_private_message(
+            interaction,
+            self._setup_private_panels,
+            self._setup_panel_key(interaction, setup),
+            embed=_status_embed(message),
+            view=BunkerSetupNavView(self, setup.id, interaction.user.id, settings, screen="status", is_operator=is_operator),
         )
 
     async def update_draft_settings(
@@ -1242,9 +1254,15 @@ class Bunker(commands.Cog):
         settings = await self.repository.get_or_create_guild_settings(guild.id)
         return guild.get_role(settings.operator_role_id) if settings.operator_role_id is not None else None
 
-    def _private_panel_key(self, interaction: discord.Interaction, game: BunkerGame) -> tuple[str, int, int, int]:
+    def _setup_panel_key(self, interaction: discord.Interaction, setup) -> tuple[int, int, int]:
+        channel_id = setup.setup_channel_id
+        if not channel_id and interaction.channel is not None:
+            channel_id = interaction.channel.id
+        return (setup.id, channel_id, interaction.user.id)
+
+    def _game_panel_key(self, interaction: discord.Interaction, game: BunkerGame) -> tuple[int, int, int]:
         channel_id = interaction.channel.id if interaction.channel is not None else 0
-        return ("game", game.id, channel_id, interaction.user.id)
+        return (game.id, channel_id, interaction.user.id)
 
     async def _delete_duplicate_setup_panels(self, channel: discord.TextChannel, *, keep_message_id: int) -> None:
         if self.bot.user is None:
@@ -1320,11 +1338,11 @@ class BunkerSetupIdleView(discord.ui.View):
 
     @discord.ui.button(label="Как играть", style=discord.ButtonStyle.secondary, custom_id=SETUP_RULES_ID)
     async def rules(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await self.cog.show_rules(interaction)
+        await self.cog.show_setup_rules(interaction)
 
     @discord.ui.button(label="Паки/контент", style=discord.ButtonStyle.secondary, custom_id=SETUP_PACKS_ID)
     async def packs(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await self.cog.show_packs(interaction)
+        await self.cog.show_setup_packs(interaction)
 
 
 class BunkerPublicGameView(discord.ui.View):
@@ -1438,6 +1456,53 @@ class BunkerPanelBackView(discord.ui.View):
         await self.cog.update_current_game_panel(interaction, game)
 
 
+class BunkerSetupNavView(discord.ui.View):
+    def __init__(self, cog: Bunker, setup_id: int, user_id: int, settings: BunkerSettings, *, screen: str, is_operator: bool = False) -> None:
+        super().__init__(timeout=900)
+        self.cog = cog
+        self.setup_id = setup_id
+        self.user_id = user_id
+        self.settings = settings
+        self.screen = screen
+        self.is_operator = is_operator
+        self._build()
+
+    def _build(self) -> None:
+        self._add_button("Настройки", discord.ButtonStyle.primary if self.screen == "settings" else discord.ButtonStyle.secondary, self._settings, row=0)
+        self._add_button("Как играть", discord.ButtonStyle.primary if self.screen == "rules" else discord.ButtonStyle.secondary, self._rules, row=0)
+        self._add_button("Паки/контент", discord.ButtonStyle.primary if self.screen == "packs" else discord.ButtonStyle.secondary, self._packs, row=0)
+        self._add_button("Назад", discord.ButtonStyle.secondary, self._settings, row=0)
+        if self.is_operator:
+            self._add_button("Админ-режим", discord.ButtonStyle.danger, self._admin, row=0)
+
+    def _add_button(self, label: str, style: discord.ButtonStyle, callback, *, row: int) -> None:
+        button = discord.ui.Button(label=label, style=style, row=row)
+        button.callback = callback
+        self.add_item(button)
+
+    async def _ensure_owner(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.user_id:
+            return True
+        await interaction.response.send_message("Эта приватная панель открыта другим пользователем.", ephemeral=True)
+        return False
+
+    async def _settings(self, interaction: discord.Interaction) -> None:
+        if await self._ensure_owner(interaction):
+            await self.cog.open_setup_panel(interaction, screen="settings")
+
+    async def _rules(self, interaction: discord.Interaction) -> None:
+        if await self._ensure_owner(interaction):
+            await self.cog.open_setup_panel(interaction, screen="rules")
+
+    async def _packs(self, interaction: discord.Interaction) -> None:
+        if await self._ensure_owner(interaction):
+            await self.cog.open_setup_panel(interaction, screen="packs")
+
+    async def _admin(self, interaction: discord.Interaction) -> None:
+        if await self._ensure_owner(interaction):
+            await self.cog.build_admin_bunker(interaction)
+
+
 class BunkerSettingsView(discord.ui.View):
     def __init__(self, cog: Bunker, setup_id: int, user_id: int, settings: BunkerSettings, *, is_operator: bool = False) -> None:
         super().__init__(timeout=900)
@@ -1445,23 +1510,37 @@ class BunkerSettingsView(discord.ui.View):
         self.setup_id = setup_id
         self.user_id = user_id
         self.settings = settings
-        self.add_item(BunkerModeSelect(self))
-        self.add_item(BunkerSlotsSelect(self))
-        self.add_item(BunkerTimerSelect(self))
-        self.add_item(BunkerRoundsSelect(self))
+        self.is_operator = is_operator
+        self.add_item(BunkerModeSelect(self, row=0))
+        self.add_item(BunkerSlotsSelect(self, row=1))
+        self.add_item(BunkerTimerSelect(self, row=2))
+        self.add_item(BunkerRoundsSelect(self, row=3))
+        rules_button = discord.ui.Button(label="Как играть", style=discord.ButtonStyle.secondary, row=4)
+        rules_button.callback = self.open_rules
+        self.add_item(rules_button)
         if is_operator:
             admin_button = discord.ui.Button(label="Админ-режим", style=discord.ButtonStyle.danger)
             admin_button.callback = self.start_admin_game
             self.add_item(admin_button)
+        else:
+            packs_button = discord.ui.Button(label="Паки/контент", style=discord.ButtonStyle.secondary, row=4)
+            packs_button.callback = self.open_packs
+            self.add_item(packs_button)
+
+    async def open_rules(self, interaction: discord.Interaction) -> None:
+        await self.cog.open_setup_panel(interaction, screen="rules")
+
+    async def open_packs(self, interaction: discord.Interaction) -> None:
+        await self.cog.open_setup_panel(interaction, screen="packs")
 
     async def start_admin_game(self, interaction: discord.Interaction) -> None:
         await self.cog.build_admin_bunker(interaction)
 
-    @discord.ui.button(label="Публичный/приватный", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Публичный/приватный", style=discord.ButtonStyle.secondary, row=4)
     async def toggle_visibility(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.cog.update_draft_settings(interaction, self.setup_id, self.user_id, replace(self.settings, is_public=not self.settings.is_public))
 
-    @discord.ui.button(label="Подсказки новичкам", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Подсказки новичкам", style=discord.ButtonStyle.secondary, row=4)
     async def toggle_newbies(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.cog.update_draft_settings(
             interaction,
@@ -1470,7 +1549,7 @@ class BunkerSettingsView(discord.ui.View):
             replace(self.settings, explain_for_newbies=not self.settings.explain_for_newbies),
         )
 
-    @discord.ui.button(label="Пропущенный голос", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Пропущенный голос", style=discord.ButtonStyle.secondary, row=4)
     async def toggle_vote_policy(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         next_policy = VotePolicy.RANDOM if self.settings.missing_vote_policy == VotePolicy.ABSTAIN else VotePolicy.ABSTAIN
         await self.cog.update_draft_settings(
@@ -1482,13 +1561,14 @@ class BunkerSettingsView(discord.ui.View):
 
 
 class BunkerModeSelect(discord.ui.Select):
-    def __init__(self, owner: BunkerSettingsView) -> None:
+    def __init__(self, owner: BunkerSettingsView, *, row: int) -> None:
         self.owner = owner
         super().__init__(
             placeholder=f"Режим: {owner.settings.mode.value}",
             min_values=1,
             max_values=1,
             options=[discord.SelectOption(label=mode.value, value=mode.value, default=mode == owner.settings.mode) for mode in GameMode],
+            row=row,
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
@@ -1498,7 +1578,7 @@ class BunkerModeSelect(discord.ui.Select):
 
 
 class BunkerSlotsSelect(discord.ui.Select):
-    def __init__(self, owner: BunkerSettingsView) -> None:
+    def __init__(self, owner: BunkerSettingsView, *, row: int) -> None:
         self.owner = owner
         super().__init__(
             placeholder=f"Слоты: {owner.settings.slots}",
@@ -1508,6 +1588,7 @@ class BunkerSlotsSelect(discord.ui.Select):
                 discord.SelectOption(label=str(slots), value=str(slots), default=slots == owner.settings.slots)
                 for slots in range(6, 17)
             ],
+            row=row,
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
@@ -1522,7 +1603,7 @@ class BunkerSlotsSelect(discord.ui.Select):
 
 
 class BunkerTimerSelect(discord.ui.Select):
-    def __init__(self, owner: BunkerSettingsView) -> None:
+    def __init__(self, owner: BunkerSettingsView, *, row: int) -> None:
         self.owner = owner
         values = (60, 90, 120, 180, 240, 300, 420)
         super().__init__(
@@ -1533,6 +1614,7 @@ class BunkerTimerSelect(discord.ui.Select):
                 discord.SelectOption(label=f"{seconds} сек.", value=str(seconds), default=seconds == owner.settings.timer_seconds)
                 for seconds in values
             ],
+            row=row,
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
@@ -1545,7 +1627,7 @@ class BunkerTimerSelect(discord.ui.Select):
 
 
 class BunkerRoundsSelect(discord.ui.Select):
-    def __init__(self, owner: BunkerSettingsView) -> None:
+    def __init__(self, owner: BunkerSettingsView, *, row: int) -> None:
         self.owner = owner
         values = (3, 4, 5, 6)
         super().__init__(
@@ -1556,6 +1638,7 @@ class BunkerRoundsSelect(discord.ui.Select):
                 discord.SelectOption(label=str(rounds), value=str(rounds), default=rounds == owner.settings.rounds)
                 for rounds in values
             ],
+            row=row,
         )
 
     async def callback(self, interaction: discord.Interaction) -> None:
@@ -1732,6 +1815,16 @@ def format_player_name(player: BunkerPlayer | None) -> str:
     if player.is_fake:
         return player.display_name
     return f"<@{player.user_id}>"
+
+
+def _same_discord_message(left: Any, right: Any) -> bool:
+    if left is None or right is None:
+        return False
+    left_id = getattr(left, "id", None)
+    right_id = getattr(right, "id", None)
+    if left_id is not None and right_id is not None:
+        return left_id == right_id
+    return left is right
 
 
 def _room_number(name: str, fallback: int) -> str:
