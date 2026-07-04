@@ -10,8 +10,6 @@ from siri_bot.cogs.leveling import (
     RANK_PANEL_MODE_LEADERBOARD,
     RANK_PANEL_MODE_RANK,
     RANK_PANEL_REFRESH_CUSTOM_ID,
-    RANK_PANEL_RESULT_LEADERBOARD_CUSTOM_ID,
-    RANK_PANEL_RESULT_LEVEL_CUSTOM_ID,
     Leveling,
     RankPanelResultView,
 )
@@ -57,6 +55,13 @@ def _button(view: discord.ui.View, custom_id: str) -> discord.ui.Button:
     raise AssertionError(f"Button {custom_id} not found")
 
 
+def _assert_only_refresh_button(view: discord.ui.View) -> None:
+    buttons = [child for child in view.children if isinstance(child, discord.ui.Button)]
+    assert len(buttons) == 1
+    assert buttons[0].custom_id == RANK_PANEL_REFRESH_CUSTOM_ID
+    assert buttons[0].label == "Обновить"
+
+
 class LevelingPanelTests(unittest.TestCase):
     def test_public_rank_button_sends_private_result_menu(self) -> None:
         cog = Leveling.__new__(Leveling)
@@ -74,6 +79,7 @@ class LevelingPanelTests(unittest.TestCase):
         self.assertIs(kwargs["embed"], embed)
         self.assertIsInstance(kwargs["view"], RankPanelResultView)
         self.assertEqual(kwargs["view"].mode, RANK_PANEL_MODE_RANK)
+        _assert_only_refresh_button(kwargs["view"])
 
     def test_public_leaderboard_button_sends_private_result_menu(self) -> None:
         cog = Leveling.__new__(Leveling)
@@ -91,6 +97,7 @@ class LevelingPanelTests(unittest.TestCase):
         self.assertIs(kwargs["embed"], embed)
         self.assertIsInstance(kwargs["view"], RankPanelResultView)
         self.assertEqual(kwargs["view"].mode, RANK_PANEL_MODE_LEADERBOARD)
+        _assert_only_refresh_button(kwargs["view"])
 
     def test_public_leaderboard_button_handles_empty_table_privately(self) -> None:
         cog = Leveling.__new__(Leveling)
@@ -106,40 +113,7 @@ class LevelingPanelTests(unittest.TestCase):
         self.assertTrue(kwargs["ephemeral"])
         self.assertIsInstance(kwargs["view"], RankPanelResultView)
         self.assertEqual(kwargs["view"].mode, RANK_PANEL_MODE_LEADERBOARD)
-
-    def test_result_rank_button_edits_private_menu(self) -> None:
-        cog = Leveling.__new__(Leveling)
-        embed = discord.Embed(title="Rank")
-        cog._build_rank_embed = AsyncMock(return_value=embed)
-        interaction = FakeInteraction()
-        view = RankPanelResultView(cog, RANK_PANEL_MODE_LEADERBOARD)
-
-        asyncio.run(_button(view, RANK_PANEL_RESULT_LEVEL_CUSTOM_ID).callback(interaction))
-
-        interaction.response.send_message.assert_not_called()
-        interaction.response.edit_message.assert_awaited_once()
-        kwargs = interaction.response.edit_message.await_args.kwargs
-        self.assertIsNone(kwargs["content"])
-        self.assertIs(kwargs["embed"], embed)
-        self.assertIsInstance(kwargs["view"], RankPanelResultView)
-        self.assertEqual(kwargs["view"].mode, RANK_PANEL_MODE_RANK)
-
-    def test_result_leaderboard_button_edits_private_menu(self) -> None:
-        cog = Leveling.__new__(Leveling)
-        embed = discord.Embed(title="Leaderboard")
-        cog._build_leaderboard_embed = AsyncMock(return_value=embed)
-        interaction = FakeInteraction()
-        view = RankPanelResultView(cog, RANK_PANEL_MODE_RANK)
-
-        asyncio.run(_button(view, RANK_PANEL_RESULT_LEADERBOARD_CUSTOM_ID).callback(interaction))
-
-        interaction.response.send_message.assert_not_called()
-        interaction.response.edit_message.assert_awaited_once()
-        kwargs = interaction.response.edit_message.await_args.kwargs
-        self.assertIsNone(kwargs["content"])
-        self.assertIs(kwargs["embed"], embed)
-        self.assertIsInstance(kwargs["view"], RankPanelResultView)
-        self.assertEqual(kwargs["view"].mode, RANK_PANEL_MODE_LEADERBOARD)
+        _assert_only_refresh_button(kwargs["view"])
 
     def test_refresh_updates_rank_private_menu(self) -> None:
         cog = Leveling.__new__(Leveling)
@@ -155,6 +129,7 @@ class LevelingPanelTests(unittest.TestCase):
         self.assertIsNone(kwargs["content"])
         self.assertIs(kwargs["embed"], embed)
         self.assertEqual(kwargs["view"].mode, RANK_PANEL_MODE_RANK)
+        _assert_only_refresh_button(kwargs["view"])
 
     def test_refresh_updates_empty_leaderboard_private_menu(self) -> None:
         cog = Leveling.__new__(Leveling)
@@ -169,6 +144,7 @@ class LevelingPanelTests(unittest.TestCase):
         self.assertEqual(kwargs["content"], "Пока нет XP в таблице лидеров.")
         self.assertIsNone(kwargs["embed"])
         self.assertEqual(kwargs["view"].mode, RANK_PANEL_MODE_LEADERBOARD)
+        _assert_only_refresh_button(kwargs["view"])
 
 
 if __name__ == "__main__":
