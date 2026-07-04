@@ -74,6 +74,7 @@ SETUP_PACKS_ID = "siri:bunker:setup:packs"
 ADMIN_PANEL_SCREEN_LIST = "list"
 ADMIN_PANEL_SCREEN_PACK = "pack"
 ADMIN_PANEL_SCREEN_CATEGORY = "category"
+ADMIN_PANEL_SCREEN_ACCESS = "access"
 
 GAME_PANEL_ID = "siri:bunker:game:panel"
 GAME_JOIN_ID = "siri:bunker:game:join"
@@ -135,8 +136,7 @@ class Bunker(commands.Cog):
             return
 
         existing_setup = await self.repository.get_setup_by_channel(channel.id)
-        active_game = await self._live_active_game_for_setup(existing_setup) if existing_setup else None
-        embed = _setup_embed(channel.name, active_game=active_game)
+        embed = _setup_embed(channel.name)
         setup_message: discord.Message | None = None
         if existing_setup and existing_setup.setup_message_id is not None:
             try:
@@ -286,7 +286,23 @@ class Bunker(commands.Cog):
         await self.repository.finish_game(game.id)
         await self.refresh_game_message(game.id)
         await self.refresh_setup_message(game)
-        await interaction.response.send_message("Партия завершена. Временные каналы оставлены на месте.", ephemeral=True)
+        await interaction.response.send_message("Партия завершена. Временные каналы оставлены на месте; удалить их можно через /bunker close.", ephemeral=True)
+
+    @bunker_group.command(name="close", description="Закрыть временную комнату Бункера и удалить ее каналы.")
+    async def close_command(self, interaction: discord.Interaction) -> None:
+        game = await self._game_from_interaction_channel(interaction, include_finished=True)
+        if game is None:
+            await interaction.response.send_message("Эта команда работает во временном text-канале бункера.", ephemeral=True)
+            return
+        if not await self._is_host_or_admin_user(interaction, game):
+            await interaction.response.send_message("Закрыть бункер может только его хост, админ или оператор.", ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            embed=_status_embed("Закрыть этот бункер и удалить временные text/voice каналы?"),
+            view=BunkerCloseConfirmView(self, game.id),
+            ephemeral=True,
+        )
 
     @bunker_group.command(name="packs", description="Показать встроенный контент-пак Бункера.")
     async def packs_command(self, interaction: discord.Interaction) -> None:
@@ -309,10 +325,14 @@ class Bunker(commands.Cog):
             await interaction.response.send_message("Эта панель доступна только админу сервера или operator-role Бункера.", ephemeral=True)
             return
 
+        guild_settings = await self.repository.get_or_create_guild_settings(guild.id)
         packs = await self.repository.list_content_packs(guild.id)
         embed: discord.Embed
         view: discord.ui.View | None
-        if screen == ADMIN_PANEL_SCREEN_PACK and pack_id is not None:
+        if screen == ADMIN_PANEL_SCREEN_ACCESS:
+            embed = _admin_access_embed(guild, guild_settings, status=status)
+            view = BunkerAdminAccessView(self, guild_settings)
+        elif screen == ADMIN_PANEL_SCREEN_PACK and pack_id is not None:
             pack = await self.repository.get_content_pack(pack_id, guild_id=guild.id)
             if pack is None:
                 embed = _admin_packs_embed(packs, status="Пак не найден.")
@@ -430,6 +450,15 @@ class Bunker(commands.Cog):
         deleted = await self.repository.delete_content_pack(pack_id, guild_id=guild.id)
         await self.open_bunker_admin_panel(interaction, status="Пак удален." if deleted else "Пак не найден.")
 
+    async def set_admin_interest_role(self, interaction: discord.Interaction, role_id: int | None) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Админ-панель Бункера работает только на сервере.", ephemeral=True)
+            return
+        await self.repository.set_interest_role(guild.id, role_id)
+        status = "Роль интереса очищена." if role_id is None else "Роль интереса сохранена."
+        await self.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_ACCESS, status=status)
+
     async def open_game_panel(self, interaction: discord.Interaction, *, screen: str = "main", status: str | None = None) -> None:
         game = await self._game_from_interaction_channel(interaction)
         if game is None:
@@ -489,6 +518,7 @@ class Bunker(commands.Cog):
         players = await self.repository.list_players(game.id)
         player = next((candidate for candidate in players if candidate.user_id == interaction.user.id), None)
         is_operator = await self._is_bunker_operator(interaction)
+        can_close = (player is not None and player.is_host) or await self._is_bunker_admin_or_operator(interaction)
         back_view = BunkerPanelBackView(self, game.id)
 
         if screen == "settings":
@@ -535,7 +565,7 @@ class Bunker(commands.Cog):
                 return _status_embed("Эта карта уже использована."), back_view
             return _status_embed(f"Твое действие: {player.card.special_action}. Использовать сейчас?"), BunkerActionView(self, game.id, player.user_id)
 
-        return _private_panel_embed(game, players, player, is_operator=is_operator, status=status), BunkerPrivatePlayerPanelView(self, game, player, is_operator=is_operator)
+        return _private_panel_embed(game, players, player, is_operator=is_operator, status=status), BunkerPrivatePlayerPanelView(self, game, player, is_operator=is_operator, can_close=can_close)
 
     async def _send_or_edit_private_message(
         self,
@@ -697,22 +727,46 @@ class Bunker(commands.Cog):
         await self.update_current_game_panel(interaction, fresh, status="Фаза сдвинута.")
 
     async def panel_close_channels(self, interaction: discord.Interaction, game_id: int) -> None:
-        if not await self._is_bunker_operator(interaction):
-            await interaction.response.edit_message(embed=_status_embed("Это действие доступно только оператору Бункера."), view=BunkerPanelBackView(self, game_id))
-            return
         game = await self.repository.get_game(game_id)
         if game is None:
             await interaction.response.edit_message(embed=_status_embed("Партия не найдена."), view=None)
             return
+        if not await self._is_host_or_admin_user(interaction, game):
+            await interaction.response.edit_message(embed=_status_embed("Закрыть бункер может только его хост, админ или оператор."), view=BunkerPanelBackView(self, game_id))
+            return
+
+        await interaction.response.edit_message(
+            embed=_status_embed("Закрыть этот бункер и удалить временные text/voice каналы?"),
+            view=BunkerCloseConfirmView(self, game.id),
+        )
+
+    async def confirm_close_channels(self, interaction: discord.Interaction, game_id: int) -> None:
+        game = await self.repository.get_game(game_id)
+        if game is None:
+            await interaction.response.edit_message(embed=_status_embed("Партия не найдена."), view=None)
+            return
+        if not await self._is_host_or_admin_user(interaction, game):
+            await interaction.response.edit_message(embed=_status_embed("Закрыть бункер может только его хост, админ или оператор."), view=BunkerPanelBackView(self, game_id))
+            return
 
         await interaction.response.edit_message(embed=_status_embed("Закрываю временные каналы."), view=None)
+        await self._close_game_channels(game, reason="Bunker room closed")
+
+    async def _close_game_channels(self, game: BunkerGame, *, reason: str) -> None:
         await self.repository.finish_game(game.id)
+        await self.refresh_setup_message(game)
         voice_channel = await self._fetch_voice_channel(game.voice_channel_id)
         text_channel = await self._fetch_text_channel(game.game_text_channel_id)
         if voice_channel is not None:
-            await voice_channel.delete(reason="Bunker admin cleanup")
+            try:
+                await voice_channel.delete(reason=reason)
+            except discord.HTTPException:
+                LOGGER.info("Could not delete bunker voice channel %s.", game.voice_channel_id, exc_info=True)
         if text_channel is not None:
-            await text_channel.delete(reason="Bunker admin cleanup")
+            try:
+                await text_channel.delete(reason=reason)
+            except discord.HTTPException:
+                LOGGER.info("Could not delete bunker text channel %s.", game.game_text_channel_id, exc_info=True)
 
     @bunker_group.command(name="invite", description="Пригласить игрока в приватный бункер.")
     @app_commands.describe(user="Кого пригласить")
@@ -738,14 +792,14 @@ class Bunker(commands.Cog):
             await interaction.response.send_message("Не нашел setup этой комнаты. Создай панель через /createbunker заново.", ephemeral=True)
             return
 
-        active = await self._live_active_game_for_setup(setup)
-        if active is not None:
-            await self.send_or_edit_setup_status(interaction, setup, "В этой комнате уже построен активный бункер.")
-            return
-
         guild = interaction.guild
         if guild is None or not isinstance(interaction.user, discord.Member):
             await self.send_or_edit_setup_status(interaction, setup, "Бункер можно строить только на сервере.")
+            return
+
+        active_host_game = await self._live_active_game_for_host(guild.id, interaction.user.id)
+        if active_host_game is not None:
+            await self.send_host_conflict_status(interaction, setup, active_host_game)
             return
 
         setup_channel = guild.get_channel(setup.setup_channel_id)
@@ -754,9 +808,9 @@ class Bunker(commands.Cog):
             return
 
         settings = normalize_settings(await self.repository.get_draft(setup.id, interaction.user.id))
-        room_number = _room_number(setup.room_name, setup.id)
-        text_name = f"бункер-комната-{room_number}"
-        voice_name = f"Собрание бункера {room_number}"
+        room_index = await self.repository.next_room_index(setup)
+        text_name = f"бункер-комната-{room_index}"
+        voice_name = f"Собрание бункера {room_index}"
         category = setup_channel.category
 
         text_channel: discord.TextChannel | None = None
@@ -766,16 +820,21 @@ class Bunker(commands.Cog):
             if is_admin_game and operator_role is None:
                 await self.send_or_edit_setup_status(interaction, setup, "Сначала назначь operator-role через /opbunker role.")
                 return
+            interest_role = None if is_admin_game or not settings.is_public else await self._interest_role(guild)
             if operator_role is not None:
                 text_overwrites = build_admin_text_overwrites(guild, operator_role, [interaction.user])
             elif settings.is_public:
-                text_overwrites = build_lobby_text_overwrites(guild, [interaction.user])
+                text_overwrites = build_lobby_text_overwrites(guild, [interaction.user], interest_role=interest_role)
             else:
                 text_overwrites = build_private_text_overwrites(guild, [interaction.user])
             voice_overwrites = (
                 build_admin_voice_overwrites(guild, operator_role, [interaction.user])
                 if operator_role is not None
-                else build_private_voice_overwrites(guild, [interaction.user])
+                else build_private_voice_overwrites(
+                    guild,
+                    [interaction.user],
+                    spectator_role=interest_role if settings.is_public else None,
+                )
             )
             text_channel = await guild.create_text_channel(
                 text_name,
@@ -789,36 +848,27 @@ class Bunker(commands.Cog):
                 overwrites=voice_overwrites,
                 reason="Bunker room built",
             )
-            try:
-                game = await self.repository.create_game(
-                    setup=setup,
-                    host_id=interaction.user.id,
-                    settings=settings,
-                    text_channel_id=text_channel.id,
-                    voice_channel_id=voice_channel.id,
-                    host_display_name=interaction.user.display_name,
-                    is_admin_game=is_admin_game,
-                )
-            except ActiveBunkerGameError as exc:
-                conflicting = await self.repository.get_game(exc.game_id)
-                live_conflict = await self._ensure_game_discord_state(conflicting)
-                if live_conflict is not None:
-                    raise
-                game = await self.repository.create_game(
-                    setup=setup,
-                    host_id=interaction.user.id,
-                    settings=settings,
-                    text_channel_id=text_channel.id,
-                    voice_channel_id=voice_channel.id,
-                    host_display_name=interaction.user.display_name,
-                    is_admin_game=is_admin_game,
-                )
-        except ActiveBunkerGameError:
+            game = await self.repository.create_game(
+                setup=setup,
+                host_id=interaction.user.id,
+                settings=settings,
+                room_index=room_index,
+                text_channel_id=text_channel.id,
+                voice_channel_id=voice_channel.id,
+                host_display_name=interaction.user.display_name,
+                is_admin_game=is_admin_game,
+            )
+        except ActiveBunkerGameError as exc:
             if text_channel is not None:
                 await text_channel.delete(reason="Bunker duplicate build rollback")
             if voice_channel is not None:
                 await voice_channel.delete(reason="Bunker duplicate build rollback")
-            await self.send_or_edit_setup_status(interaction, setup, "В этой комнате уже есть активная партия.")
+            conflicting = await self.repository.get_game(exc.game_id)
+            live_conflict = await self._ensure_game_discord_state(conflicting)
+            if live_conflict is not None:
+                await self.send_host_conflict_status(interaction, setup, live_conflict)
+            else:
+                await self.send_or_edit_setup_status(interaction, setup, "Старый бункер был очищен. Нажми 'Построить бункер' еще раз.")
             return
         except discord.Forbidden:
             await self.send_or_edit_setup_status(
@@ -1133,6 +1183,33 @@ class Bunker(commands.Cog):
             ),
         )
 
+    async def send_host_conflict_status(
+        self,
+        interaction: discord.Interaction,
+        setup,
+        game: BunkerGame,
+    ) -> None:
+        settings = normalize_settings(await self.repository.get_draft(setup.id, interaction.user.id))
+        is_operator = await self._is_bunker_operator(interaction)
+        channel_hint = f"<#{game.game_text_channel_id}>" if game.game_text_channel_id is not None else f"#{game.id}"
+        await self._send_or_edit_private_message(
+            interaction,
+            self._setup_private_panels,
+            self._setup_panel_key(interaction, setup),
+            embed=_status_embed(
+                "У тебя уже есть активный бункер: "
+                f"{channel_hint}. Закрой прошлый бункер, чтобы создать новый."
+            ),
+            view=BunkerSetupHostConflictView(
+                self,
+                setup.id,
+                interaction.user.id,
+                settings,
+                game,
+                is_operator=is_operator,
+            ),
+        )
+
     async def update_draft_settings(
         self,
         interaction: discord.Interaction,
@@ -1356,6 +1433,13 @@ class Bunker(commands.Cog):
         active = await self.repository.get_active_game_by_setup(setup_id)
         return await self._ensure_game_discord_state(active)
 
+    async def _live_active_game_for_host(self, guild_id: int, host_id: int) -> BunkerGame | None:
+        for active in await self.repository.list_active_games_by_host(guild_id, host_id):
+            live = await self._ensure_game_discord_state(active)
+            if live is not None:
+                return live
+        return None
+
     async def refresh_setup_message(self, game: BunkerGame) -> None:
         if game.setup_message_id is None:
             return
@@ -1369,8 +1453,7 @@ class Bunker(commands.Cog):
         except discord.HTTPException:
             return
 
-        active = await self._live_active_game_for_setup(game)
-        embed = _setup_embed(channel.name, active_game=active)
+        embed = _setup_embed(channel.name)
         await message.edit(embed=embed, view=BunkerSetupIdleView(self))
 
     async def _trigger_chaos_event(self, game: BunkerGame) -> None:
@@ -1459,12 +1542,15 @@ class Bunker(commands.Cog):
 
         return game
 
-    async def _game_from_interaction_channel(self, interaction: discord.Interaction) -> BunkerGame | None:
+    async def _game_from_interaction_channel(self, interaction: discord.Interaction, *, include_finished: bool = False) -> BunkerGame | None:
         channel = interaction.channel
         if channel is None:
             return None
 
-        game = await self.repository.get_active_game_by_text_channel(channel.id)
+        if include_finished:
+            game = await self.repository.get_game_by_text_channel(channel.id)
+        else:
+            game = await self.repository.get_active_game_by_text_channel(channel.id)
         if game is None:
             return None
 
@@ -1527,6 +1613,10 @@ class Bunker(commands.Cog):
     async def _operator_role(self, guild: discord.Guild) -> discord.Role | None:
         settings = await self.repository.get_or_create_guild_settings(guild.id)
         return guild.get_role(settings.operator_role_id) if settings.operator_role_id is not None else None
+
+    async def _interest_role(self, guild: discord.Guild) -> discord.Role | None:
+        settings = await self.repository.get_or_create_guild_settings(guild.id)
+        return guild.get_role(settings.interest_role_id) if settings.interest_role_id is not None else None
 
     def _setup_panel_key(self, interaction: discord.Interaction, setup) -> tuple[int, int, int]:
         channel_id = setup.setup_channel_id
@@ -1639,12 +1729,21 @@ class BunkerPublicGameView(discord.ui.View):
 
 
 class BunkerPrivatePlayerPanelView(discord.ui.View):
-    def __init__(self, cog: Bunker, game: BunkerGame, player: BunkerPlayer | None, *, is_operator: bool) -> None:
+    def __init__(
+        self,
+        cog: Bunker,
+        game: BunkerGame,
+        player: BunkerPlayer | None,
+        *,
+        is_operator: bool,
+        can_close: bool = False,
+    ) -> None:
         super().__init__(timeout=900)
         self.cog = cog
         self.game = game
         self.player = player
         self.is_operator = is_operator
+        self.can_close = can_close
         self._build()
 
     def _build(self) -> None:
@@ -1682,7 +1781,8 @@ class BunkerPrivatePlayerPanelView(discord.ui.View):
             self._add_button("Очистить тест-ботов", discord.ButtonStyle.secondary, self._remove_fakes, row=3)
             self._add_button("Форс-старт", discord.ButtonStyle.danger, self._force_start, row=3)
             self._add_button("Следующая фаза", discord.ButtonStyle.primary, self._next_phase, row=4)
-            self._add_button("Закрыть каналы", discord.ButtonStyle.danger, self._close_channels, row=4)
+        if self.can_close:
+            self._add_button("Закрыть бункер", discord.ButtonStyle.danger, self._close_channels, row=4)
 
     def _add_button(self, label: str, style: discord.ButtonStyle, callback, *, row: int) -> None:
         button = discord.ui.Button(label=label, style=style, row=row)
@@ -1748,6 +1848,79 @@ class BunkerPanelBackView(discord.ui.View):
         await self.cog.update_current_game_panel(interaction, game)
 
 
+class BunkerCloseConfirmView(discord.ui.View):
+    def __init__(self, cog: Bunker, game_id: int) -> None:
+        super().__init__(timeout=900)
+        self.cog = cog
+        self.game_id = game_id
+
+    @discord.ui.button(label="Да, закрыть", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.confirm_close_channels(interaction, self.game_id)
+
+    @discord.ui.button(label="Отмена", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        game = await self.cog.repository.get_game(self.game_id)
+        if game is None:
+            await interaction.response.edit_message(embed=_status_embed("Партия не найдена."), view=None)
+            return
+        await self.cog.update_current_game_panel(interaction, game)
+
+
+class BunkerSetupHostConflictView(discord.ui.View):
+    def __init__(
+        self,
+        cog: Bunker,
+        setup_id: int,
+        user_id: int,
+        settings: BunkerSettings,
+        game: BunkerGame,
+        *,
+        is_operator: bool,
+    ) -> None:
+        super().__init__(timeout=900)
+        self.cog = cog
+        self.setup_id = setup_id
+        self.user_id = user_id
+        self.settings = settings
+        self.game = game
+        self.is_operator = is_operator
+        if game.game_text_channel_id is not None:
+            self.add_item(
+                discord.ui.Button(
+                    label="Открыть бункер",
+                    style=discord.ButtonStyle.link,
+                    url=f"https://discord.com/channels/{game.guild_id}/{game.game_text_channel_id}",
+                    row=0,
+                )
+            )
+        self._add_button("Закрыть бункер", discord.ButtonStyle.danger, self._close, row=0)
+        self._add_button("Настройки", discord.ButtonStyle.secondary, self._settings, row=1)
+
+    def _add_button(self, label: str, style: discord.ButtonStyle, callback, *, row: int) -> None:
+        button = discord.ui.Button(label=label, style=style, row=row)
+        button.callback = callback
+        self.add_item(button)
+
+    async def _ensure_owner(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.user_id:
+            return True
+        await interaction.response.send_message("Эта приватная панель открыта другим пользователем.", ephemeral=True)
+        return False
+
+    async def _close(self, interaction: discord.Interaction) -> None:
+        if not await self._ensure_owner(interaction):
+            return
+        await interaction.response.edit_message(
+            embed=_status_embed("Закрыть твой активный бункер и удалить временные text/voice каналы?"),
+            view=BunkerCloseConfirmView(self.cog, self.game.id),
+        )
+
+    async def _settings(self, interaction: discord.Interaction) -> None:
+        if await self._ensure_owner(interaction):
+            await self.cog.open_setup_panel(interaction, screen="settings")
+
+
 class BunkerAdminListView(discord.ui.View):
     def __init__(self, cog: Bunker, packs: list[BunkerContentPack]) -> None:
         super().__init__(timeout=900)
@@ -1763,6 +1936,36 @@ class BunkerAdminListView(discord.ui.View):
     @discord.ui.button(label="Обновить", style=discord.ButtonStyle.secondary, row=1)
     async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.cog.open_bunker_admin_panel(interaction)
+
+    @discord.ui.button(label="Доступ", style=discord.ButtonStyle.primary, row=2)
+    async def access(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_ACCESS)
+
+
+class BunkerAdminAccessView(discord.ui.View):
+    def __init__(self, cog: Bunker, settings: Any) -> None:
+        super().__init__(timeout=900)
+        self.cog = cog
+        self.settings = settings
+        self.add_item(BunkerInterestRoleSelect(cog))
+
+    @discord.ui.button(label="Очистить роль интереса", style=discord.ButtonStyle.secondary, row=1)
+    async def clear_interest(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.set_admin_interest_role(interaction, None)
+
+    @discord.ui.button(label="Назад", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.open_bunker_admin_panel(interaction)
+
+
+class BunkerInterestRoleSelect(discord.ui.RoleSelect):
+    def __init__(self, cog: Bunker) -> None:
+        super().__init__(placeholder="Роль интересующихся Бункером", min_values=1, max_values=1, row=0)
+        self.cog = cog
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        role = self.values[0]
+        await self.cog.set_admin_interest_role(interaction, role.id)
 
 
 class BunkerAdminPackSelect(discord.ui.Select):
@@ -2278,7 +2481,7 @@ class BunkerActionView(discord.ui.View):
 
 
 def _setup_embed(room_name: str, active_game: BunkerGame | None = None) -> discord.Embed:
-    status = "Комната свободна. Нажми 'Построить бункер', чтобы стать хостом." if active_game is None else "Комната занята: идет набор или партия."
+    status = "Можно строить новые бункеры в этой категории. Один пользователь может хостить только один активный бункер."
     embed = discord.Embed(
         title=f"Бункер - {room_name}",
         description=(
@@ -2411,6 +2614,29 @@ def _admin_packs_embed(packs: list[BunkerContentPack], *, status: str | None = N
         embed.add_field(name="Паки", value="\n".join(lines), inline=False)
     else:
         embed.add_field(name="Паки", value="Паков пока нет.", inline=False)
+    return embed
+
+
+def _admin_access_embed(guild: discord.Guild, settings: Any, *, status: str | None = None) -> discord.Embed:
+    operator_role = guild.get_role(settings.operator_role_id) if settings.operator_role_id is not None else None
+    interest_role = guild.get_role(settings.interest_role_id) if settings.interest_role_id is not None else None
+    embed = discord.Embed(title="Доступ Бункера", color=discord.Color.dark_teal())
+    embed.description = status or "Настрой роли, которые управляют видимостью и админскими комнатами Бункера."
+    embed.add_field(
+        name="Operator-role",
+        value=operator_role.mention if operator_role is not None else "не назначена; админ-лобби недоступно",
+        inline=False,
+    )
+    embed.add_field(
+        name="Роль интереса",
+        value=interest_role.mention if interest_role is not None else "не назначена; public-комнаты видны всем",
+        inline=False,
+    )
+    embed.add_field(
+        name="Правило",
+        value="Админ-лобби всегда видят только bot и operator-role. Роль интереса применяется только к обычным public-комнатам.",
+        inline=False,
+    )
     return embed
 
 

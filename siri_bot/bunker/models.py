@@ -110,6 +110,7 @@ class RoomSetup:
 class BunkerGuildSettings:
     guild_id: int
     operator_role_id: int | None
+    interest_role_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -259,6 +260,7 @@ class BunkerGame:
     paused_at: datetime | None
     board_message_id: int | None
     profile: BunkerProfile | None
+    room_index: int = 0
     is_admin_game: bool = False
     recent_events: tuple[str, ...] = field(default_factory=tuple)
     finished_at: datetime | None = None

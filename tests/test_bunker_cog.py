@@ -9,12 +9,14 @@ import discord
 from siri_bot.cogs.bunker import (
     GAME_PANEL_ID,
     Bunker,
+    BunkerPrivatePlayerPanelView,
     BunkerPublicGameView,
     BunkerSettingsView,
     BunkerSetupIdleView,
     BunkerSetupNavView,
     format_player_name,
     _missing_setup_panel_permissions,
+    _setup_embed,
 )
 from siri_bot.bunker.models import BunkerPlayer, BunkerSettings, RoomSetup
 from siri_bot.bunker.models import BunkerGame, GameState
@@ -115,6 +117,12 @@ class BunkerCogTests(unittest.TestCase):
         self.assertEqual(len(buttons), 1)
         self.assertEqual(buttons[0].label, "Панель")
         self.assertEqual(buttons[0].custom_id, GAME_PANEL_ID)
+
+    def test_setup_embed_is_factory_not_busy_state(self) -> None:
+        embed = _setup_embed("build-a-bunker")
+
+        self.assertIn("Один пользователь может хостить только один активный бункер", embed.description)
+        self.assertNotIn("занята", embed.description.lower())
 
     def test_setup_private_panel_edits_saved_message_for_next_screen(self) -> None:
         setup = RoomSetup(
@@ -227,6 +235,47 @@ class BunkerCogTests(unittest.TestCase):
 
         self.assertIsNone(live)
         cog.repository.finish_game.assert_awaited_once_with(55)
+
+    def test_host_panel_can_close_own_bunker(self) -> None:
+        game = BunkerGame(
+            id=55,
+            guild_id=100,
+            setup_id=10,
+            setup_channel_id=300,
+            setup_message_id=500,
+            category_id=None,
+            game_text_channel_id=700,
+            voice_channel_id=800,
+            host_id=200,
+            state=GameState.LOBBY,
+            settings=BunkerSettings(),
+            round_number=0,
+            phase_started_at=None,
+            phase_ends_at=None,
+            paused_at=None,
+            board_message_id=None,
+            profile=None,
+        )
+        host = BunkerPlayer(
+            game_id=55,
+            user_id=200,
+            display_name="Host",
+            is_host=True,
+            ready_at=None,
+            invited_at=None,
+            joined_at=None,
+            left_at=None,
+            is_eliminated=False,
+            card=None,
+            revealed_stats=(),
+            used_special_action=False,
+            immune_round=None,
+        )
+
+        view = BunkerPrivatePlayerPanelView(object(), game, host, is_operator=False, can_close=True)
+        labels = [child.label for child in view.children if isinstance(child, discord.ui.Button)]
+
+        self.assertIn("Закрыть бункер", labels)
 
     def test_fake_player_name_has_no_discord_mention(self) -> None:
         player = BunkerPlayer(

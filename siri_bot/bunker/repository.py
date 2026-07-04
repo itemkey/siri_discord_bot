@@ -52,6 +52,7 @@ class BunkerRepository:
                 CREATE TABLE IF NOT EXISTS bunker_guild_settings (
                     guild_id BIGINT PRIMARY KEY,
                     operator_role_id BIGINT,
+                    interest_role_id BIGINT,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
@@ -94,13 +95,15 @@ class BunkerRepository:
                     bunker_profile JSONB,
                     recent_events JSONB NOT NULL DEFAULT '[]',
                     is_admin_game BOOLEAN NOT NULL DEFAULT FALSE,
+                    room_index INTEGER NOT NULL DEFAULT 0,
                     finished_at TIMESTAMPTZ,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
 
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_bunker_active_game_per_setup
-                    ON bunker_games (setup_id)
+                DROP INDEX IF EXISTS idx_bunker_active_game_per_setup;
+                CREATE INDEX IF NOT EXISTS idx_bunker_active_game_by_host
+                    ON bunker_games (guild_id, host_id)
                     WHERE finished_at IS NULL;
                 CREATE INDEX IF NOT EXISTS idx_bunker_game_text_channel
                     ON bunker_games (game_text_channel_id)
@@ -156,6 +159,8 @@ class BunkerRepository:
                 ALTER TABLE bunker_room_setups ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
                 ALTER TABLE bunker_room_setups ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 
+                ALTER TABLE bunker_guild_settings ADD COLUMN IF NOT EXISTS interest_role_id BIGINT;
+
                 ALTER TABLE bunker_content_packs ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT '';
                 ALTER TABLE bunker_content_packs ADD COLUMN IF NOT EXISTS content JSONB NOT NULL DEFAULT '{}';
                 ALTER TABLE bunker_content_packs ADD COLUMN IF NOT EXISTS is_enabled BOOLEAN NOT NULL DEFAULT TRUE;
@@ -172,6 +177,7 @@ class BunkerRepository:
                 ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS bunker_profile JSONB;
                 ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS recent_events JSONB NOT NULL DEFAULT '[]';
                 ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS is_admin_game BOOLEAN NOT NULL DEFAULT FALSE;
+                ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS room_index INTEGER NOT NULL DEFAULT 0;
                 ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ;
 
                 ALTER TABLE bunker_players ADD COLUMN IF NOT EXISTS ready_at TIMESTAMPTZ;
@@ -190,6 +196,10 @@ class BunkerRepository:
                     ON bunker_room_setups (setup_channel_id);
                 CREATE INDEX IF NOT EXISTS idx_bunker_content_packs_guild_id
                     ON bunker_content_packs (guild_id);
+                DROP INDEX IF EXISTS idx_bunker_active_game_per_setup;
+                CREATE INDEX IF NOT EXISTS idx_bunker_active_game_by_host
+                    ON bunker_games (guild_id, host_id)
+                    WHERE finished_at IS NULL;
                 """
             )
 
@@ -212,6 +222,20 @@ class BunkerRepository:
             VALUES ($1, $2)
             ON CONFLICT (guild_id)
             DO UPDATE SET operator_role_id = EXCLUDED.operator_role_id, updated_at = NOW()
+            RETURNING *
+            """,
+            guild_id,
+            role_id,
+        )
+        return _guild_settings_from_row(row)
+
+    async def set_interest_role(self, guild_id: int, role_id: int | None) -> BunkerGuildSettings:
+        row = await self.pool.fetchrow(
+            """
+            INSERT INTO bunker_guild_settings (guild_id, interest_role_id)
+            VALUES ($1, $2)
+            ON CONFLICT (guild_id)
+            DO UPDATE SET interest_role_id = EXCLUDED.interest_role_id, updated_at = NOW()
             RETURNING *
             """,
             guild_id,
@@ -433,6 +457,7 @@ class BunkerRepository:
         setup: RoomSetup,
         host_id: int,
         settings: BunkerSettings,
+        room_index: int,
         text_channel_id: int,
         voice_channel_id: int,
         host_display_name: str,
@@ -441,8 +466,15 @@ class BunkerRepository:
         async with self.pool.acquire() as connection:
             async with connection.transaction():
                 active = await connection.fetchrow(
-                    "SELECT id FROM bunker_games WHERE setup_id = $1 AND finished_at IS NULL",
-                    setup.id,
+                    """
+                    SELECT id
+                    FROM bunker_games
+                    WHERE guild_id = $1 AND host_id = $2 AND finished_at IS NULL
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    setup.guild_id,
+                    host_id,
                 )
                 if active is not None:
                     raise ActiveBunkerGameError(int(active["id"]))
@@ -452,9 +484,9 @@ class BunkerRepository:
                     INSERT INTO bunker_games (
                         guild_id, setup_id, setup_channel_id, setup_message_id, category_id,
                         game_text_channel_id, voice_channel_id, host_id, state, mode, is_public,
-                        slots, max_rounds, timer_seconds, settings, is_admin_game
+                        slots, max_rounds, timer_seconds, settings, is_admin_game, room_index
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'lobby', $9, $10, $11, $12, $13, $14::jsonb, $15)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'lobby', $9, $10, $11, $12, $13, $14::jsonb, $15, $16)
                     RETURNING *
                     """,
                     setup.guild_id,
@@ -472,6 +504,7 @@ class BunkerRepository:
                     settings.timer_seconds,
                     json.dumps(settings.to_json(), ensure_ascii=False),
                     is_admin_game,
+                    room_index,
                 )
                 await connection.execute(
                     """
@@ -484,17 +517,31 @@ class BunkerRepository:
                     host_id,
                     host_display_name,
                 )
-                await connection.execute(
-                    """
-                    UPDATE bunker_room_setups
-                    SET active_game_id = $2, updated_at = NOW()
-                    WHERE id = $1
-                    """,
-                    setup.id,
-                    int(row["id"]),
-                )
 
         return _game_from_row(row)
+
+    async def next_room_index(self, setup: RoomSetup) -> int:
+        if setup.category_id is None:
+            row = await self.pool.fetchrow(
+                """
+                SELECT COALESCE(MAX(room_index), 0) + 1 AS next_index
+                FROM bunker_games
+                WHERE guild_id = $1 AND setup_id = $2
+                """,
+                setup.guild_id,
+                setup.id,
+            )
+        else:
+            row = await self.pool.fetchrow(
+                """
+                SELECT COALESCE(MAX(room_index), 0) + 1 AS next_index
+                FROM bunker_games
+                WHERE guild_id = $1 AND category_id = $2
+                """,
+                setup.guild_id,
+                setup.category_id,
+            )
+        return int(row["next_index"]) if row is not None else 1
 
     async def get_active_game_by_setup(self, setup_id: int) -> BunkerGame | None:
         row = await self.pool.fetchrow(
@@ -509,12 +556,52 @@ class BunkerRepository:
         )
         return _game_from_row(row) if row else None
 
+    async def get_active_game_by_host(self, guild_id: int, host_id: int) -> BunkerGame | None:
+        row = await self.pool.fetchrow(
+            """
+            SELECT *
+            FROM bunker_games
+            WHERE guild_id = $1 AND host_id = $2 AND finished_at IS NULL
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            guild_id,
+            host_id,
+        )
+        return _game_from_row(row) if row else None
+
+    async def list_active_games_by_host(self, guild_id: int, host_id: int) -> list[BunkerGame]:
+        rows = await self.pool.fetch(
+            """
+            SELECT *
+            FROM bunker_games
+            WHERE guild_id = $1 AND host_id = $2 AND finished_at IS NULL
+            ORDER BY id DESC
+            """,
+            guild_id,
+            host_id,
+        )
+        return [_game_from_row(row) for row in rows]
+
     async def get_active_game_by_text_channel(self, channel_id: int) -> BunkerGame | None:
         row = await self.pool.fetchrow(
             """
             SELECT *
             FROM bunker_games
             WHERE game_text_channel_id = $1 AND finished_at IS NULL
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            channel_id,
+        )
+        return _game_from_row(row) if row else None
+
+    async def get_game_by_text_channel(self, channel_id: int) -> BunkerGame | None:
+        row = await self.pool.fetchrow(
+            """
+            SELECT *
+            FROM bunker_games
+            WHERE game_text_channel_id = $1
             ORDER BY id DESC
             LIMIT 1
             """,
@@ -891,6 +978,7 @@ def _guild_settings_from_row(row: asyncpg.Record) -> BunkerGuildSettings:
     return BunkerGuildSettings(
         guild_id=int(row["guild_id"]),
         operator_role_id=int(row["operator_role_id"]) if row["operator_role_id"] is not None else None,
+        interest_role_id=int(row["interest_role_id"]) if row["interest_role_id"] is not None else None,
     )
 
 
@@ -914,6 +1002,7 @@ def _game_from_row(row: asyncpg.Record) -> BunkerGame:
         paused_at=row["paused_at"],
         board_message_id=int(row["board_message_id"]) if row["board_message_id"] is not None else None,
         profile=BunkerProfile.from_json(_json_load(row["bunker_profile"])),
+        room_index=int(row["room_index"]),
         is_admin_game=bool(row["is_admin_game"]),
         recent_events=tuple(str(event) for event in _json_load(row["recent_events"], [])),
         finished_at=row["finished_at"],
