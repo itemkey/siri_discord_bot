@@ -29,8 +29,9 @@ from siri_bot.leveling.repository import LevelingRepository
 LOGGER = logging.getLogger(__name__)
 DURATION_PATTERN = re.compile(r"^(?P<amount>\d+)(?P<unit>s|m|h|d)$", re.IGNORECASE)
 LEADERBOARD_PAGE_SIZE = 10
-RANK_PANEL_DEFAULT_EMOJI = "📊"
-RANK_PANEL_COOLDOWN_SECONDS = 30
+RANK_PANEL_LEVEL_CUSTOM_ID = "siri:leveling:panel:rank"
+RANK_PANEL_LEADERBOARD_CUSTOM_ID = "siri:leveling:panel:leaderboard"
+RANK_PANEL_REFRESH_CUSTOM_ID = "siri:leveling:panel:refresh"
 
 
 class Leveling(commands.Cog):
@@ -45,8 +46,8 @@ class Leveling(commands.Cog):
         self.repository = repository
         self.pool = pool
         self._voice_synced_once = False
-        self._rank_panel_messages: dict[tuple[int, int], str] = {}
-        self._rank_panel_cooldowns: dict[tuple[int, int, int], datetime] = {}
+        self.bot.add_view(RankPanelView(self))
+        self.bot.add_view(RankRefreshView(self))
         self.voice_xp_tick.start()
 
     def cog_unload(self) -> None:
@@ -100,22 +101,13 @@ class Leveling(commands.Cog):
         if guild is None:
             return
 
-        is_rank_panel_message = (guild.id, payload.message_id) in self._rank_panel_messages
-        settings: LevelingSettings | None = None
-        if not is_rank_panel_message:
-            settings = await self.repository.get_settings(guild.id)
-            if not settings.enabled or settings.reaction_xp <= 0:
-                return
+        settings = await self.repository.get_settings(guild.id)
+        if not settings.enabled or settings.reaction_xp <= 0:
+            return
 
         reactor_is_bot = await self._is_user_bot(payload)
         if reactor_is_bot:
             return
-
-        if await self._handle_rank_panel_reaction(payload, guild):
-            return
-
-        if settings is None:
-            settings = await self.repository.get_settings(guild.id)
 
         message = await self._fetch_reaction_message(payload)
         if message is None or message.author.bot or message.author.id == payload.user_id:
@@ -222,40 +214,17 @@ class Leveling(commands.Cog):
         if guild is None:
             return
 
-        settings = await self.repository.get_settings(guild.id)
-        entries = await self.repository.get_leaderboard(
-            guild.id,
-            limit=LEADERBOARD_PAGE_SIZE,
-            offset=(page - 1) * LEADERBOARD_PAGE_SIZE,
-        )
-        if not entries:
+        embed = await self._build_leaderboard_embed(guild, page=page)
+        if embed is None:
             await interaction.response.send_message("Пока нет XP в таблице лидеров.", ephemeral=True)
             return
 
-        lines: list[str] = []
-        for entry in entries:
-            progress = progress_for_total_xp(entry.total_xp, settings.formula)
-            member = guild.get_member(entry.user_id)
-            name = member.mention if member else f"<@{entry.user_id}>"
-            lines.append(f"#{entry.rank} {name} - level {progress.level}, {entry.total_xp} XP")
-
-        embed = discord.Embed(
-            title=f"Leaderboard: {guild.name}",
-            description="\n".join(lines),
-            color=discord.Color.gold(),
-        )
-        embed.set_footer(text=f"Page {page}")
         await interaction.response.send_message(embed=embed)
 
     @leveling_group.command(name="panel", description="Отправить интерактивную XP-панель в канал.")
-    @app_commands.describe(channel="Канал для панели", emoji="Emoji реакции. По умолчанию 📊")
+    @app_commands.describe(channel="Канал для панели")
     @admin_only()
-    async def panel_command(
-        self,
-        interaction: discord.Interaction,
-        channel: discord.TextChannel,
-        emoji: app_commands.Range[str, 1, 100] = RANK_PANEL_DEFAULT_EMOJI,
-    ) -> None:
+    async def panel_command(self, interaction: discord.Interaction, channel: discord.TextChannel) -> None:
         guild = await self._require_guild(interaction)
         if guild is None:
             return
@@ -264,36 +233,27 @@ class Leveling(commands.Cog):
             await interaction.response.send_message("Канал должен быть на этом же сервере.", ephemeral=True)
             return
 
-        emoji_text = str(emoji).strip() or RANK_PANEL_DEFAULT_EMOJI
         embed = discord.Embed(
             title="XP-панель",
             description=(
-                f"Нажми {emoji_text}, чтобы узнать свой уровень, XP, место "
-                "и прогресс до следующего уровня."
+                "Нажимай кнопки ниже, чтобы смотреть актуальный уровень, XP, "
+                "прогресс до следующего уровня и топ сервера."
             ),
             color=discord.Color.teal(),
         )
-        embed.set_footer(text="Информация появится следующим сообщением в этом канале.")
+        embed.add_field(name="Мой уровень", value="Личная карточка с твоим текущим прогрессом.", inline=False)
+        embed.add_field(name="Топ сервера", value="Личная таблица лидеров без спама в канал.", inline=False)
+        embed.set_footer(text="Ответы видит только тот, кто нажал кнопку.")
 
-        message: discord.Message | None = None
         try:
-            message = await channel.send(embed=embed)
-            await message.add_reaction(emoji_text)
-        except (discord.HTTPException, TypeError, ValueError):
-            if message is not None:
-                try:
-                    await message.delete()
-                except discord.HTTPException:
-                    pass
-
+            await channel.send(embed=embed, view=RankPanelView(self))
+        except discord.HTTPException:
             await interaction.response.send_message(
-                "Не смог отправить XP-панель или поставить эту emoji-реакцию. "
-                "Проверь права бота и корректность emoji.",
+                "Не смог отправить XP-панель. Проверь права бота в выбранном канале.",
                 ephemeral=True,
             )
             return
 
-        self._rank_panel_messages[(guild.id, message.id)] = emoji_text
         await interaction.response.send_message(f"XP-панель отправлена в {channel.mention}.", ephemeral=True)
 
     @leveling_group.command(name="settings", description="Показать настройки leveling.")
@@ -745,57 +705,61 @@ class Leveling(commands.Cog):
 
         return _rank_embed(guild, target, progress, rank_number)
 
-    async def _handle_rank_panel_reaction(
-        self,
-        payload: discord.RawReactionActionEvent,
-        guild: discord.Guild,
-    ) -> bool:
-        panel_emoji = self._rank_panel_messages.get((guild.id, payload.message_id))
-        if panel_emoji is None:
-            return False
-
-        if str(payload.emoji) != panel_emoji:
-            return True
-
-        now = datetime.now(UTC)
-        cooldown_key = (guild.id, payload.message_id, payload.user_id)
-        available_at = self._rank_panel_cooldowns.get(cooldown_key)
-        if available_at is not None and available_at > now:
-            return True
-
-        self._rank_panel_cooldowns[cooldown_key] = now + timedelta(seconds=RANK_PANEL_COOLDOWN_SECONDS)
-
-        target: discord.User | discord.Member | None = payload.member or guild.get_member(payload.user_id)
-        if target is None:
-            try:
-                target = await self.bot.fetch_user(payload.user_id)
-            except discord.HTTPException:
-                return True
-
-        channel = await self._get_messageable_channel(payload.channel_id)
-        if channel is None:
-            return True
-
-        embed = await self._build_rank_embed(guild, target)
-        try:
-            await channel.send(embed=embed)
-        except discord.HTTPException:
-            LOGGER.exception("Failed to send rank panel response in channel %s", payload.channel_id)
-
-        return True
-
-    async def _get_messageable_channel(self, channel_id: int) -> discord.abc.Messageable | None:
-        channel = self.bot.get_channel(channel_id)
-        if channel is None:
-            try:
-                channel = await self.bot.fetch_channel(channel_id)
-            except discord.HTTPException:
-                return None
-
-        if not isinstance(channel, discord.abc.Messageable):
+    async def _build_leaderboard_embed(self, guild: discord.Guild, *, page: int = 1) -> discord.Embed | None:
+        settings = await self.repository.get_settings(guild.id)
+        entries = await self.repository.get_leaderboard(
+            guild.id,
+            limit=LEADERBOARD_PAGE_SIZE,
+            offset=(page - 1) * LEADERBOARD_PAGE_SIZE,
+        )
+        if not entries:
             return None
 
-        return channel
+        lines: list[str] = []
+        for entry in entries:
+            progress = progress_for_total_xp(entry.total_xp, settings.formula)
+            member = guild.get_member(entry.user_id)
+            name = member.mention if member else f"<@{entry.user_id}>"
+            lines.append(_leaderboard_entry_line(entry.rank, name, progress.level, entry.total_xp))
+
+        embed = discord.Embed(
+            title=f"Leaderboard: {guild.name}",
+            description="\n".join(lines),
+            color=discord.Color.gold(),
+        )
+        embed.set_footer(text=f"Page {page}")
+        return embed
+
+    async def _send_rank_panel_response(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Эта кнопка работает только на сервере.", ephemeral=True)
+            return
+
+        embed = await self._build_rank_embed(guild, interaction.user)
+        await interaction.response.send_message(embed=embed, view=RankRefreshView(self), ephemeral=True)
+
+    async def _send_leaderboard_panel_response(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Эта кнопка работает только на сервере.", ephemeral=True)
+            return
+
+        embed = await self._build_leaderboard_embed(guild, page=1)
+        if embed is None:
+            await interaction.response.send_message("Пока нет XP в таблице лидеров.", ephemeral=True)
+            return
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    async def _refresh_rank_panel_response(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Эта кнопка работает только на сервере.", ephemeral=True)
+            return
+
+        embed = await self._build_rank_embed(guild, interaction.user)
+        await interaction.response.edit_message(embed=embed, view=RankRefreshView(self))
 
     async def _award_xp(self, member: discord.Member, settings: LevelingSettings, base_xp: int) -> XpChange | None:
         if base_xp <= 0:
@@ -978,6 +942,46 @@ class Leveling(commands.Cog):
     def _can_manage_role(self, guild: discord.Guild, role: discord.Role) -> bool:
         me = guild.me
         return bool(me and me.guild_permissions.manage_roles and role < me.top_role and not role.managed)
+
+
+class RankPanelView(discord.ui.View):
+    def __init__(self, cog: Leveling) -> None:
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    @discord.ui.button(
+        label="Мой уровень",
+        style=discord.ButtonStyle.primary,
+        custom_id=RANK_PANEL_LEVEL_CUSTOM_ID,
+    )
+    async def show_rank(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog._send_rank_panel_response(interaction)
+
+    @discord.ui.button(
+        label="Топ сервера",
+        style=discord.ButtonStyle.secondary,
+        custom_id=RANK_PANEL_LEADERBOARD_CUSTOM_ID,
+    )
+    async def show_leaderboard(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog._send_leaderboard_panel_response(interaction)
+
+
+class RankRefreshView(discord.ui.View):
+    def __init__(self, cog: Leveling) -> None:
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    @discord.ui.button(
+        label="Обновить",
+        style=discord.ButtonStyle.success,
+        custom_id=RANK_PANEL_REFRESH_CUSTOM_ID,
+    )
+    async def refresh_rank(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog._refresh_rank_panel_response(interaction)
+
+
+def _leaderboard_entry_line(rank: int, name: str, level: int, total_xp: int) -> str:
+    return f"#{rank} {name} - level {level}, {total_xp} XP"
 
 
 def _rank_embed(
