@@ -277,6 +277,50 @@ class BunkerCogTests(unittest.TestCase):
 
         self.assertIn("Закрыть бункер", labels)
 
+    def test_lobby_panel_hides_active_game_actions(self) -> None:
+        game = BunkerGame(
+            id=55,
+            guild_id=100,
+            setup_id=10,
+            setup_channel_id=300,
+            setup_message_id=500,
+            category_id=None,
+            game_text_channel_id=700,
+            voice_channel_id=800,
+            host_id=200,
+            state=GameState.LOBBY,
+            settings=BunkerSettings(),
+            round_number=0,
+            phase_started_at=None,
+            phase_ends_at=None,
+            paused_at=None,
+            board_message_id=None,
+            profile=None,
+        )
+        player = BunkerPlayer(
+            game_id=55,
+            user_id=201,
+            display_name="Player",
+            is_host=False,
+            ready_at=None,
+            invited_at=None,
+            joined_at=None,
+            left_at=None,
+            is_eliminated=False,
+            card=None,
+            revealed_stats=(),
+            used_special_action=False,
+            immune_round=None,
+        )
+
+        view = BunkerPrivatePlayerPanelView(object(), game, player, is_operator=False, can_close=False)
+        labels = [child.label for child in view.children if isinstance(child, discord.ui.Button)]
+
+        self.assertIn("Готов", labels)
+        self.assertNotIn("Моя карточка", labels)
+        self.assertNotIn("Раскрыть стату", labels)
+        self.assertNotIn("Голосовать", labels)
+
     def test_fake_player_name_has_no_discord_mention(self) -> None:
         player = BunkerPlayer(
             game_id=1,

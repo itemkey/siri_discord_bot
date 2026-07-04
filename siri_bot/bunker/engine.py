@@ -43,18 +43,38 @@ def recommended_rounds(slots: int, mode: GameMode = GameMode.CLASSIC) -> int:
 
 def normalize_settings(settings: BunkerSettings) -> BunkerSettings:
     slots = max(MIN_PLAYERS, min(MAX_PLAYERS, settings.slots))
+    min_players = max(1, min(slots, settings.min_players))
+    bunker_seats = settings.bunker_seats
+    if bunker_seats is not None:
+        bunker_seats = max(1, min(slots - 1, bunker_seats))
     rounds = max(3, min(6, settings.rounds or recommended_rounds(slots, settings.mode)))
     timer = max(30, min(900, settings.timer_seconds))
     if settings.mode == GameMode.TURBO:
         timer = max(30, timer // 2)
 
-    return replace(settings, slots=slots, rounds=rounds, timer_seconds=timer)
+    return replace(
+        settings,
+        slots=slots,
+        rounds=rounds,
+        timer_seconds=timer,
+        min_players=min_players,
+        bunker_seats=bunker_seats,
+        speech_seconds=max(15, min(300, settings.speech_seconds)),
+        discussion_seconds=max(30, min(900, settings.discussion_seconds)),
+        voting_seconds=max(15, min(300, settings.voting_seconds)),
+        revote_seconds=max(15, min(180, settings.revote_seconds)),
+    )
 
 
-def can_start_game(players: Iterable[BunkerPlayer]) -> tuple[bool, str]:
+def can_start_game(players: Iterable[BunkerPlayer], *, min_players: int = MIN_PLAYERS, ranked: bool = False) -> tuple[bool, str]:
     active = [player for player in players if player.is_active]
-    if len(active) < MIN_PLAYERS:
-        return False, f"Нужно минимум {MIN_PLAYERS} игроков."
+    if len(active) < min_players:
+        return False, f"Нужно минимум {min_players} игроков."
+
+    if ranked:
+        real_players = [player for player in active if not player.is_fake]
+        if len(real_players) < min_players:
+            return False, "Ranked не стартует с тест-ботами или недостатком реальных игроков."
 
     waiting = [player.display_name for player in active if not player.is_host and player.ready_at is None]
     if waiting:
@@ -196,7 +216,7 @@ def tally_votes(
 
 def should_enter_final(game: BunkerGame, players: list[BunkerPlayer]) -> bool:
     alive_count = sum(1 for player in players if player.is_alive)
-    target = max(FINAL_ALIVE_FLOOR, game.settings.slots // 2)
+    target = max(FINAL_ALIVE_FLOOR, game.settings.bunker_seats or game.settings.slots // 2)
     return game.round_number >= game.settings.rounds or alive_count <= target
 
 
@@ -216,14 +236,14 @@ def phase_deadline(settings: BunkerSettings, state: GameState, now: datetime | N
     if state in {GameState.LOBBY, GameState.PREPARING, GameState.FINAL_PHASE, GameState.FINISHED}:
         return None
 
-    multiplier = {
-        GameState.REVEAL_PHASE: 1.0,
-        GameState.DISCUSSION_PHASE: 1.5,
-        GameState.CHAOS_PHASE: 0.75,
-        GameState.VOTING_PHASE: 1.0,
-        GameState.ELIMINATION_PHASE: 0.5,
-    }.get(state, 1.0)
-    return now + timedelta(seconds=max(30, int(settings.timer_seconds * multiplier)))
+    seconds_by_state = {
+        GameState.REVEAL_PHASE: settings.timer_seconds,
+        GameState.DISCUSSION_PHASE: settings.discussion_seconds,
+        GameState.CHAOS_PHASE: max(30, settings.timer_seconds // 2),
+        GameState.VOTING_PHASE: settings.voting_seconds,
+        GameState.ELIMINATION_PHASE: settings.revote_seconds,
+    }
+    return now + timedelta(seconds=max(15, int(seconds_by_state.get(state, settings.timer_seconds))))
 
 
 def final_epilogue(game: BunkerGame, players: list[BunkerPlayer], rng: random.Random | None = None) -> str:

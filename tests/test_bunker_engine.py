@@ -64,6 +64,14 @@ class BunkerEngineTests(unittest.TestCase):
 
         self.assertTrue(ok)
 
+    def test_ranked_start_rejects_fake_players(self) -> None:
+        players = [_player(1, host=True)] + [_player(-index, ready=True, fake=True) for index in range(2, 7)]
+
+        ok, message = can_start_game(players, ranked=True)
+
+        self.assertFalse(ok)
+        self.assertIn("Ranked", message)
+
     def test_assign_cards_uses_selected_content_pack(self) -> None:
         pack = ContentPack(
             professions=("Кастомный инженер",),

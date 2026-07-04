@@ -7,7 +7,6 @@ import random
 import re
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from io import BytesIO
 from typing import Any
 
 import asyncpg
@@ -15,7 +14,6 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from siri_bot.bunker.board import render_board_png
 from siri_bot.bunker.content import (
     BUILTIN_PACK,
     PACK_FIELD_LABELS,
@@ -62,6 +60,7 @@ from siri_bot.bunker.permissions import (
 )
 from siri_bot.bunker.repository import ActiveBunkerGameError, BunkerRepository
 from siri_bot.checks import admin_only
+from siri_bot.leveling.repository import LevelingRepository
 
 
 LOGGER = logging.getLogger(__name__)
@@ -93,9 +92,16 @@ class Bunker(commands.Cog):
     bunker_group = app_commands.Group(name="bunker", description="Команды игры Бункер.")
     opbunker_group = app_commands.Group(name="opbunker", description="Админ-настройки Бункера.")
 
-    def __init__(self, bot: commands.Bot, repository: BunkerRepository, pool: asyncpg.Pool) -> None:
+    def __init__(
+        self,
+        bot: commands.Bot,
+        repository: BunkerRepository,
+        pool: asyncpg.Pool,
+        leveling_repository: LevelingRepository | None = None,
+    ) -> None:
         self.bot = bot
         self.repository = repository
+        self.leveling_repository = leveling_repository or LevelingRepository(pool)
         self.pool = pool
         self._setup_private_panels: dict[tuple[int, int, int], Any] = {}
         self._game_private_panels: dict[tuple[int, int, int], Any] = {}
@@ -207,6 +213,143 @@ class Bunker(commands.Cog):
             return
 
         await self.open_bunker_admin_panel(interaction)
+
+    @bunker_group.command(name="create", description="Построить новый бункер из текущей setup-комнаты.")
+    async def create_command(self, interaction: discord.Interaction) -> None:
+        await self.build_bunker(interaction)
+
+    @bunker_group.command(name="join", description="Войти в бункер в текущем игровом канале.")
+    async def join_command(self, interaction: discord.Interaction) -> None:
+        await self.join_from_game(interaction)
+
+    @bunker_group.command(name="leave", description="Покинуть текущий бункер до старта.")
+    async def leave_command(self, interaction: discord.Interaction) -> None:
+        await self.leave_game(interaction)
+
+    @bunker_group.command(name="panel", description="Открыть личную панель текущего бункера.")
+    async def panel_command(self, interaction: discord.Interaction) -> None:
+        await self.open_game_panel(interaction)
+
+    @bunker_group.command(name="rules", description="Показать правила Бункера.")
+    async def rules_command(self, interaction: discord.Interaction) -> None:
+        game = await self._game_from_interaction_channel(interaction)
+        if game is not None:
+            if game.state == GameState.LOBBY:
+                await self.open_game_panel(interaction, screen="rules")
+            else:
+                await interaction.response.send_message(embed=_rules_embed(), ephemeral=True)
+            return
+        await interaction.response.send_message(embed=_rules_embed(), ephemeral=True)
+
+    @bunker_group.command(name="stats", description="Показать свои результаты Бункера.")
+    async def stats_command(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("Статистика Бункера работает только на сервере.", ephemeral=True)
+            return
+        try:
+            total_xp = await self.leveling_repository.get_member_xp(interaction.guild.id, interaction.user.id)
+            rank = await self.leveling_repository.get_member_rank(interaction.guild.id, interaction.user.id)
+        except asyncpg.PostgresError:
+            LOGGER.exception("Could not load bunker stats from leveling tables.")
+            await interaction.response.send_message("Не смог прочитать XP-таблицу. Проверь PostgreSQL и leveling-схему.", ephemeral=True)
+            return
+        await interaction.response.send_message(f"Твой общий XP после ranked-игр Бункера: {total_xp}. Место в общем рейтинге: #{rank}.", ephemeral=True)
+
+    @bunker_group.command(name="leaderboard", description="Показать таблицу лидеров Бункера.")
+    async def leaderboard_command(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("Лидерборд Бункера работает только на сервере.", ephemeral=True)
+            return
+        try:
+            entries = await self.leveling_repository.get_leaderboard(interaction.guild.id, limit=10, offset=0)
+        except asyncpg.PostgresError:
+            LOGGER.exception("Could not load bunker leaderboard from leveling tables.")
+            await interaction.response.send_message("Не смог прочитать XP-лидерборд. Проверь PostgreSQL и leveling-схему.", ephemeral=True)
+            return
+        if not entries:
+            await interaction.response.send_message("В XP-лидерборде пока пусто.", ephemeral=True)
+            return
+        lines = [f"{entry.rank}. <@{entry.user_id}> - {entry.total_xp} XP" for entry in entries]
+        await interaction.response.send_message(
+            embed=discord.Embed(title="Лидерборд Бункера", description="\n".join(lines), color=discord.Color.gold()),
+            ephemeral=True,
+        )
+
+    @bunker_group.command(name="room-cleanup", description="Проверить и закрыть зависшие временные комнаты Бункера.")
+    async def room_cleanup_command(self, interaction: discord.Interaction) -> None:
+        if not await self._is_bunker_admin_or_operator(interaction):
+            await interaction.response.send_message("Cleanup доступен только админу или operator-role Бункера.", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        await self.reconcile_open_games()
+        await interaction.followup.send("Проверка комнат завершена. Зависшие партии с удаленными каналами закрыты.", ephemeral=True)
+
+    @bunker_group.command(name="pack-validate", description="Проверить контент-пак Бункера по счетчикам.")
+    @app_commands.describe(pack_id="ID кастомного пака из /bunkeradminpanel; пусто = встроенный пак")
+    async def pack_validate_command(self, interaction: discord.Interaction, pack_id: int | None = None) -> None:
+        if not await self._is_bunker_admin_or_operator(interaction):
+            await interaction.response.send_message("Проверка паков доступна только админу или operator-role Бункера.", ephemeral=True)
+            return
+        if interaction.guild is None:
+            await interaction.response.send_message("Паки Бункера проверяются только на сервере.", ephemeral=True)
+            return
+        if pack_id is None:
+            counts = BUILTIN_PACK.counts()
+            name = "встроенный"
+        else:
+            pack = await self.repository.get_content_pack(pack_id, guild_id=interaction.guild.id)
+            if pack is None:
+                await interaction.response.send_message("Пак не найден.", ephemeral=True)
+                return
+            counts = {field: len(pack.content.get(field, ())) for field in PACK_FIELDS}
+            name = pack.name
+        missing = [PACK_FIELD_LABELS[field] for field, count in counts.items() if count <= 0]
+        lines = [f"{PACK_FIELD_LABELS[field]}: {count}" for field, count in counts.items()]
+        status = "Пак можно использовать." if not missing else "Не хватает категорий: " + ", ".join(missing)
+        await interaction.response.send_message(
+            embed=discord.Embed(
+                title=f"Проверка пака: {name}",
+                description=f"{status}\n```text\n{chr(10).join(lines)[:1800]}\n```",
+                color=discord.Color.green() if not missing else discord.Color.red(),
+            ),
+            ephemeral=True,
+        )
+
+    @bunker_group.command(name="add-test-bots", description="Добавить тест-ботов в текущее лобби Бункера.")
+    async def add_test_bots_command(self, interaction: discord.Interaction) -> None:
+        if not await self._is_bunker_operator(interaction):
+            await interaction.response.send_message("Тест-боты доступны только operator-role Бункера.", ephemeral=True)
+            return
+        game = await self._require_game_channel(interaction)
+        if game is None:
+            return
+        if game.settings.is_ranked:
+            await interaction.response.send_message("В ranked нельзя добавлять тест-ботов.", ephemeral=True)
+            return
+        added = await self.repository.add_fake_players(game.id, game.settings.slots)
+        await self.refresh_game_message(game.id)
+        await interaction.response.send_message(f"Добавлено тест-ботов: {len(added)}.", ephemeral=True)
+
+    @bunker_group.command(name="force-phase", description="Debug: перейти к следующей фазе текущего Бункера.")
+    async def force_phase_command(self, interaction: discord.Interaction) -> None:
+        if not await self._is_bunker_operator(interaction):
+            await interaction.response.send_message("Смена фазы доступна только operator-role Бункера.", ephemeral=True)
+            return
+        game = await self._require_game_channel(interaction)
+        if game is None:
+            return
+        if game.settings.is_ranked:
+            await interaction.response.send_message("В ranked нельзя вручную менять фазу.", ephemeral=True)
+            return
+        await self.advance_phase(game)
+        await interaction.response.send_message("Фаза сдвинута.", ephemeral=True)
+
+    @bunker_group.command(name="debug", description="Открыть debug-панель текущего Бункера.")
+    async def debug_command(self, interaction: discord.Interaction) -> None:
+        if not await self._is_bunker_operator(interaction):
+            await interaction.response.send_message("Debug доступен только operator-role Бункера.", ephemeral=True)
+            return
+        await self.open_game_panel(interaction, status="Debug-режим: доступны тест-боты, форс-старт и смена фазы для casual/admin игры.")
 
     @bunker_group.command(name="card", description="Показать свою карточку в текущей партии.")
     async def card_command(self, interaction: discord.Interaction) -> None:
@@ -753,9 +896,12 @@ class Bunker(commands.Cog):
         await self._close_game_channels(game, reason="Bunker room closed")
 
     async def _close_game_channels(self, game: BunkerGame, *, reason: str) -> None:
-        await self.repository.finish_game(game.id)
-        await self.refresh_setup_message(game)
+        players = await self.repository.list_players(game.id)
         voice_channel = await self._fetch_voice_channel(game.voice_channel_id)
+        if voice_channel is not None:
+            await self._sync_voice_state(replace(game, state=GameState.FINISHED), voice_channel, players)
+        await self.repository.close_game(game.id)
+        await self.refresh_setup_message(game)
         text_channel = await self._fetch_text_channel(game.game_text_channel_id)
         if voice_channel is not None:
             try:
@@ -985,7 +1131,7 @@ class Bunker(commands.Cog):
 
         players = await self.repository.list_players(game.id)
         if not force:
-            ok, reason = can_start_game(players)
+            ok, reason = can_start_game(players, min_players=game.settings.min_players, ranked=game.settings.is_ranked)
             if not ok:
                 return reason
 
@@ -1258,6 +1404,17 @@ class Bunker(commands.Cog):
     @phase_tick.before_loop
     async def before_phase_tick(self) -> None:
         await self.bot.wait_until_ready()
+        await self.reconcile_open_games()
+
+    async def reconcile_open_games(self) -> None:
+        list_open_games = getattr(self.repository, "list_open_games", None)
+        if list_open_games is None:
+            return
+        for game in await list_open_games():
+            try:
+                await self._ensure_game_discord_state(game)
+            except Exception:
+                LOGGER.exception("Failed to reconcile bunker game %s", game.id)
 
     async def advance_phase(self, game: BunkerGame) -> None:
         now = datetime.now(UTC)
@@ -1348,6 +1505,7 @@ class Bunker(commands.Cog):
         players = await self.repository.list_players(game.id)
         epilogue = final_epilogue(game, players)
         await self.repository.add_event(game.id, game.round_number, "final", epilogue)
+        await self._award_ranked_xp(game, players)
         await self.repository.set_game_state(
             game.id,
             GameState.FINAL_PHASE,
@@ -1360,6 +1518,27 @@ class Bunker(commands.Cog):
         await self.repository.finish_game(game.id)
         await self.refresh_setup_message(game)
 
+    async def _award_ranked_xp(self, game: BunkerGame, players: list[BunkerPlayer]) -> None:
+        if not game.settings.is_ranked or game.is_admin_game:
+            return
+        real_players = [player for player in players if player.is_active and not player.is_fake and player.user_id > 0]
+        if len(real_players) < game.settings.min_players:
+            return
+        try:
+            leveling_settings = await self.leveling_repository.get_settings(game.guild_id)
+            if not leveling_settings.enabled:
+                return
+            for player in real_players:
+                amount = 10
+                if player.is_alive:
+                    amount += 25
+                    amount += 50
+                if not await self.repository.record_xp_award_once(game.id, player.user_id, amount):
+                    continue
+                await self.leveling_repository.add_xp(game.guild_id, player.user_id, amount, leveling_settings.formula)
+        except asyncpg.PostgresError:
+            LOGGER.exception("Could not award ranked bunker XP for game %s.", game.id)
+
     async def refresh_game_message(self, game_id: int) -> None:
         game = await self.repository.get_game(game_id)
         if game is None:
@@ -1368,7 +1547,7 @@ class Bunker(commands.Cog):
         channel = await self._fetch_text_channel(game.game_text_channel_id)
         voice_channel = await self._fetch_voice_channel(game.voice_channel_id)
         if channel is None or voice_channel is None:
-            await self.repository.finish_game(game.id)
+            await self.repository.close_game(game.id)
             return
 
         message = await self._ensure_board_message(game, channel)
@@ -1377,26 +1556,15 @@ class Bunker(commands.Cog):
         game = await self.repository.get_game(game.id) or game
 
         players = await self.repository.list_players(game.id)
+        await self._sync_voice_state(game, voice_channel, players)
         embed = _game_embed(game, players)
-        try:
-            image_bytes = render_board_png(game, players)
-            file = discord.File(BytesIO(image_bytes), filename="bunker_board.png")
-            embed.set_image(url="attachment://bunker_board.png")
-            await message.edit(embed=embed, attachments=[file], view=BunkerPublicGameView(self))
-        except Exception:
-            LOGGER.exception("Could not render bunker board for game %s", game.id)
-            await message.edit(embed=embed, view=BunkerPublicGameView(self))
+        await message.edit(embed=embed, attachments=[], view=BunkerPublicGameView(self))
+        if game.state != GameState.LOBBY:
+            await self._sync_public_game_messages(game, channel, players)
 
     async def _send_board_message(self, channel: discord.TextChannel, game: BunkerGame, players: list[BunkerPlayer]) -> discord.Message:
         embed = _game_embed(game, players)
-        try:
-            image_bytes = render_board_png(game, players)
-            file = discord.File(BytesIO(image_bytes), filename="bunker_board.png")
-            embed.set_image(url="attachment://bunker_board.png")
-            return await channel.send(embed=embed, file=file, view=BunkerPublicGameView(self))
-        except Exception:
-            LOGGER.exception("Could not render bunker board for game %s", game.id)
-            return await channel.send(embed=embed, view=BunkerPublicGameView(self))
+        return await channel.send(embed=embed, view=BunkerPublicGameView(self))
 
     async def _ensure_board_message(self, game: BunkerGame, channel: discord.TextChannel) -> discord.Message | None:
         if game.board_message_id is not None:
@@ -1414,6 +1582,46 @@ class Bunker(commands.Cog):
         await self.repository.set_board_message(game.id, message.id)
         return message
 
+    async def _sync_public_game_messages(
+        self,
+        game: BunkerGame,
+        channel: discord.TextChannel,
+        players: list[BunkerPlayer],
+    ) -> None:
+        payloads: dict[str, discord.Embed] = {
+            "cataclysm": _cataclysm_embed(game),
+            "bunker": _bunker_profile_embed(game),
+            "players": _players_table_embed(game, players),
+            "abilities": _abilities_table_embed(players),
+        }
+        for key, embed in payloads.items():
+            await self._ensure_public_message(game, channel, key, embed)
+
+    async def _ensure_public_message(
+        self,
+        game: BunkerGame,
+        channel: discord.TextChannel,
+        key: str,
+        embed: discord.Embed,
+    ) -> discord.Message | None:
+        message_id = game.public_message_ids.get(key)
+        if message_id is not None:
+            try:
+                message = await channel.fetch_message(message_id)
+                await message.edit(embed=embed, attachments=[], view=None)
+                return message
+            except discord.HTTPException:
+                LOGGER.info("Bunker public message %s/%s is missing; recreating.", game.id, key, exc_info=True)
+
+        try:
+            message = await channel.send(embed=embed)
+        except discord.HTTPException:
+            LOGGER.info("Could not send bunker public message %s/%s.", game.id, key, exc_info=True)
+            return None
+        await self.repository.set_public_message_id(game.id, key, message.id)
+        game.public_message_ids[key] = message.id
+        return message
+
     async def _ensure_game_discord_state(self, game: BunkerGame | None) -> BunkerGame | None:
         if game is None:
             return None
@@ -1421,7 +1629,11 @@ class Bunker(commands.Cog):
         text_channel = await self._fetch_text_channel(game.game_text_channel_id)
         voice_channel = await self._fetch_voice_channel(game.voice_channel_id)
         if text_channel is None or voice_channel is None:
-            await self.repository.finish_game(game.id)
+            close_game = getattr(self.repository, "close_game", None)
+            if close_game is not None:
+                await close_game(game.id)
+            else:
+                await self.repository.finish_game(game.id)
             LOGGER.info("Finished stale bunker game %s because its Discord channels are missing.", game.id)
             return None
 
@@ -1695,6 +1907,39 @@ class Bunker(commands.Cog):
             return False
         return True
 
+    async def _sync_voice_state(
+        self,
+        game: BunkerGame,
+        voice_channel: discord.VoiceChannel | None,
+        players: list[BunkerPlayer],
+    ) -> None:
+        if voice_channel is None:
+            return
+        player_ids = {player.user_id for player in players if player.is_active and not player.is_fake}
+        if not player_ids:
+            return
+
+        should_mute = game.settings.is_ranked and game.state == GameState.VOTING_PHASE
+        should_unmute = game.state in {
+            GameState.LOBBY,
+            GameState.DISCUSSION_PHASE,
+            GameState.FINAL_PHASE,
+            GameState.FINISHED,
+        }
+        if not should_mute and not should_unmute:
+            return
+
+        for member in list(voice_channel.members):
+            if member.id not in player_ids:
+                continue
+            target_mute = should_mute
+            if member.voice is not None and member.voice.mute == target_mute:
+                continue
+            try:
+                await member.edit(mute=target_mute, reason="Bunker phase voice control")
+            except discord.HTTPException:
+                LOGGER.info("Could not update bunker voice mute for member %s.", member.id, exc_info=True)
+
 
 class BunkerSetupIdleView(discord.ui.View):
     def __init__(self, cog: Bunker) -> None:
@@ -1747,26 +1992,34 @@ class BunkerPrivatePlayerPanelView(discord.ui.View):
         self._build()
 
     def _build(self) -> None:
-        if self.game.state == GameState.LOBBY and self.player is None:
+        in_lobby = self.game.state == GameState.LOBBY
+        is_active_player = self.player is not None and self.player.is_active
+        is_alive_player = is_active_player and not self.player.is_eliminated
+
+        if in_lobby and self.player is None:
             self._add_button("Зайти в бункер", discord.ButtonStyle.success, self._join, row=0)
 
-        if self.player is not None and self.player.is_active and not self.player.is_host and self.player.ready_at is None and self.game.state == GameState.LOBBY:
+        if is_active_player and not self.player.is_host and self.player.ready_at is None and in_lobby:
             self._add_button("Готов", discord.ButtonStyle.primary, self._ready, row=0)
 
-        if self.player is not None and self.player.is_active and not self.player.is_host and self.game.state == GameState.LOBBY:
+        if is_active_player and not self.player.is_host and in_lobby:
             self._add_button("Покинуть", discord.ButtonStyle.secondary, self._leave, row=0)
 
-        if self.player is not None and self.player.is_host and self.game.state == GameState.LOBBY:
+        if is_active_player and self.player.is_host and in_lobby:
             self._add_button("Начать", discord.ButtonStyle.danger, self._start, row=0)
 
-        if self.player is not None and self.player.is_active:
+        if is_active_player and not in_lobby and self.player.card is not None:
             self._add_button("Моя карточка", discord.ButtonStyle.secondary, self._card, row=1)
+        if is_alive_player and self.game.state == GameState.REVEAL_PHASE:
             self._add_button("Раскрыть стату", discord.ButtonStyle.primary, self._reveal, row=1)
+        if is_alive_player and not in_lobby and self.player.card is not None and not self.player.used_special_action:
             self._add_button("Действие", discord.ButtonStyle.secondary, self._action, row=1)
+        if is_alive_player and self.game.state == GameState.VOTING_PHASE:
             self._add_button("Голосовать", discord.ButtonStyle.primary, self._vote, row=1)
 
-        self._add_button("Правила", discord.ButtonStyle.secondary, self._rules, row=2)
-        if self.player is not None and self.player.is_active and self.game.voice_channel_id is not None:
+        if in_lobby:
+            self._add_button("Правила", discord.ButtonStyle.secondary, self._rules, row=2)
+        if is_active_player and self.game.voice_channel_id is not None:
             self.add_item(
                 discord.ui.Button(
                     label="Перейти в голосовой",
@@ -1776,11 +2029,13 @@ class BunkerPrivatePlayerPanelView(discord.ui.View):
                 )
             )
 
-        if self.is_operator:
-            self._add_button("Добавить тест-ботов", discord.ButtonStyle.success, self._add_fakes, row=3)
-            self._add_button("Очистить тест-ботов", discord.ButtonStyle.secondary, self._remove_fakes, row=3)
-            self._add_button("Форс-старт", discord.ButtonStyle.danger, self._force_start, row=3)
-            self._add_button("Следующая фаза", discord.ButtonStyle.primary, self._next_phase, row=4)
+        if self.is_operator and not self.game.settings.is_ranked:
+            if in_lobby:
+                self._add_button("Добавить тест-ботов", discord.ButtonStyle.success, self._add_fakes, row=3)
+                self._add_button("Очистить тест-ботов", discord.ButtonStyle.secondary, self._remove_fakes, row=3)
+                self._add_button("Форс-старт", discord.ButtonStyle.danger, self._force_start, row=3)
+            elif self.game.is_admin_game:
+                self._add_button("Следующая фаза", discord.ButtonStyle.primary, self._next_phase, row=4)
         if self.can_close:
             self._add_button("Закрыть бункер", discord.ButtonStyle.danger, self._close_channels, row=4)
 
@@ -2320,13 +2575,13 @@ class BunkerSettingsView(discord.ui.View):
     async def toggle_visibility(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.cog.update_draft_settings(interaction, self.setup_id, self.user_id, replace(self.settings, is_public=not self.settings.is_public))
 
-    @discord.ui.button(label="Подсказки новичкам", style=discord.ButtonStyle.secondary, row=4)
-    async def toggle_newbies(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+    @discord.ui.button(label="Casual/ranked", style=discord.ButtonStyle.secondary, row=4)
+    async def toggle_ranked(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.cog.update_draft_settings(
             interaction,
             self.setup_id,
             self.user_id,
-            replace(self.settings, explain_for_newbies=not self.settings.explain_for_newbies),
+            replace(self.settings, is_ranked=not self.settings.is_ranked),
         )
 
     @discord.ui.button(label="Пропущенный голос", style=discord.ButtonStyle.secondary, row=4)
@@ -2480,6 +2735,101 @@ class BunkerActionView(discord.ui.View):
         await self.cog.use_special_action(interaction, self.game_id, self.user_id)
 
 
+def _phase_label(state: GameState) -> str:
+    return {
+        GameState.LOBBY: "ожидание игроков",
+        GameState.PREPARING: "подготовка",
+        GameState.REVEAL_PHASE: "раскрытие характеристик",
+        GameState.DISCUSSION_PHASE: "обсуждение",
+        GameState.CHAOS_PHASE: "событие",
+        GameState.VOTING_PHASE: "голосование",
+        GameState.ELIMINATION_PHASE: "изгнание",
+        GameState.FINAL_PHASE: "финал",
+        GameState.FINISHED: "завершено",
+    }.get(state, state.value)
+
+
+def _cataclysm_embed(game: BunkerGame) -> discord.Embed:
+    apocalypse = game.profile.apocalypse if game.profile else "Катаклизм будет сгенерирован после старта."
+    embed = discord.Embed(title="Катаклизм", description=apocalypse, color=discord.Color.dark_red())
+    embed.set_footer(text=f"Бункер #{game.room_index}")
+    return embed
+
+
+def _bunker_profile_embed(game: BunkerGame) -> discord.Embed:
+    embed = discord.Embed(title="Бункер", color=discord.Color.dark_teal())
+    if game.profile is None:
+        embed.description = "Информация о бункере появится после старта."
+        return embed
+
+    resources = game.profile.resources
+    seats = game.settings.bunker_seats or max(2, game.settings.slots // 2)
+    table = [
+        ("Планировка", game.profile.layout),
+        ("Дефект", game.profile.defect),
+        ("Мест", str(seats)),
+        ("Еда", f"{resources.food}%"),
+        ("Вода", f"{resources.water}%"),
+        ("Электричество", f"{resources.electricity}%"),
+        ("Мораль", f"{resources.morale}%"),
+        ("Радиация", f"{resources.radiation}%"),
+    ]
+    embed.description = _two_column_table(table)
+    return embed
+
+
+def _players_table_embed(game: BunkerGame, players: list[BunkerPlayer]) -> discord.Embed:
+    seats = game.settings.bunker_seats or max(2, game.settings.slots // 2)
+    lines = ["#  Игрок                 Статус       Раскрыто"]
+    for index, player in enumerate(players[:16], start=1):
+        status = "host" if player.is_host else "alive"
+        if player.is_eliminated:
+            status = "out"
+        if player.left_at is not None:
+            status = "left"
+        revealed = len(player.revealed_stats)
+        lines.append(f"{index:<2} {_compact_player_name(player):<21} {status:<11} {revealed}/{len(CARD_STAT_LABELS) - 1}")
+
+    embed = discord.Embed(
+        title="Желающие попасть в бункер",
+        description=f"Мест в бункере: {seats}\n```text\n{chr(10).join(lines)[:1800]}\n```",
+        color=discord.Color.blurple(),
+    )
+    embed.set_footer(text=f"Обновлено: раунд {game.round_number}, {_phase_label(game.state)}")
+    return embed
+
+
+def _abilities_table_embed(players: list[BunkerPlayer]) -> discord.Embed:
+    lines = ["#  Игрок                 Спец. возможность"]
+    for index, player in enumerate(players[:16], start=1):
+        if player.card is None:
+            status = "?"
+        elif player.used_special_action:
+            status = "использована"
+        elif player.is_eliminated:
+            status = "заблокирована"
+        else:
+            status = "есть"
+        lines.append(f"{index:<2} {_compact_player_name(player):<21} {status}")
+    return discord.Embed(
+        title="Таблица спец. возможностей",
+        description=f"```text\n{chr(10).join(lines)[:1800]}\n```",
+        color=discord.Color.dark_gold(),
+    )
+
+
+def _two_column_table(rows: list[tuple[str, str]]) -> str:
+    width = max((len(label) for label, _ in rows), default=8)
+    lines = [f"{label:<{width}} : {value}" for label, value in rows]
+    return f"```text\n{chr(10).join(lines)[:1800]}\n```"
+
+
+def _compact_player_name(player: BunkerPlayer) -> str:
+    if player.is_fake:
+        return player.display_name[:20]
+    return player.display_name[:20] or str(player.user_id)
+
+
 def _setup_embed(room_name: str, active_game: BunkerGame | None = None) -> discord.Embed:
     status = "Можно строить новые бункеры в этой категории. Один пользователь может хостить только один активный бункер."
     embed = discord.Embed(
@@ -2499,21 +2849,53 @@ def _game_embed(game: BunkerGame, players: list[BunkerPlayer]) -> discord.Embed:
     alive = sum(1 for player in players if player.is_alive)
     ready = sum(1 for player in players if player.ready_at is not None and not player.is_host)
     non_hosts = sum(1 for player in players if not player.is_host and player.is_active)
-    status = f"{game.state.value}, раунд {game.round_number}/{game.settings.rounds}"
+    status = f"{_phase_label(game.state)}, раунд {game.round_number}/{game.settings.rounds}"
     if game.phase_ends_at is not None and game.paused_at is None:
-        status += f", до фазы: {discord.utils.format_dt(game.phase_ends_at, style='R')}"
+        status += f", до следующего шага: {discord.utils.format_dt(game.phase_ends_at, style='R')}"
     if game.paused_at is not None:
         status += ", пауза"
 
-    embed = discord.Embed(title="Бункер", description=status, color=discord.Color.blurple())
-    embed.add_field(name="Игроки", value=f"{len(players)}/{game.settings.slots}, живых: {alive}, готово: {ready}/{non_hosts}", inline=True)
+    if game.state == GameState.LOBBY:
+        embed = discord.Embed(
+            title=f"Бункер #{game.room_index} - ожидание игроков",
+            description="Открой приватную панель кнопкой ниже. Все действия лобби находятся там.",
+            color=discord.Color.dark_teal(),
+        )
+        rows = [
+            ("Игроков", f"{len(players)}/{game.settings.slots}"),
+            ("Готово", f"{ready}/{non_hosts}"),
+            ("Режим", "ranked" if game.settings.is_ranked else "casual"),
+            ("Контент", f"custom #{game.settings.content_pack_id}" if game.settings.content_pack_id else "встроенный"),
+            ("Мест", str(game.settings.bunker_seats or max(2, game.settings.slots // 2))),
+        ]
+        embed.add_field(name="Комната", value=_two_column_table(rows), inline=False)
+        if players:
+            names = "\n".join(
+                f"{index}. {format_player_name(player)}"
+                f"{' · host' if player.is_host else ''}"
+                f"{' · готов' if player.ready_at is not None and not player.is_host else ''}"
+                for index, player in enumerate(players, start=1)
+            )
+            embed.add_field(name="Участники", value=names[:1024], inline=False)
+        return embed
+
+    embed = discord.Embed(title="Ведущий", description=status, color=discord.Color.blurple())
+    embed.add_field(name="Игроки", value=f"{len(players)}/{game.settings.slots}, живых: {alive}", inline=True)
     host = next((player for player in players if player.user_id == game.host_id), None)
     embed.add_field(name="Хост", value=format_player_name(host) if host else f"<@{game.host_id}>", inline=True)
-    embed.add_field(name="Режим", value=game.settings.mode.value, inline=True)
+    embed.add_field(name="Режим", value="ranked" if game.settings.is_ranked else "casual", inline=True)
+    prompt = {
+        GameState.REVEAL_PHASE: "Игроки раскрывают характеристики через личную панель.",
+        GameState.DISCUSSION_PHASE: "Обсуждение открыто. Доказывайте пользу и собирайте коалиции.",
+        GameState.CHAOS_PHASE: "Бункер фиксирует событие. Следите за обновлением таблиц.",
+        GameState.VOTING_PHASE: "Живые игроки голосуют в личной панели.",
+        GameState.ELIMINATION_PHASE: "Подводим итог голосования и готовим следующий раунд.",
+        GameState.FINAL_PHASE: "Финал: места в бункере распределены.",
+        GameState.FINISHED: "Партия завершена.",
+    }.get(game.state, "Следи за личной панелью.")
+    embed.add_field(name="Что делать", value=prompt, inline=False)
     if game.recent_events:
-        embed.add_field(name="Последние события", value="\n".join(game.recent_events[-5:])[:1024], inline=False)
-    else:
-        embed.add_field(name="Лобби", value="Игроки заходят в бункер и нажимают 'Готов'.", inline=False)
+        embed.add_field(name="Важные события", value="\n".join(game.recent_events[-5:])[:1024], inline=False)
     return embed
 
 
@@ -2533,7 +2915,7 @@ def _private_panel_embed(
         title += " · админ-режим"
     embed = discord.Embed(title=title, color=discord.Color.dark_teal())
     embed.description = status or "Выбери доступное действие. Эта панель видна только тебе."
-    embed.add_field(name="Фаза", value=game.state.value, inline=True)
+    embed.add_field(name="Этап", value=_phase_label(game.state), inline=True)
     embed.add_field(name="Игроки", value=f"{len(players)}/{game.settings.slots}, живых: {alive}", inline=True)
     embed.add_field(name="Готовность", value=f"{ready}/{non_hosts}", inline=True)
     if player is None:
@@ -2561,10 +2943,15 @@ def _status_embed(message: str) -> discord.Embed:
 def _settings_embed(settings: BunkerSettings) -> discord.Embed:
     embed = discord.Embed(title="Настройки Бункера", color=discord.Color.dark_teal())
     embed.add_field(name="Тип", value="публичный" if settings.is_public else "приватный", inline=True)
-    embed.add_field(name="Режим", value=settings.mode.value, inline=True)
+    embed.add_field(name="Игра", value="ranked" if settings.is_ranked else "casual", inline=True)
+    embed.add_field(name="Стиль", value=settings.mode.value, inline=True)
     embed.add_field(name="Слоты", value=str(settings.slots), inline=True)
+    embed.add_field(name="Мин. игроков", value=str(settings.min_players), inline=True)
+    embed.add_field(name="Мест в бункере", value=str(settings.bunker_seats or max(2, settings.slots // 2)), inline=True)
     embed.add_field(name="Раунды", value=str(settings.rounds), inline=True)
-    embed.add_field(name="Таймер", value=f"{settings.timer_seconds} сек.", inline=True)
+    embed.add_field(name="Раскрытие", value=f"{settings.timer_seconds} сек.", inline=True)
+    embed.add_field(name="Обсуждение", value=f"{settings.discussion_seconds} сек.", inline=True)
+    embed.add_field(name="Голосование", value=f"{settings.voting_seconds} сек.", inline=True)
     embed.add_field(name="Подсказки", value="вкл" if settings.explain_for_newbies else "выкл", inline=True)
     embed.add_field(name="Нет голоса", value=settings.missing_vote_policy.value, inline=True)
     embed.add_field(name="Пак", value=f"custom #{settings.content_pack_id}" if settings.content_pack_id else "встроенный", inline=True)
@@ -2742,4 +3129,6 @@ async def setup(bot: commands.Bot) -> None:
     pool = await _create_pool(database_url)
     repository = BunkerRepository(pool)
     await repository.init_schema()
-    await bot.add_cog(Bunker(bot, repository, pool))
+    leveling_repository = LevelingRepository(pool)
+    await leveling_repository.init_schema()
+    await bot.add_cog(Bunker(bot, repository, pool, leveling_repository))

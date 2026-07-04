@@ -26,6 +26,14 @@ class GameState(StrEnum):
     FINISHED = "finished"
 
 
+class RoomStatus(StrEnum):
+    LOBBY = "lobby"
+    ACTIVE = "active"
+    FINISHED = "finished"
+    CLOSED = "closed"
+    CRASHED = "crashed"
+
+
 class VotePolicy(StrEnum):
     ABSTAIN = "abstain"
     RANDOM = "random"
@@ -65,6 +73,13 @@ class BunkerSettings:
     explain_for_newbies: bool = True
     missing_vote_policy: VotePolicy = VotePolicy.ABSTAIN
     content_pack_id: int | None = None
+    is_ranked: bool = False
+    min_players: int = 6
+    bunker_seats: int | None = None
+    speech_seconds: int = 60
+    discussion_seconds: int = 180
+    voting_seconds: int = 60
+    revote_seconds: int = 45
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -76,6 +91,13 @@ class BunkerSettings:
             "explain_for_newbies": self.explain_for_newbies,
             "missing_vote_policy": self.missing_vote_policy.value,
             "content_pack_id": self.content_pack_id,
+            "is_ranked": self.is_ranked,
+            "min_players": self.min_players,
+            "bunker_seats": self.bunker_seats,
+            "speech_seconds": self.speech_seconds,
+            "discussion_seconds": self.discussion_seconds,
+            "voting_seconds": self.voting_seconds,
+            "revote_seconds": self.revote_seconds,
         }
 
     @classmethod
@@ -92,6 +114,13 @@ class BunkerSettings:
             explain_for_newbies=bool(raw.get("explain_for_newbies", True)),
             missing_vote_policy=VotePolicy(str(raw.get("missing_vote_policy", VotePolicy.ABSTAIN.value))),
             content_pack_id=int(raw["content_pack_id"]) if raw.get("content_pack_id") is not None else None,
+            is_ranked=bool(raw.get("is_ranked", False)),
+            min_players=int(raw.get("min_players", 6)),
+            bunker_seats=int(raw["bunker_seats"]) if raw.get("bunker_seats") is not None else None,
+            speech_seconds=int(raw.get("speech_seconds", 60)),
+            discussion_seconds=int(raw.get("discussion_seconds", raw.get("timer_seconds", 180))),
+            voting_seconds=int(raw.get("voting_seconds", 60)),
+            revote_seconds=int(raw.get("revote_seconds", 45)),
         )
 
 
@@ -261,7 +290,9 @@ class BunkerGame:
     board_message_id: int | None
     profile: BunkerProfile | None
     room_index: int = 0
+    room_status: RoomStatus = RoomStatus.LOBBY
     is_admin_game: bool = False
+    public_message_ids: dict[str, int] = field(default_factory=dict)
     recent_events: tuple[str, ...] = field(default_factory=tuple)
     finished_at: datetime | None = None
 

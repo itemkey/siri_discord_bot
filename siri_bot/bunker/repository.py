@@ -16,6 +16,7 @@ from siri_bot.bunker.models import (
     BunkerSettings,
     CharacterCard,
     GameState,
+    RoomStatus,
     RoomSetup,
     Vote,
 )
@@ -96,18 +97,22 @@ class BunkerRepository:
                     recent_events JSONB NOT NULL DEFAULT '[]',
                     is_admin_game BOOLEAN NOT NULL DEFAULT FALSE,
                     room_index INTEGER NOT NULL DEFAULT 0,
+                    room_status TEXT NOT NULL DEFAULT 'lobby',
+                    public_message_ids JSONB NOT NULL DEFAULT '{}',
                     finished_at TIMESTAMPTZ,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
 
                 DROP INDEX IF EXISTS idx_bunker_active_game_per_setup;
+                DROP INDEX IF EXISTS idx_bunker_active_game_by_host;
+                DROP INDEX IF EXISTS idx_bunker_game_text_channel;
                 CREATE INDEX IF NOT EXISTS idx_bunker_active_game_by_host
                     ON bunker_games (guild_id, host_id)
-                    WHERE finished_at IS NULL;
+                    WHERE room_status IN ('lobby', 'active') AND finished_at IS NULL;
                 CREATE INDEX IF NOT EXISTS idx_bunker_game_text_channel
                     ON bunker_games (game_text_channel_id)
-                    WHERE finished_at IS NULL;
+                    WHERE room_status IN ('lobby', 'active') AND finished_at IS NULL;
 
                 CREATE TABLE IF NOT EXISTS bunker_players (
                     game_id BIGINT NOT NULL REFERENCES bunker_games(id) ON DELETE CASCADE,
@@ -146,6 +151,14 @@ class BunkerRepository:
                     body TEXT NOT NULL,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
+
+                CREATE TABLE IF NOT EXISTS bunker_xp_awards (
+                    game_id BIGINT NOT NULL REFERENCES bunker_games(id) ON DELETE CASCADE,
+                    user_id BIGINT NOT NULL,
+                    amount INTEGER NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (game_id, user_id)
+                );
                 """
             )
             await connection.execute(
@@ -178,6 +191,8 @@ class BunkerRepository:
                 ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS recent_events JSONB NOT NULL DEFAULT '[]';
                 ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS is_admin_game BOOLEAN NOT NULL DEFAULT FALSE;
                 ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS room_index INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS room_status TEXT NOT NULL DEFAULT 'lobby';
+                ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS public_message_ids JSONB NOT NULL DEFAULT '{}';
                 ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ;
 
                 ALTER TABLE bunker_players ADD COLUMN IF NOT EXISTS ready_at TIMESTAMPTZ;
@@ -197,9 +212,14 @@ class BunkerRepository:
                 CREATE INDEX IF NOT EXISTS idx_bunker_content_packs_guild_id
                     ON bunker_content_packs (guild_id);
                 DROP INDEX IF EXISTS idx_bunker_active_game_per_setup;
+                DROP INDEX IF EXISTS idx_bunker_active_game_by_host;
+                DROP INDEX IF EXISTS idx_bunker_game_text_channel;
                 CREATE INDEX IF NOT EXISTS idx_bunker_active_game_by_host
                     ON bunker_games (guild_id, host_id)
-                    WHERE finished_at IS NULL;
+                    WHERE room_status IN ('lobby', 'active') AND finished_at IS NULL;
+                CREATE INDEX IF NOT EXISTS idx_bunker_game_text_channel
+                    ON bunker_games (game_text_channel_id)
+                    WHERE room_status IN ('lobby', 'active') AND finished_at IS NULL;
                 """
             )
 
@@ -469,7 +489,10 @@ class BunkerRepository:
                     """
                     SELECT id
                     FROM bunker_games
-                    WHERE guild_id = $1 AND host_id = $2 AND finished_at IS NULL
+                    WHERE guild_id = $1
+                      AND host_id = $2
+                      AND room_status IN ('lobby', 'active')
+                      AND finished_at IS NULL
                     ORDER BY id DESC
                     LIMIT 1
                     """,
@@ -484,9 +507,10 @@ class BunkerRepository:
                     INSERT INTO bunker_games (
                         guild_id, setup_id, setup_channel_id, setup_message_id, category_id,
                         game_text_channel_id, voice_channel_id, host_id, state, mode, is_public,
-                        slots, max_rounds, timer_seconds, settings, is_admin_game, room_index
+                        slots, max_rounds, timer_seconds, settings, is_admin_game, room_index,
+                        room_status
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'lobby', $9, $10, $11, $12, $13, $14::jsonb, $15, $16)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'lobby', $9, $10, $11, $12, $13, $14::jsonb, $15, $16, 'lobby')
                     RETURNING *
                     """,
                     setup.guild_id,
@@ -522,33 +546,47 @@ class BunkerRepository:
 
     async def next_room_index(self, setup: RoomSetup) -> int:
         if setup.category_id is None:
-            row = await self.pool.fetchrow(
+            rows = await self.pool.fetch(
                 """
-                SELECT COALESCE(MAX(room_index), 0) + 1 AS next_index
+                SELECT room_index
                 FROM bunker_games
-                WHERE guild_id = $1 AND setup_id = $2
+                WHERE guild_id = $1
+                  AND setup_id = $2
+                  AND room_status IN ('lobby', 'active')
+                  AND finished_at IS NULL
+                ORDER BY room_index ASC
                 """,
                 setup.guild_id,
                 setup.id,
             )
         else:
-            row = await self.pool.fetchrow(
+            rows = await self.pool.fetch(
                 """
-                SELECT COALESCE(MAX(room_index), 0) + 1 AS next_index
+                SELECT room_index
                 FROM bunker_games
-                WHERE guild_id = $1 AND category_id = $2
+                WHERE guild_id = $1
+                  AND category_id = $2
+                  AND room_status IN ('lobby', 'active')
+                  AND finished_at IS NULL
+                ORDER BY room_index ASC
                 """,
                 setup.guild_id,
                 setup.category_id,
             )
-        return int(row["next_index"]) if row is not None else 1
+        used = {int(row["room_index"]) for row in rows if int(row["room_index"]) > 0}
+        room_index = 1
+        while room_index in used:
+            room_index += 1
+        return room_index
 
     async def get_active_game_by_setup(self, setup_id: int) -> BunkerGame | None:
         row = await self.pool.fetchrow(
             """
             SELECT *
             FROM bunker_games
-            WHERE setup_id = $1 AND finished_at IS NULL
+            WHERE setup_id = $1
+              AND room_status IN ('lobby', 'active')
+              AND finished_at IS NULL
             ORDER BY id DESC
             LIMIT 1
             """,
@@ -561,7 +599,10 @@ class BunkerRepository:
             """
             SELECT *
             FROM bunker_games
-            WHERE guild_id = $1 AND host_id = $2 AND finished_at IS NULL
+            WHERE guild_id = $1
+              AND host_id = $2
+              AND room_status IN ('lobby', 'active')
+              AND finished_at IS NULL
             ORDER BY id DESC
             LIMIT 1
             """,
@@ -575,7 +616,10 @@ class BunkerRepository:
             """
             SELECT *
             FROM bunker_games
-            WHERE guild_id = $1 AND host_id = $2 AND finished_at IS NULL
+            WHERE guild_id = $1
+              AND host_id = $2
+              AND room_status IN ('lobby', 'active')
+              AND finished_at IS NULL
             ORDER BY id DESC
             """,
             guild_id,
@@ -588,7 +632,9 @@ class BunkerRepository:
             """
             SELECT *
             FROM bunker_games
-            WHERE game_text_channel_id = $1 AND finished_at IS NULL
+            WHERE game_text_channel_id = $1
+              AND room_status IN ('lobby', 'active')
+              AND finished_at IS NULL
             ORDER BY id DESC
             LIMIT 1
             """,
@@ -620,6 +666,19 @@ class BunkerRepository:
             message_id,
         )
 
+    async def set_public_message_id(self, game_id: int, key: str, message_id: int) -> None:
+        await self.pool.execute(
+            """
+            UPDATE bunker_games
+            SET public_message_ids = jsonb_set(public_message_ids, $2::text[], to_jsonb($3::bigint), TRUE),
+                updated_at = NOW()
+            WHERE id = $1
+            """,
+            game_id,
+            [key],
+            message_id,
+        )
+
     async def set_game_state(
         self,
         game_id: int,
@@ -634,6 +693,11 @@ class BunkerRepository:
             """
             UPDATE bunker_games
             SET state = $2,
+                room_status = CASE
+                    WHEN $2 = 'lobby' THEN 'lobby'
+                    WHEN $2 = 'finished' THEN 'finished'
+                    ELSE 'active'
+                END,
                 round_number = COALESCE($3, round_number),
                 phase_started_at = $4,
                 phase_ends_at = $5,
@@ -696,6 +760,20 @@ class BunkerRepository:
             game_id,
             json.dumps(events, ensure_ascii=False),
         )
+
+    async def record_xp_award_once(self, game_id: int, user_id: int, amount: int) -> bool:
+        row = await self.pool.fetchrow(
+            """
+            INSERT INTO bunker_xp_awards (game_id, user_id, amount)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (game_id, user_id) DO NOTHING
+            RETURNING game_id
+            """,
+            game_id,
+            user_id,
+            amount,
+        )
+        return row is not None
 
     async def add_or_restore_player(self, game_id: int, user_id: int, display_name: str, *, is_fake: bool = False) -> BunkerPlayer:
         row = await self.pool.fetchrow(
@@ -902,7 +980,8 @@ class BunkerRepository:
             """
             SELECT *
             FROM bunker_games
-            WHERE finished_at IS NULL
+            WHERE room_status = 'active'
+              AND finished_at IS NULL
               AND paused_at IS NULL
               AND phase_ends_at IS NOT NULL
               AND phase_ends_at <= $1
@@ -912,17 +991,36 @@ class BunkerRepository:
         )
         return [_game_from_row(row) for row in rows]
 
-    async def finish_game(self, game_id: int) -> None:
+    async def list_open_games(self, *, limit: int = 100) -> list[BunkerGame]:
+        rows = await self.pool.fetch(
+            """
+            SELECT *
+            FROM bunker_games
+            WHERE room_status IN ('lobby', 'active')
+              AND finished_at IS NULL
+            ORDER BY updated_at ASC
+            LIMIT $1
+            """,
+            limit,
+        )
+        return [_game_from_row(row) for row in rows]
+
+    async def finish_game(self, game_id: int, *, room_status: RoomStatus = RoomStatus.FINISHED) -> None:
         async with self.pool.acquire() as connection:
             async with connection.transaction():
                 row = await connection.fetchrow("SELECT setup_id FROM bunker_games WHERE id = $1", game_id)
                 await connection.execute(
                     """
                     UPDATE bunker_games
-                    SET state = 'finished', finished_at = NOW(), phase_ends_at = NULL, updated_at = NOW()
+                    SET state = 'finished',
+                        room_status = $2,
+                        finished_at = COALESCE(finished_at, NOW()),
+                        phase_ends_at = NULL,
+                        updated_at = NOW()
                     WHERE id = $1
                     """,
                     game_id,
+                    room_status.value,
                 )
                 if row is not None:
                     await connection.execute(
@@ -934,6 +1032,12 @@ class BunkerRepository:
                         int(row["setup_id"]),
                         game_id,
                     )
+
+    async def close_game(self, game_id: int) -> None:
+        await self.finish_game(game_id, room_status=RoomStatus.CLOSED)
+
+    async def crash_game(self, game_id: int) -> None:
+        await self.finish_game(game_id, room_status=RoomStatus.CRASHED)
 
 
 class ActiveBunkerGameError(RuntimeError):
@@ -1003,7 +1107,9 @@ def _game_from_row(row: asyncpg.Record) -> BunkerGame:
         board_message_id=int(row["board_message_id"]) if row["board_message_id"] is not None else None,
         profile=BunkerProfile.from_json(_json_load(row["bunker_profile"])),
         room_index=int(row["room_index"]),
+        room_status=RoomStatus(str(row["room_status"] or RoomStatus.LOBBY.value)),
         is_admin_game=bool(row["is_admin_game"]),
+        public_message_ids={str(key): int(value) for key, value in _json_load(row["public_message_ids"], {}).items()},
         recent_events=tuple(str(event) for event in _json_load(row["recent_events"], [])),
         finished_at=row["finished_at"],
     )
