@@ -74,7 +74,15 @@ class LevelingRepositoryTests(unittest.IsolatedAsyncioTestCase):
         await self.repository.reset_guild_progress(100)
         self.assertEqual(await self.repository.get_leaderboard(100, limit=10, offset=0), [])
 
+    async def test_panel_result_message_id(self) -> None:
+        self.assertIsNone(await self.repository.get_panel_result_message_id(100, 300))
+
+        await self.repository.upsert_panel_result_message_id(100, 300, 900)
+        self.assertEqual(await self.repository.get_panel_result_message_id(100, 300), 900)
+
+        await self.repository.upsert_panel_result_message_id(100, 300, 901)
+        self.assertEqual(await self.repository.get_panel_result_message_id(100, 300), 901)
+
 
 if __name__ == "__main__":
     unittest.main()
-

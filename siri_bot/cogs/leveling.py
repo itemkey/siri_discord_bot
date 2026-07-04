@@ -242,8 +242,8 @@ class Leveling(commands.Cog):
             color=discord.Color.teal(),
         )
         embed.add_field(name="Мой уровень", value="Личная карточка с твоим текущим прогрессом.", inline=False)
-        embed.add_field(name="Топ сервера", value="Таблица лидеров без новых сообщений в канал.", inline=False)
-        embed.set_footer(text="Кнопки обновляют это сообщение.")
+        embed.add_field(name="Топ сервера", value="Таблица лидеров без лишних сообщений в канал.", inline=False)
+        embed.set_footer(text="Результат появится отдельным сообщением ниже и будет обновляться.")
 
         try:
             await channel.send(embed=embed, view=RankPanelView(self))
@@ -738,7 +738,7 @@ class Leveling(commands.Cog):
 
         await interaction.response.defer()
         embed = await self._build_rank_embed(guild, interaction.user)
-        await self._edit_rank_panel_message(interaction, content=None, embed=embed)
+        await self._send_or_update_rank_panel_result(interaction, content=None, embed=embed)
 
     async def _send_leaderboard_panel_response(self, interaction: discord.Interaction) -> None:
         guild = interaction.guild
@@ -749,29 +749,54 @@ class Leveling(commands.Cog):
         await interaction.response.defer()
         embed = await self._build_leaderboard_embed(guild, page=1)
         if embed is None:
-            await self._edit_rank_panel_message(
+            await self._send_or_update_rank_panel_result(
                 interaction,
                 content="Пока нет XP в таблице лидеров.",
                 embed=None,
             )
             return
 
-        await self._edit_rank_panel_message(interaction, content=None, embed=embed)
+        await self._send_or_update_rank_panel_result(interaction, content=None, embed=embed)
 
-    async def _edit_rank_panel_message(
+    async def _send_or_update_rank_panel_result(
         self,
         interaction: discord.Interaction,
         *,
         content: str | None,
         embed: discord.Embed | None,
     ) -> None:
-        view = RankPanelView(self)
-        message = getattr(interaction, "message", None)
-        if message is None:
-            await interaction.edit_original_response(content=content, embed=embed, view=view)
+        guild = interaction.guild
+        channel = interaction.channel
+        if guild is None or channel is None:
             return
 
-        await message.edit(content=content, embed=embed, view=view)
+        saved_message_id = await self.repository.get_panel_result_message_id(guild.id, channel.id)
+        if saved_message_id is not None:
+            try:
+                message = channel.get_partial_message(saved_message_id)
+                await message.edit(content=content, embed=embed, view=None)
+                return
+            except discord.NotFound:
+                pass
+            except discord.HTTPException:
+                LOGGER.exception("Failed to edit leveling panel result message %s", saved_message_id)
+                await interaction.followup.send(
+                    "Не смог обновить сообщение результата. Проверь права бота в этом канале.",
+                    ephemeral=True,
+                )
+                return
+
+        try:
+            message = await channel.send(content=content, embed=embed)
+        except discord.HTTPException:
+            LOGGER.exception("Failed to send leveling panel result message in channel %s", channel.id)
+            await interaction.followup.send(
+                "Не смог отправить сообщение результата. Проверь права бота в этом канале.",
+                ephemeral=True,
+            )
+            return
+
+        await self.repository.upsert_panel_result_message_id(guild.id, channel.id, message.id)
 
     async def _refresh_rank_panel_response(self, interaction: discord.Interaction) -> None:
         guild = interaction.guild
