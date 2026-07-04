@@ -17,6 +17,7 @@ from siri_bot.cogs.bunker import (
     _missing_setup_panel_permissions,
 )
 from siri_bot.bunker.models import BunkerPlayer, BunkerSettings, RoomSetup
+from siri_bot.bunker.models import BunkerGame, GameState
 
 
 class FakeGuild:
@@ -71,8 +72,18 @@ class FakeInteraction:
 class FakeBunkerRepository:
     def __init__(self, setup: RoomSetup) -> None:
         self.setup = setup
+        self.repaired_setup = RoomSetup(
+            id=setup.id,
+            guild_id=setup.guild_id,
+            setup_channel_id=setup.setup_channel_id,
+            category_id=setup.category_id,
+            setup_message_id=900,
+            room_name=setup.room_name,
+            active_game_id=setup.active_game_id,
+        )
         self.get_setup_by_message = AsyncMock(side_effect=self._get_setup_by_message)
         self.get_setup_by_channel = AsyncMock(return_value=setup)
+        self.repair_setup_message_id = AsyncMock(return_value=self.repaired_setup)
         self.get_draft = AsyncMock(return_value=BunkerSettings())
         self.save_draft = AsyncMock()
 
@@ -166,7 +177,56 @@ class BunkerCogTests(unittest.TestCase):
         labels = [child.label for child in view.children if isinstance(child, discord.ui.Button)]
 
         self.assertIn("Как играть", labels)
-        self.assertIn("Паки/контент", labels)
+        self.assertIn("Контент", labels)
+
+    def test_setup_lookup_repairs_deleted_setup_message_binding(self) -> None:
+        setup = RoomSetup(
+            id=10,
+            guild_id=100,
+            setup_channel_id=300,
+            category_id=None,
+            setup_message_id=500,
+            room_name="build-a-bunker",
+            active_game_id=None,
+        )
+        cog = Bunker.__new__(Bunker)
+        cog.repository = FakeBunkerRepository(setup)
+        interaction = FakeInteraction(message=FakeMessage(900))
+
+        repaired = asyncio.run(cog._setup_from_interaction_message(interaction))
+
+        self.assertEqual(repaired.setup_message_id, 900)
+        cog.repository.repair_setup_message_id.assert_awaited_once_with(10, 900)
+
+    def test_stale_active_game_is_finished_when_channels_are_missing(self) -> None:
+        game = BunkerGame(
+            id=55,
+            guild_id=100,
+            setup_id=10,
+            setup_channel_id=300,
+            setup_message_id=500,
+            category_id=None,
+            game_text_channel_id=700,
+            voice_channel_id=800,
+            host_id=200,
+            state=GameState.LOBBY,
+            settings=BunkerSettings(),
+            round_number=0,
+            phase_started_at=None,
+            phase_ends_at=None,
+            paused_at=None,
+            board_message_id=None,
+            profile=None,
+        )
+        cog = Bunker.__new__(Bunker)
+        cog.repository = type("Repo", (), {"finish_game": AsyncMock()})()
+        cog._fetch_text_channel = AsyncMock(return_value=None)
+        cog._fetch_voice_channel = AsyncMock(return_value=None)
+
+        live = asyncio.run(cog._ensure_game_discord_state(game))
+
+        self.assertIsNone(live)
+        cog.repository.finish_game.assert_awaited_once_with(55)
 
     def test_fake_player_name_has_no_discord_mention(self) -> None:
         player = BunkerPlayer(

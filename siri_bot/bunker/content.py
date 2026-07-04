@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 
 SPECIAL_ACTIONS: tuple[str, ...] = (
@@ -13,6 +14,36 @@ SPECIAL_ACTIONS: tuple[str, ...] = (
     "Факт-чек",
     "Тихий саботаж",
 )
+
+PACK_FIELDS: tuple[str, ...] = (
+    "professions",
+    "items",
+    "weaknesses",
+    "secrets",
+    "skills",
+    "phobias",
+    "funny_traits",
+    "apocalypses",
+    "bunker_defects",
+    "chaos_events",
+    "layouts",
+    "special_actions",
+)
+
+PACK_FIELD_LABELS: dict[str, str] = {
+    "professions": "Профессии",
+    "items": "Предметы",
+    "weaknesses": "Слабости/здоровье",
+    "secrets": "Секреты",
+    "skills": "Навыки",
+    "phobias": "Фобии",
+    "funny_traits": "Черты",
+    "apocalypses": "Апокалипсисы",
+    "bunker_defects": "Дефекты бункера",
+    "chaos_events": "События хаоса",
+    "layouts": "Планировки",
+    "special_actions": "Спец-действия",
+}
 
 
 @dataclass(frozen=True)
@@ -31,19 +62,63 @@ class ContentPack:
     special_actions: tuple[str, ...] = SPECIAL_ACTIONS
 
     def counts(self) -> dict[str, int]:
-        return {
-            "professions": len(self.professions),
-            "items": len(self.items),
-            "weaknesses": len(self.weaknesses),
-            "secrets": len(self.secrets),
-            "skills": len(self.skills),
-            "phobias": len(self.phobias),
-            "funny_traits": len(self.funny_traits),
-            "apocalypses": len(self.apocalypses),
-            "bunker_defects": len(self.bunker_defects),
-            "chaos_events": len(self.chaos_events),
-            "special_actions": len(self.special_actions),
-        }
+        return {field: len(getattr(self, field)) for field in PACK_FIELDS}
+
+    def to_json(self) -> dict[str, list[str]]:
+        return {field: list(getattr(self, field)) for field in PACK_FIELDS}
+
+    @classmethod
+    def from_json(cls, raw: dict[str, Any] | None) -> "ContentPack":
+        content = normalize_pack_content(raw or {})
+        return cls(**content)
+
+
+def empty_content_pack() -> ContentPack:
+    return ContentPack(**{field: () for field in PACK_FIELDS})
+
+
+def merge_content_packs(base: ContentPack, extra: ContentPack | None) -> ContentPack:
+    if extra is None:
+        return base
+
+    values: dict[str, tuple[str, ...]] = {}
+    for field in PACK_FIELDS:
+        merged: list[str] = []
+        seen: set[str] = set()
+        for value in (*getattr(base, field), *getattr(extra, field)):
+            if value in seen:
+                continue
+            seen.add(value)
+            merged.append(value)
+        values[field] = tuple(merged)
+
+    return ContentPack(**values)
+
+
+def normalize_pack_content(raw: dict[str, Any]) -> dict[str, tuple[str, ...]]:
+    unknown = sorted(set(raw) - set(PACK_FIELDS))
+    if unknown:
+        raise ValueError("Неизвестные категории пака: " + ", ".join(unknown))
+
+    content: dict[str, tuple[str, ...]] = {}
+    for field in PACK_FIELDS:
+        raw_values = raw.get(field, ())
+        if raw_values is None:
+            raw_values = ()
+        if not isinstance(raw_values, (list, tuple)):
+            raise ValueError(f"Категория {field} должна быть списком строк.")
+
+        values: list[str] = []
+        seen: set[str] = set()
+        for value in raw_values:
+            text = str(value).strip()
+            if not text or text in seen:
+                continue
+            seen.add(text)
+            values.append(text[:300])
+        content[field] = tuple(values)
+
+    return content
 
 
 CORE_PROFESSIONS = (

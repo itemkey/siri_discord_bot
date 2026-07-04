@@ -104,11 +104,16 @@ def generate_card(
     )
 
 
-def assign_cards(players: list[BunkerPlayer], settings: BunkerSettings, rng: random.Random | None = None) -> dict[int, CharacterCard]:
+def assign_cards(
+    players: list[BunkerPlayer],
+    settings: BunkerSettings,
+    rng: random.Random | None = None,
+    pack: ContentPack = BUILTIN_PACK,
+) -> dict[int, CharacterCard]:
     rng = rng or random.Random()
     traitor_id = rng.choice([player.user_id for player in players]) if settings.mode == GameMode.TRAITOR and players else None
     return {
-        player.user_id: generate_card(rng, traitor=player.user_id == traitor_id)
+        player.user_id: generate_card(rng, pack, traitor=player.user_id == traitor_id)
         for player in players
         if player.is_active
     }
@@ -265,4 +270,3 @@ def format_card(card: CharacterCard) -> str:
         lines.append("Скрытая роль: предатель. Доживи до финала и испорть статистику.")
 
     return "\n".join(lines)
-

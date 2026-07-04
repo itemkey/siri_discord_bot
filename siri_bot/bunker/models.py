@@ -64,6 +64,7 @@ class BunkerSettings:
     is_public: bool = True
     explain_for_newbies: bool = True
     missing_vote_policy: VotePolicy = VotePolicy.ABSTAIN
+    content_pack_id: int | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -74,6 +75,7 @@ class BunkerSettings:
             "is_public": self.is_public,
             "explain_for_newbies": self.explain_for_newbies,
             "missing_vote_policy": self.missing_vote_policy.value,
+            "content_pack_id": self.content_pack_id,
         }
 
     @classmethod
@@ -89,6 +91,7 @@ class BunkerSettings:
             is_public=bool(raw.get("is_public", True)),
             explain_for_newbies=bool(raw.get("explain_for_newbies", True)),
             missing_vote_policy=VotePolicy(str(raw.get("missing_vote_policy", VotePolicy.ABSTAIN.value))),
+            content_pack_id=int(raw["content_pack_id"]) if raw.get("content_pack_id") is not None else None,
         )
 
 
@@ -107,6 +110,20 @@ class RoomSetup:
 class BunkerGuildSettings:
     guild_id: int
     operator_role_id: int | None
+
+
+@dataclass(frozen=True)
+class BunkerContentPack:
+    id: int
+    guild_id: int
+    name: str
+    description: str
+    content: dict[str, tuple[str, ...]]
+    is_enabled: bool
+    created_by: int
+    updated_by: int | None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
 
 
 @dataclass(frozen=True)

@@ -6,7 +6,9 @@ from typing import Any
 
 import asyncpg
 
+from siri_bot.bunker.content import PACK_FIELDS, normalize_pack_content
 from siri_bot.bunker.models import (
+    BunkerContentPack,
     BunkerGame,
     BunkerGuildSettings,
     BunkerPlayer,
@@ -50,6 +52,19 @@ class BunkerRepository:
                 CREATE TABLE IF NOT EXISTS bunker_guild_settings (
                     guild_id BIGINT PRIMARY KEY,
                     operator_role_id BIGINT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+
+                CREATE TABLE IF NOT EXISTS bunker_content_packs (
+                    id BIGSERIAL PRIMARY KEY,
+                    guild_id BIGINT NOT NULL,
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    content JSONB NOT NULL DEFAULT '{}',
+                    is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                    created_by BIGINT NOT NULL,
+                    updated_by BIGINT,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
@@ -141,6 +156,13 @@ class BunkerRepository:
                 ALTER TABLE bunker_room_setups ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
                 ALTER TABLE bunker_room_setups ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 
+                ALTER TABLE bunker_content_packs ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT '';
+                ALTER TABLE bunker_content_packs ADD COLUMN IF NOT EXISTS content JSONB NOT NULL DEFAULT '{}';
+                ALTER TABLE bunker_content_packs ADD COLUMN IF NOT EXISTS is_enabled BOOLEAN NOT NULL DEFAULT TRUE;
+                ALTER TABLE bunker_content_packs ADD COLUMN IF NOT EXISTS updated_by BIGINT;
+                ALTER TABLE bunker_content_packs ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+                ALTER TABLE bunker_content_packs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
                 ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS setup_message_id BIGINT;
                 ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS category_id BIGINT;
                 ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS game_text_channel_id BIGINT;
@@ -166,6 +188,8 @@ class BunkerRepository:
 
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_bunker_room_setups_setup_channel_id
                     ON bunker_room_setups (setup_channel_id);
+                CREATE INDEX IF NOT EXISTS idx_bunker_content_packs_guild_id
+                    ON bunker_content_packs (guild_id);
                 """
             )
 
@@ -235,6 +259,148 @@ class BunkerRepository:
     async def get_setup_by_channel(self, channel_id: int) -> RoomSetup | None:
         row = await self.pool.fetchrow("SELECT * FROM bunker_room_setups WHERE setup_channel_id = $1", channel_id)
         return _setup_from_row(row) if row else None
+
+    async def repair_setup_message_id(self, setup_id: int, message_id: int) -> RoomSetup | None:
+        row = await self.pool.fetchrow(
+            """
+            UPDATE bunker_room_setups
+            SET setup_message_id = $2, updated_at = NOW()
+            WHERE id = $1
+            RETURNING *
+            """,
+            setup_id,
+            message_id,
+        )
+        return _setup_from_row(row) if row else None
+
+    async def create_content_pack(
+        self,
+        *,
+        guild_id: int,
+        name: str,
+        created_by: int,
+        description: str = "",
+        content: dict[str, tuple[str, ...]] | None = None,
+    ) -> BunkerContentPack:
+        normalized = normalize_pack_content(content or {})
+        row = await self.pool.fetchrow(
+            """
+            INSERT INTO bunker_content_packs (guild_id, name, description, content, created_by, updated_by)
+            VALUES ($1, $2, $3, $4::jsonb, $5, $5)
+            RETURNING *
+            """,
+            guild_id,
+            name.strip()[:80] or "Новый пак",
+            description.strip()[:500],
+            json.dumps(_pack_content_to_json(normalized), ensure_ascii=False),
+            created_by,
+        )
+        return _content_pack_from_row(row)
+
+    async def list_content_packs(self, guild_id: int, *, include_disabled: bool = True) -> list[BunkerContentPack]:
+        condition = "" if include_disabled else "AND is_enabled = TRUE"
+        rows = await self.pool.fetch(
+            f"""
+            SELECT *
+            FROM bunker_content_packs
+            WHERE guild_id = $1 {condition}
+            ORDER BY is_enabled DESC, updated_at DESC, id DESC
+            """,
+            guild_id,
+        )
+        return [_content_pack_from_row(row) for row in rows]
+
+    async def get_content_pack(self, pack_id: int, *, guild_id: int | None = None) -> BunkerContentPack | None:
+        if guild_id is None:
+            row = await self.pool.fetchrow("SELECT * FROM bunker_content_packs WHERE id = $1", pack_id)
+        else:
+            row = await self.pool.fetchrow("SELECT * FROM bunker_content_packs WHERE id = $1 AND guild_id = $2", pack_id, guild_id)
+        return _content_pack_from_row(row) if row else None
+
+    async def get_enabled_content_pack(self, guild_id: int, pack_id: int | None) -> BunkerContentPack | None:
+        if pack_id is None:
+            return None
+        row = await self.pool.fetchrow(
+            """
+            SELECT *
+            FROM bunker_content_packs
+            WHERE id = $1 AND guild_id = $2 AND is_enabled = TRUE
+            """,
+            pack_id,
+            guild_id,
+        )
+        return _content_pack_from_row(row) if row else None
+
+    async def update_content_pack(
+        self,
+        pack_id: int,
+        *,
+        guild_id: int,
+        updated_by: int,
+        name: str | None = None,
+        description: str | None = None,
+        content: dict[str, tuple[str, ...]] | None = None,
+        is_enabled: bool | None = None,
+    ) -> BunkerContentPack | None:
+        current = await self.get_content_pack(pack_id, guild_id=guild_id)
+        if current is None:
+            return None
+        next_content = current.content if content is None else normalize_pack_content(content)
+        row = await self.pool.fetchrow(
+            """
+            UPDATE bunker_content_packs
+            SET name = $3,
+                description = $4,
+                content = $5::jsonb,
+                is_enabled = $6,
+                updated_by = $7,
+                updated_at = NOW()
+            WHERE id = $1 AND guild_id = $2
+            RETURNING *
+            """,
+            pack_id,
+            guild_id,
+            (name.strip()[:80] if name is not None else current.name) or "Новый пак",
+            description.strip()[:500] if description is not None else current.description,
+            json.dumps(_pack_content_to_json(next_content), ensure_ascii=False),
+            current.is_enabled if is_enabled is None else is_enabled,
+            updated_by,
+        )
+        return _content_pack_from_row(row) if row else None
+
+    async def delete_content_pack(self, pack_id: int, *, guild_id: int) -> bool:
+        result = await self.pool.execute(
+            "DELETE FROM bunker_content_packs WHERE id = $1 AND guild_id = $2",
+            pack_id,
+            guild_id,
+        )
+        return result.endswith(" 1")
+
+    async def add_pack_value(self, pack_id: int, *, guild_id: int, field: str, value: str, updated_by: int) -> BunkerContentPack | None:
+        if field not in PACK_FIELDS:
+            raise ValueError(f"Unknown pack field: {field}")
+        pack = await self.get_content_pack(pack_id, guild_id=guild_id)
+        if pack is None:
+            return None
+        text = value.strip()[:300]
+        if not text:
+            return pack
+        content = {key: tuple(values) for key, values in pack.content.items()}
+        values = list(content.get(field, ()))
+        if text not in values:
+            values.append(text)
+        content[field] = tuple(values)
+        return await self.update_content_pack(pack_id, guild_id=guild_id, updated_by=updated_by, content=content)
+
+    async def remove_pack_value(self, pack_id: int, *, guild_id: int, field: str, value: str, updated_by: int) -> BunkerContentPack | None:
+        if field not in PACK_FIELDS:
+            raise ValueError(f"Unknown pack field: {field}")
+        pack = await self.get_content_pack(pack_id, guild_id=guild_id)
+        if pack is None:
+            return None
+        content = {key: tuple(values) for key, values in pack.content.items()}
+        content[field] = tuple(candidate for candidate in content.get(field, ()) if candidate != value)
+        return await self.update_content_pack(pack_id, guild_id=guild_id, updated_by=updated_by, content=content)
 
     async def get_draft(self, setup_id: int, user_id: int) -> BunkerSettings:
         row = await self.pool.fetchrow(
@@ -687,6 +853,26 @@ class ActiveBunkerGameError(RuntimeError):
     def __init__(self, game_id: int) -> None:
         super().__init__(f"Active bunker game already exists: {game_id}")
         self.game_id = game_id
+
+
+def _pack_content_to_json(content: dict[str, tuple[str, ...]]) -> dict[str, list[str]]:
+    normalized = normalize_pack_content(content)
+    return {field: list(normalized[field]) for field in PACK_FIELDS}
+
+
+def _content_pack_from_row(row: asyncpg.Record) -> BunkerContentPack:
+    return BunkerContentPack(
+        id=int(row["id"]),
+        guild_id=int(row["guild_id"]),
+        name=str(row["name"]),
+        description=str(row["description"] or ""),
+        content=normalize_pack_content(_json_load(row["content"], {})),
+        is_enabled=bool(row["is_enabled"]),
+        created_by=int(row["created_by"]),
+        updated_by=int(row["updated_by"]) if row["updated_by"] is not None else None,
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
 
 
 def _setup_from_row(row: asyncpg.Record) -> RoomSetup:

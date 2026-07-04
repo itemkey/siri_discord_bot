@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
 import re
@@ -15,7 +16,14 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from siri_bot.bunker.board import render_board_png
-from siri_bot.bunker.content import BUILTIN_PACK
+from siri_bot.bunker.content import (
+    BUILTIN_PACK,
+    PACK_FIELD_LABELS,
+    PACK_FIELDS,
+    ContentPack,
+    merge_content_packs,
+    normalize_pack_content,
+)
 from siri_bot.bunker.engine import (
     assign_cards,
     can_start_game,
@@ -33,6 +41,7 @@ from siri_bot.bunker.engine import (
     tally_votes,
 )
 from siri_bot.bunker.models import (
+    BunkerContentPack,
     BunkerGame,
     BunkerPlayer,
     BunkerProfile,
@@ -62,6 +71,10 @@ SETUP_SETTINGS_ID = "siri:bunker:setup:settings"
 SETUP_RULES_ID = "siri:bunker:setup:rules"
 SETUP_PACKS_ID = "siri:bunker:setup:packs"
 
+ADMIN_PANEL_SCREEN_LIST = "list"
+ADMIN_PANEL_SCREEN_PACK = "pack"
+ADMIN_PANEL_SCREEN_CATEGORY = "category"
+
 GAME_PANEL_ID = "siri:bunker:game:panel"
 GAME_JOIN_ID = "siri:bunker:game:join"
 GAME_READY_ID = "siri:bunker:game:ready"
@@ -85,6 +98,7 @@ class Bunker(commands.Cog):
         self.pool = pool
         self._setup_private_panels: dict[tuple[int, int, int], Any] = {}
         self._game_private_panels: dict[tuple[int, int, int], Any] = {}
+        self._admin_private_panels: dict[tuple[int, int, int], Any] = {}
         self.bot.add_view(BunkerSetupIdleView(self))
         self.bot.add_view(BunkerPublicGameView(self))
         self.phase_tick.start()
@@ -121,7 +135,7 @@ class Bunker(commands.Cog):
             return
 
         existing_setup = await self.repository.get_setup_by_channel(channel.id)
-        active_game = await self.repository.get_active_game_by_setup(existing_setup.id) if existing_setup else None
+        active_game = await self._live_active_game_for_setup(existing_setup) if existing_setup else None
         embed = _setup_embed(channel.name, active_game=active_game)
         setup_message: discord.Message | None = None
         if existing_setup and existing_setup.setup_message_id is not None:
@@ -185,6 +199,14 @@ class Bunker(commands.Cog):
 
         await self.repository.set_operator_role(guild.id, role.id)
         await interaction.response.send_message(f"Роль операторов Бункера: {role.mention}.", ephemeral=True)
+
+    @app_commands.command(name="bunkeradminpanel", description="Открыть закрытую админ-панель Бункера для паков и тестов.")
+    async def bunkeradminpanel(self, interaction: discord.Interaction) -> None:
+        if not await self._is_bunker_admin_or_operator(interaction):
+            await interaction.response.send_message("Эта панель доступна только админу сервера или operator-role Бункера.", ephemeral=True)
+            return
+
+        await self.open_bunker_admin_panel(interaction)
 
     @bunker_group.command(name="card", description="Показать свою карточку в текущей партии.")
     async def card_command(self, interaction: discord.Interaction) -> None:
@@ -269,6 +291,144 @@ class Bunker(commands.Cog):
     @bunker_group.command(name="packs", description="Показать встроенный контент-пак Бункера.")
     async def packs_command(self, interaction: discord.Interaction) -> None:
         await self.open_game_panel(interaction, screen="packs")
+
+    async def open_bunker_admin_panel(
+        self,
+        interaction: discord.Interaction,
+        *,
+        screen: str = ADMIN_PANEL_SCREEN_LIST,
+        pack_id: int | None = None,
+        field: str | None = None,
+        status: str | None = None,
+    ) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Админ-панель Бункера работает только на сервере.", ephemeral=True)
+            return
+        if not await self._is_bunker_admin_or_operator(interaction):
+            await interaction.response.send_message("Эта панель доступна только админу сервера или operator-role Бункера.", ephemeral=True)
+            return
+
+        packs = await self.repository.list_content_packs(guild.id)
+        embed: discord.Embed
+        view: discord.ui.View | None
+        if screen == ADMIN_PANEL_SCREEN_PACK and pack_id is not None:
+            pack = await self.repository.get_content_pack(pack_id, guild_id=guild.id)
+            if pack is None:
+                embed = _admin_packs_embed(packs, status="Пак не найден.")
+                view = BunkerAdminListView(self, packs)
+            else:
+                embed = _admin_pack_embed(pack, status=status)
+                view = BunkerAdminPackView(self, pack)
+        elif screen == ADMIN_PANEL_SCREEN_CATEGORY and pack_id is not None and field in PACK_FIELDS:
+            pack = await self.repository.get_content_pack(pack_id, guild_id=guild.id)
+            if pack is None:
+                embed = _admin_packs_embed(packs, status="Пак не найден.")
+                view = BunkerAdminListView(self, packs)
+            else:
+                embed = _admin_category_embed(pack, field, status=status)
+                view = BunkerAdminCategoryView(self, pack, field)
+        else:
+            embed = _admin_packs_embed(packs, status=status)
+            view = BunkerAdminListView(self, packs)
+
+        await self._send_or_edit_private_message(
+            interaction,
+            self._admin_private_panels,
+            self._admin_panel_key(interaction),
+            embed=embed,
+            view=view,
+        )
+
+    async def create_admin_pack(self, interaction: discord.Interaction, *, name: str, description: str) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Админ-панель Бункера работает только на сервере.", ephemeral=True)
+            return
+        pack = await self.repository.create_content_pack(
+            guild_id=guild.id,
+            name=name,
+            description=description,
+            created_by=interaction.user.id,
+        )
+        await self.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_PACK, pack_id=pack.id, status="Пак создан.")
+
+    async def rename_admin_pack(self, interaction: discord.Interaction, pack_id: int, *, name: str, description: str) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Админ-панель Бункера работает только на сервере.", ephemeral=True)
+            return
+        pack = await self.repository.update_content_pack(
+            pack_id,
+            guild_id=guild.id,
+            updated_by=interaction.user.id,
+            name=name,
+            description=description,
+        )
+        await self.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_PACK, pack_id=pack_id, status="Пак обновлен." if pack else "Пак не найден.")
+
+    async def import_admin_pack_json(self, interaction: discord.Interaction, pack_id: int, raw_json: str) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Админ-панель Бункера работает только на сервере.", ephemeral=True)
+            return
+        try:
+            raw = json.loads(raw_json)
+            if not isinstance(raw, dict):
+                raise ValueError("JSON должен быть объектом.")
+            content_source = raw.get("content", raw)
+            if not isinstance(content_source, dict):
+                raise ValueError("Поле content должно быть объектом.")
+            content = normalize_pack_content(content_source)
+            name = str(raw["name"]) if isinstance(raw.get("name"), str) else None
+            description = str(raw["description"]) if isinstance(raw.get("description"), str) else None
+        except (json.JSONDecodeError, ValueError) as exc:
+            await self.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_PACK, pack_id=pack_id, status=f"Импорт не принят: {exc}")
+            return
+
+        await self.repository.update_content_pack(
+            pack_id,
+            guild_id=guild.id,
+            updated_by=interaction.user.id,
+            name=name,
+            description=description,
+            content=content,
+        )
+        await self.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_PACK, pack_id=pack_id, status="JSON импортирован.")
+
+    async def add_admin_pack_value(self, interaction: discord.Interaction, pack_id: int, field: str, value: str) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Админ-панель Бункера работает только на сервере.", ephemeral=True)
+            return
+        await self.repository.add_pack_value(pack_id, guild_id=guild.id, field=field, value=value, updated_by=interaction.user.id)
+        await self.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_CATEGORY, pack_id=pack_id, field=field, status="Строка добавлена.")
+
+    async def remove_admin_pack_value(self, interaction: discord.Interaction, pack_id: int, field: str, value: str) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Админ-панель Бункера работает только на сервере.", ephemeral=True)
+            return
+        await self.repository.remove_pack_value(pack_id, guild_id=guild.id, field=field, value=value, updated_by=interaction.user.id)
+        await self.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_CATEGORY, pack_id=pack_id, field=field, status="Строка удалена.")
+
+    async def toggle_admin_pack(self, interaction: discord.Interaction, pack_id: int) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Админ-панель Бункера работает только на сервере.", ephemeral=True)
+            return
+        pack = await self.repository.get_content_pack(pack_id, guild_id=guild.id)
+        if pack is not None:
+            await self.repository.update_content_pack(pack_id, guild_id=guild.id, updated_by=interaction.user.id, is_enabled=not pack.is_enabled)
+        await self.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_PACK, pack_id=pack_id, status="Статус пака переключен.")
+
+    async def delete_admin_pack(self, interaction: discord.Interaction, pack_id: int) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Админ-панель Бункера работает только на сервере.", ephemeral=True)
+            return
+        deleted = await self.repository.delete_content_pack(pack_id, guild_id=guild.id)
+        await self.open_bunker_admin_panel(interaction, status="Пак удален." if deleted else "Пак не найден.")
 
     async def open_game_panel(self, interaction: discord.Interaction, *, screen: str = "main", status: str | None = None) -> None:
         game = await self._game_from_interaction_channel(interaction)
@@ -578,7 +738,7 @@ class Bunker(commands.Cog):
             await interaction.response.send_message("Не нашел setup этой комнаты. Создай панель через /createbunker заново.", ephemeral=True)
             return
 
-        active = await self.repository.get_active_game_by_setup(setup.id)
+        active = await self._live_active_game_for_setup(setup)
         if active is not None:
             await self.send_or_edit_setup_status(interaction, setup, "В этой комнате уже построен активный бункер.")
             return
@@ -629,15 +789,30 @@ class Bunker(commands.Cog):
                 overwrites=voice_overwrites,
                 reason="Bunker room built",
             )
-            game = await self.repository.create_game(
-                setup=setup,
-                host_id=interaction.user.id,
-                settings=settings,
-                text_channel_id=text_channel.id,
-                voice_channel_id=voice_channel.id,
-                host_display_name=interaction.user.display_name,
-                is_admin_game=is_admin_game,
-            )
+            try:
+                game = await self.repository.create_game(
+                    setup=setup,
+                    host_id=interaction.user.id,
+                    settings=settings,
+                    text_channel_id=text_channel.id,
+                    voice_channel_id=voice_channel.id,
+                    host_display_name=interaction.user.display_name,
+                    is_admin_game=is_admin_game,
+                )
+            except ActiveBunkerGameError as exc:
+                conflicting = await self.repository.get_game(exc.game_id)
+                live_conflict = await self._ensure_game_discord_state(conflicting)
+                if live_conflict is not None:
+                    raise
+                game = await self.repository.create_game(
+                    setup=setup,
+                    host_id=interaction.user.id,
+                    settings=settings,
+                    text_channel_id=text_channel.id,
+                    voice_channel_id=voice_channel.id,
+                    host_display_name=interaction.user.display_name,
+                    is_admin_game=is_admin_game,
+                )
         except ActiveBunkerGameError:
             if text_channel is not None:
                 await text_channel.delete(reason="Bunker duplicate build rollback")
@@ -653,14 +828,14 @@ class Bunker(commands.Cog):
             )
             return
 
-        board_message = await text_channel.send(embed=_game_embed(game, await self.repository.list_players(game.id)), view=BunkerPublicGameView(self))
+        board_message = await self._send_board_message(text_channel, game, await self.repository.list_players(game.id))
         await self.repository.set_board_message(game.id, board_message.id)
         await self.refresh_game_message(game.id)
         await self.refresh_setup_message(game)
 
         moved = await self._move_member_to_voice(interaction.user, voice_channel)
         suffix = "Я перенес тебя в голосовой." if moved else f"Я открыл доступ к {voice_channel.mention}; зайди туда вручную, если сейчас не был в voice."
-        await self.send_or_edit_setup_status(interaction, setup, f"Бункер построен: {text_channel.mention}. {suffix}")
+        await self.send_or_edit_setup_status(interaction, setup, f"Бункер построен: {text_channel.mention}. {suffix}", voice_channel=voice_channel)
 
     async def join_from_setup(self, interaction: discord.Interaction) -> None:
         setup = await self._setup_from_interaction_message(interaction)
@@ -668,7 +843,7 @@ class Bunker(commands.Cog):
             await interaction.response.send_message("Эта панель не привязана к комнате.", ephemeral=True)
             return
 
-        game = await self.repository.get_active_game_by_setup(setup.id)
+        game = await self._live_active_game_for_setup(setup)
         if game is None:
             await interaction.response.send_message("Бункер еще не построен. Сначала нажмите 'Построить бункер'.", ephemeral=True)
             return
@@ -765,9 +940,10 @@ class Bunker(commands.Cog):
                 return reason
 
         rng = random.Random()
-        profile = generate_profile(game.settings, rng)
+        content_pack = await self._content_pack_for_game(game)
+        profile = generate_profile(game.settings, rng, content_pack)
         await self.repository.set_profile(game.id, profile)
-        cards = assign_cards(players, game.settings, rng)
+        cards = assign_cards(players, game.settings, rng, content_pack)
         await self.repository.assign_cards(game.id, cards)
         now = datetime.now(UTC)
         started = await self.repository.set_game_state(
@@ -897,6 +1073,10 @@ class Bunker(commands.Cog):
         if screen == "rules":
             embed = _rules_embed()
             view: discord.ui.View | None = BunkerSetupNavView(self, setup.id, interaction.user.id, settings, screen=screen, is_operator=is_operator)
+        elif screen == "content":
+            packs = await self.repository.list_content_packs(setup.guild_id, include_disabled=False)
+            embed = _setup_content_embed(settings, packs)
+            view = BunkerSetupContentView(self, setup.id, interaction.user.id, settings, packs, is_operator=is_operator)
         elif screen == "packs":
             embed = _packs_embed()
             view = BunkerSetupNavView(self, setup.id, interaction.user.id, settings, screen=screen, is_operator=is_operator)
@@ -922,12 +1102,19 @@ class Bunker(commands.Cog):
         await self.open_setup_panel(interaction, screen="rules")
 
     async def show_setup_packs(self, interaction: discord.Interaction) -> None:
-        await self.open_setup_panel(interaction, screen="packs")
+        await self.open_setup_panel(interaction, screen="content")
 
     async def show_setup_settings(self, interaction: discord.Interaction) -> None:
         await self.open_setup_panel(interaction, screen="settings")
 
-    async def send_or_edit_setup_status(self, interaction: discord.Interaction, setup, message: str) -> None:
+    async def send_or_edit_setup_status(
+        self,
+        interaction: discord.Interaction,
+        setup,
+        message: str,
+        *,
+        voice_channel: discord.VoiceChannel | None = None,
+    ) -> None:
         settings = normalize_settings(await self.repository.get_draft(setup.id, interaction.user.id))
         is_operator = await self._is_bunker_operator(interaction)
         await self._send_or_edit_private_message(
@@ -935,7 +1122,15 @@ class Bunker(commands.Cog):
             self._setup_private_panels,
             self._setup_panel_key(interaction, setup),
             embed=_status_embed(message),
-            view=BunkerSetupNavView(self, setup.id, interaction.user.id, settings, screen="status", is_operator=is_operator),
+            view=BunkerSetupNavView(
+                self,
+                setup.id,
+                interaction.user.id,
+                settings,
+                screen="status",
+                is_operator=is_operator,
+                voice_url=_voice_channel_url(voice_channel),
+            ),
         )
 
     async def update_draft_settings(
@@ -944,6 +1139,8 @@ class Bunker(commands.Cog):
         setup_id: int,
         user_id: int,
         settings: BunkerSettings,
+        *,
+        screen: str = "settings",
     ) -> None:
         if interaction.user.id != user_id:
             await interaction.response.send_message("Эти настройки открыты другим пользователем.", ephemeral=True)
@@ -952,6 +1149,15 @@ class Bunker(commands.Cog):
         settings = normalize_settings(settings)
         await self.repository.save_draft(setup_id, user_id, settings)
         is_operator = await self._is_bunker_operator(interaction)
+        if screen == "content":
+            guild_id = interaction.guild.id if interaction.guild is not None else 0
+            packs = await self.repository.list_content_packs(guild_id, include_disabled=False)
+            await interaction.response.edit_message(
+                embed=_setup_content_embed(settings, packs),
+                view=BunkerSetupContentView(self, setup_id, user_id, settings, packs, is_operator=is_operator),
+            )
+            return
+
         await interaction.response.edit_message(
             embed=_settings_embed(settings),
             view=BunkerSettingsView(self, setup_id, user_id, settings, is_operator=is_operator),
@@ -1079,17 +1285,19 @@ class Bunker(commands.Cog):
 
     async def refresh_game_message(self, game_id: int) -> None:
         game = await self.repository.get_game(game_id)
-        if game is None or game.board_message_id is None:
+        if game is None:
             return
 
         channel = await self._fetch_text_channel(game.game_text_channel_id)
-        if channel is None:
+        voice_channel = await self._fetch_voice_channel(game.voice_channel_id)
+        if channel is None or voice_channel is None:
+            await self.repository.finish_game(game.id)
             return
 
-        try:
-            message = await channel.fetch_message(game.board_message_id)
-        except discord.HTTPException:
+        message = await self._ensure_board_message(game, channel)
+        if message is None:
             return
+        game = await self.repository.get_game(game.id) or game
 
         players = await self.repository.list_players(game.id)
         embed = _game_embed(game, players)
@@ -1101,6 +1309,52 @@ class Bunker(commands.Cog):
         except Exception:
             LOGGER.exception("Could not render bunker board for game %s", game.id)
             await message.edit(embed=embed, view=BunkerPublicGameView(self))
+
+    async def _send_board_message(self, channel: discord.TextChannel, game: BunkerGame, players: list[BunkerPlayer]) -> discord.Message:
+        embed = _game_embed(game, players)
+        try:
+            image_bytes = render_board_png(game, players)
+            file = discord.File(BytesIO(image_bytes), filename="bunker_board.png")
+            embed.set_image(url="attachment://bunker_board.png")
+            return await channel.send(embed=embed, file=file, view=BunkerPublicGameView(self))
+        except Exception:
+            LOGGER.exception("Could not render bunker board for game %s", game.id)
+            return await channel.send(embed=embed, view=BunkerPublicGameView(self))
+
+    async def _ensure_board_message(self, game: BunkerGame, channel: discord.TextChannel) -> discord.Message | None:
+        if game.board_message_id is not None:
+            try:
+                return await channel.fetch_message(game.board_message_id)
+            except discord.HTTPException:
+                LOGGER.info("Bunker board message %s is missing; recreating.", game.board_message_id, exc_info=True)
+
+        players = await self.repository.list_players(game.id)
+        try:
+            message = await self._send_board_message(channel, game, players)
+        except discord.HTTPException:
+            LOGGER.info("Could not recreate bunker board message for game %s.", game.id, exc_info=True)
+            return None
+        await self.repository.set_board_message(game.id, message.id)
+        return message
+
+    async def _ensure_game_discord_state(self, game: BunkerGame | None) -> BunkerGame | None:
+        if game is None:
+            return None
+
+        text_channel = await self._fetch_text_channel(game.game_text_channel_id)
+        voice_channel = await self._fetch_voice_channel(game.voice_channel_id)
+        if text_channel is None or voice_channel is None:
+            await self.repository.finish_game(game.id)
+            LOGGER.info("Finished stale bunker game %s because its Discord channels are missing.", game.id)
+            return None
+
+        await self._ensure_board_message(game, text_channel)
+        return await self.repository.get_game(game.id) or game
+
+    async def _live_active_game_for_setup(self, setup) -> BunkerGame | None:
+        setup_id = getattr(setup, "setup_id", getattr(setup, "id"))
+        active = await self.repository.get_active_game_by_setup(setup_id)
+        return await self._ensure_game_discord_state(active)
 
     async def refresh_setup_message(self, game: BunkerGame) -> None:
         if game.setup_message_id is None:
@@ -1115,12 +1369,13 @@ class Bunker(commands.Cog):
         except discord.HTTPException:
             return
 
-        active = await self.repository.get_active_game_by_setup(game.setup_id)
+        active = await self._live_active_game_for_setup(game)
         embed = _setup_embed(channel.name, active_game=active)
         await message.edit(embed=embed, view=BunkerSetupIdleView(self))
 
     async def _trigger_chaos_event(self, game: BunkerGame) -> None:
-        event = pick_chaos_event()
+        content_pack = await self._content_pack_for_game(game)
+        event = pick_chaos_event(pack=content_pack)
         if game.profile is not None:
             profile = BunkerProfile(
                 apocalypse=game.profile.apocalypse,
@@ -1130,6 +1385,12 @@ class Bunker(commands.Cog):
             )
             await self.repository.set_profile(game.id, profile)
         await self.repository.add_event(game.id, game.round_number, "chaos", event)
+
+    async def _content_pack_for_game(self, game: BunkerGame) -> ContentPack:
+        custom_pack = await self.repository.get_enabled_content_pack(game.guild_id, game.settings.content_pack_id)
+        if custom_pack is None:
+            return BUILTIN_PACK
+        return merge_content_packs(BUILTIN_PACK, ContentPack.from_json(custom_pack.content))
 
     async def _apply_special_action(self, game: BunkerGame, player: BunkerPlayer) -> str:
         action = player.card.special_action if player.card else ""
@@ -1250,6 +1511,19 @@ class Bunker(commands.Cog):
         role_ids = [role.id for role in user.roles]
         return await self.repository.is_bunker_operator(guild.id, role_ids)
 
+    async def _is_bunker_admin_or_operator(self, interaction: discord.Interaction) -> bool:
+        user = interaction.user
+        settings = getattr(interaction.client, "settings", None)
+        if settings is not None and settings.owner_id and user.id == settings.owner_id:
+            return True
+        if isinstance(user, discord.Member):
+            if user.guild_permissions.administrator:
+                return True
+            allowed_role_ids = getattr(settings, "admin_role_ids", frozenset()) if settings else frozenset()
+            if any(role.id in allowed_role_ids for role in user.roles):
+                return True
+        return await self._is_bunker_operator(interaction)
+
     async def _operator_role(self, guild: discord.Guild) -> discord.Role | None:
         settings = await self.repository.get_or_create_guild_settings(guild.id)
         return guild.get_role(settings.operator_role_id) if settings.operator_role_id is not None else None
@@ -1263,6 +1537,11 @@ class Bunker(commands.Cog):
     def _game_panel_key(self, interaction: discord.Interaction, game: BunkerGame) -> tuple[int, int, int]:
         channel_id = interaction.channel.id if interaction.channel is not None else 0
         return (game.id, channel_id, interaction.user.id)
+
+    def _admin_panel_key(self, interaction: discord.Interaction) -> tuple[int, int, int]:
+        guild_id = interaction.guild.id if interaction.guild is not None else 0
+        channel_id = interaction.channel.id if interaction.channel is not None else 0
+        return (guild_id, channel_id, interaction.user.id)
 
     async def _delete_duplicate_setup_panels(self, channel: discord.TextChannel, *, keep_message_id: int) -> None:
         if self.bot.user is None:
@@ -1287,7 +1566,11 @@ class Bunker(commands.Cog):
             if setup is not None:
                 return setup
         if interaction.channel is not None:
-            return await self.repository.get_setup_by_channel(interaction.channel.id)
+            setup = await self.repository.get_setup_by_channel(interaction.channel.id)
+            if setup is not None and message is not None and setup.setup_message_id != message.id:
+                repaired = await self.repository.repair_setup_message_id(setup.id, message.id)
+                return repaired or setup
+            return setup
         return None
 
     async def _fetch_text_channel(self, channel_id: int | None) -> discord.TextChannel | None:
@@ -1384,6 +1667,15 @@ class BunkerPrivatePlayerPanelView(discord.ui.View):
             self._add_button("Голосовать", discord.ButtonStyle.primary, self._vote, row=1)
 
         self._add_button("Правила", discord.ButtonStyle.secondary, self._rules, row=2)
+        if self.player is not None and self.player.is_active and self.game.voice_channel_id is not None:
+            self.add_item(
+                discord.ui.Button(
+                    label="Перейти в голосовой",
+                    style=discord.ButtonStyle.link,
+                    url=f"https://discord.com/channels/{self.game.guild_id}/{self.game.voice_channel_id}",
+                    row=2,
+                )
+            )
 
         if self.is_operator:
             self._add_button("Добавить тест-ботов", discord.ButtonStyle.success, self._add_fakes, row=3)
@@ -1456,8 +1748,203 @@ class BunkerPanelBackView(discord.ui.View):
         await self.cog.update_current_game_panel(interaction, game)
 
 
+class BunkerAdminListView(discord.ui.View):
+    def __init__(self, cog: Bunker, packs: list[BunkerContentPack]) -> None:
+        super().__init__(timeout=900)
+        self.cog = cog
+        self.packs = packs
+        if packs:
+            self.add_item(BunkerAdminPackSelect(cog, packs))
+
+    @discord.ui.button(label="Создать пак", style=discord.ButtonStyle.success, row=1)
+    async def create(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(BunkerPackCreateModal(self.cog))
+
+    @discord.ui.button(label="Обновить", style=discord.ButtonStyle.secondary, row=1)
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.open_bunker_admin_panel(interaction)
+
+
+class BunkerAdminPackSelect(discord.ui.Select):
+    def __init__(self, cog: Bunker, packs: list[BunkerContentPack]) -> None:
+        self.cog = cog
+        options = [
+            discord.SelectOption(
+                label=pack.name[:100],
+                value=str(pack.id),
+                description=("включен" if pack.is_enabled else "выключен") + f"; {_pack_total(pack)} строк",
+            )
+            for pack in packs[:25]
+        ]
+        super().__init__(placeholder="Выбери пак", min_values=1, max_values=1, options=options, row=0)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.cog.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_PACK, pack_id=int(self.values[0]))
+
+
+class BunkerAdminPackView(discord.ui.View):
+    def __init__(self, cog: Bunker, pack: BunkerContentPack) -> None:
+        super().__init__(timeout=900)
+        self.cog = cog
+        self.pack = pack
+        self.add_item(BunkerAdminCategorySelect(cog, pack))
+
+    @discord.ui.button(label="Переименовать", style=discord.ButtonStyle.secondary, row=1)
+    async def rename(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(BunkerPackRenameModal(self.cog, self.pack))
+
+    @discord.ui.button(label="Импорт JSON", style=discord.ButtonStyle.primary, row=1)
+    async def import_json(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(BunkerPackImportModal(self.cog, self.pack))
+
+    @discord.ui.button(label="Экспорт JSON", style=discord.ButtonStyle.secondary, row=1)
+    async def export_json(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.edit_message(embed=_pack_export_embed(self.pack), view=BunkerAdminExportView(self.cog, self.pack.id))
+
+    @discord.ui.button(label="Вкл/выкл", style=discord.ButtonStyle.secondary, row=2)
+    async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.toggle_admin_pack(interaction, self.pack.id)
+
+    @discord.ui.button(label="Удалить", style=discord.ButtonStyle.danger, row=2)
+    async def delete(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.delete_admin_pack(interaction, self.pack.id)
+
+    @discord.ui.button(label="Назад", style=discord.ButtonStyle.secondary, row=2)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.open_bunker_admin_panel(interaction)
+
+
+class BunkerAdminExportView(discord.ui.View):
+    def __init__(self, cog: Bunker, pack_id: int) -> None:
+        super().__init__(timeout=900)
+        self.cog = cog
+        self.pack_id = pack_id
+
+    @discord.ui.button(label="Назад к паку", style=discord.ButtonStyle.primary)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_PACK, pack_id=self.pack_id)
+
+
+class BunkerAdminCategorySelect(discord.ui.Select):
+    def __init__(self, cog: Bunker, pack: BunkerContentPack) -> None:
+        self.cog = cog
+        self.pack = pack
+        options = [
+            discord.SelectOption(
+                label=PACK_FIELD_LABELS[field],
+                value=field,
+                description=f"{len(pack.content.get(field, ()))} строк",
+            )
+            for field in PACK_FIELDS
+        ]
+        super().__init__(placeholder="Категория контента", min_values=1, max_values=1, options=options, row=0)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.cog.open_bunker_admin_panel(
+            interaction,
+            screen=ADMIN_PANEL_SCREEN_CATEGORY,
+            pack_id=self.pack.id,
+            field=self.values[0],
+        )
+
+
+class BunkerAdminCategoryView(discord.ui.View):
+    def __init__(self, cog: Bunker, pack: BunkerContentPack, field: str) -> None:
+        super().__init__(timeout=900)
+        self.cog = cog
+        self.pack = pack
+        self.field = field
+        values = list(pack.content.get(field, ()))
+        if values:
+            self.add_item(BunkerAdminRemoveValueSelect(cog, pack, field, values[:25]))
+
+    @discord.ui.button(label="Добавить строку", style=discord.ButtonStyle.success, row=1)
+    async def add_value(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_modal(BunkerPackValueModal(self.cog, self.pack.id, self.field))
+
+    @discord.ui.button(label="Назад к паку", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_PACK, pack_id=self.pack.id)
+
+
+class BunkerAdminRemoveValueSelect(discord.ui.Select):
+    def __init__(self, cog: Bunker, pack: BunkerContentPack, field: str, values: list[str]) -> None:
+        self.cog = cog
+        self.pack = pack
+        self.field = field
+        self.values_by_index = values
+        options = [discord.SelectOption(label=value[:100], value=str(index)) for index, value in enumerate(values)]
+        super().__init__(placeholder="Удалить строку", min_values=1, max_values=1, options=options, row=0)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.cog.remove_admin_pack_value(interaction, self.pack.id, self.field, self.values_by_index[int(self.values[0])])
+
+
+class BunkerPackCreateModal(discord.ui.Modal, title="Создать пак Бункера"):
+    name = discord.ui.TextInput(label="Название", max_length=80)
+    description = discord.ui.TextInput(label="Описание", style=discord.TextStyle.paragraph, required=False, max_length=500)
+
+    def __init__(self, cog: Bunker) -> None:
+        super().__init__()
+        self.cog = cog
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self.cog.create_admin_pack(interaction, name=str(self.name.value), description=str(self.description.value))
+
+
+class BunkerPackRenameModal(discord.ui.Modal, title="Настройки пака"):
+    name = discord.ui.TextInput(label="Название", max_length=80)
+    description = discord.ui.TextInput(label="Описание", style=discord.TextStyle.paragraph, required=False, max_length=500)
+
+    def __init__(self, cog: Bunker, pack: BunkerContentPack) -> None:
+        super().__init__()
+        self.cog = cog
+        self.pack_id = pack.id
+        self.name.default = pack.name
+        self.description.default = pack.description
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self.cog.rename_admin_pack(interaction, self.pack_id, name=str(self.name.value), description=str(self.description.value))
+
+
+class BunkerPackImportModal(discord.ui.Modal, title="Импорт JSON пака"):
+    raw_json = discord.ui.TextInput(label="JSON", style=discord.TextStyle.paragraph, max_length=4000)
+
+    def __init__(self, cog: Bunker, pack: BunkerContentPack) -> None:
+        super().__init__()
+        self.cog = cog
+        self.pack_id = pack.id
+        self.raw_json.default = _pack_json_dump(pack)[:4000]
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self.cog.import_admin_pack_json(interaction, self.pack_id, str(self.raw_json.value))
+
+
+class BunkerPackValueModal(discord.ui.Modal, title="Добавить строку"):
+    value = discord.ui.TextInput(label="Текст", style=discord.TextStyle.paragraph, max_length=300)
+
+    def __init__(self, cog: Bunker, pack_id: int, field: str) -> None:
+        super().__init__()
+        self.cog = cog
+        self.pack_id = pack_id
+        self.field = field
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        await self.cog.add_admin_pack_value(interaction, self.pack_id, self.field, str(self.value.value))
+
+
 class BunkerSetupNavView(discord.ui.View):
-    def __init__(self, cog: Bunker, setup_id: int, user_id: int, settings: BunkerSettings, *, screen: str, is_operator: bool = False) -> None:
+    def __init__(
+        self,
+        cog: Bunker,
+        setup_id: int,
+        user_id: int,
+        settings: BunkerSettings,
+        *,
+        screen: str,
+        is_operator: bool = False,
+        voice_url: str | None = None,
+    ) -> None:
         super().__init__(timeout=900)
         self.cog = cog
         self.setup_id = setup_id
@@ -1465,15 +1952,18 @@ class BunkerSetupNavView(discord.ui.View):
         self.settings = settings
         self.screen = screen
         self.is_operator = is_operator
+        self.voice_url = voice_url
         self._build()
 
     def _build(self) -> None:
         self._add_button("Настройки", discord.ButtonStyle.primary if self.screen == "settings" else discord.ButtonStyle.secondary, self._settings, row=0)
         self._add_button("Как играть", discord.ButtonStyle.primary if self.screen == "rules" else discord.ButtonStyle.secondary, self._rules, row=0)
-        self._add_button("Паки/контент", discord.ButtonStyle.primary if self.screen == "packs" else discord.ButtonStyle.secondary, self._packs, row=0)
+        self._add_button("Контент", discord.ButtonStyle.primary if self.screen == "content" else discord.ButtonStyle.secondary, self._content, row=0)
         self._add_button("Назад", discord.ButtonStyle.secondary, self._settings, row=0)
         if self.is_operator:
             self._add_button("Админ-режим", discord.ButtonStyle.danger, self._admin, row=0)
+        if self.voice_url:
+            self.add_item(discord.ui.Button(label="Перейти в голосовой", style=discord.ButtonStyle.link, url=self.voice_url, row=1))
 
     def _add_button(self, label: str, style: discord.ButtonStyle, callback, *, row: int) -> None:
         button = discord.ui.Button(label=label, style=style, row=row)
@@ -1494,13 +1984,100 @@ class BunkerSetupNavView(discord.ui.View):
         if await self._ensure_owner(interaction):
             await self.cog.open_setup_panel(interaction, screen="rules")
 
-    async def _packs(self, interaction: discord.Interaction) -> None:
+    async def _content(self, interaction: discord.Interaction) -> None:
         if await self._ensure_owner(interaction):
-            await self.cog.open_setup_panel(interaction, screen="packs")
+            await self.cog.open_setup_panel(interaction, screen="content")
 
     async def _admin(self, interaction: discord.Interaction) -> None:
         if await self._ensure_owner(interaction):
             await self.cog.build_admin_bunker(interaction)
+
+
+class BunkerSetupContentView(discord.ui.View):
+    def __init__(
+        self,
+        cog: Bunker,
+        setup_id: int,
+        user_id: int,
+        settings: BunkerSettings,
+        packs: list[BunkerContentPack],
+        *,
+        is_operator: bool,
+    ) -> None:
+        super().__init__(timeout=900)
+        self.cog = cog
+        self.setup_id = setup_id
+        self.user_id = user_id
+        self.settings = settings
+        self.packs = packs
+        self.is_operator = is_operator
+        self.add_item(BunkerSetupPackSelect(self))
+        self._add_button("Настройки", discord.ButtonStyle.secondary, self._settings, row=1)
+        self._add_button("Как играть", discord.ButtonStyle.secondary, self._rules, row=1)
+        if is_operator:
+            self._add_button("Админка паков", discord.ButtonStyle.primary, self._admin_panel, row=1)
+
+    def _add_button(self, label: str, style: discord.ButtonStyle, callback, *, row: int) -> None:
+        button = discord.ui.Button(label=label, style=style, row=row)
+        button.callback = callback
+        self.add_item(button)
+
+    async def _ensure_owner(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.user_id:
+            return True
+        await interaction.response.send_message("Эта приватная панель открыта другим пользователем.", ephemeral=True)
+        return False
+
+    async def _settings(self, interaction: discord.Interaction) -> None:
+        if await self._ensure_owner(interaction):
+            await self.cog.open_setup_panel(interaction, screen="settings")
+
+    async def _rules(self, interaction: discord.Interaction) -> None:
+        if await self._ensure_owner(interaction):
+            await self.cog.open_setup_panel(interaction, screen="rules")
+
+    async def _admin_panel(self, interaction: discord.Interaction) -> None:
+        if await self._ensure_owner(interaction):
+            await self.cog.open_bunker_admin_panel(interaction)
+
+
+class BunkerSetupPackSelect(discord.ui.Select):
+    def __init__(self, owner: BunkerSetupContentView) -> None:
+        self.owner = owner
+        options = [
+            discord.SelectOption(
+                label="Встроенный контент",
+                value="none",
+                description="Только базовый набор Бункера",
+                default=owner.settings.content_pack_id is None,
+            )
+        ]
+        for pack in owner.packs[:24]:
+            counts = sum(len(values) for values in pack.content.values())
+            options.append(
+                discord.SelectOption(
+                    label=pack.name[:100],
+                    value=str(pack.id),
+                    description=f"{counts} строк; смешивается со встроенным",
+                    default=owner.settings.content_pack_id == pack.id,
+                )
+            )
+        super().__init__(placeholder="Пак для этой партии", min_values=1, max_values=1, options=options, row=0)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.owner.user_id:
+            await interaction.response.send_message("Этот выбор открыт другим пользователем.", ephemeral=True)
+            return
+
+        raw_value = self.values[0]
+        pack_id = None if raw_value == "none" else int(raw_value)
+        await self.owner.cog.update_draft_settings(
+            interaction,
+            self.owner.setup_id,
+            self.owner.user_id,
+            replace(self.owner.settings, content_pack_id=pack_id),
+            screen="content",
+        )
 
 
 class BunkerSettingsView(discord.ui.View):
@@ -1515,23 +2092,23 @@ class BunkerSettingsView(discord.ui.View):
         self.add_item(BunkerSlotsSelect(self, row=1))
         self.add_item(BunkerTimerSelect(self, row=2))
         self.add_item(BunkerRoundsSelect(self, row=3))
-        rules_button = discord.ui.Button(label="Как играть", style=discord.ButtonStyle.secondary, row=4)
-        rules_button.callback = self.open_rules
-        self.add_item(rules_button)
+        content_button = discord.ui.Button(label="Контент", style=discord.ButtonStyle.secondary, row=4)
+        content_button.callback = self.open_content
+        self.add_item(content_button)
         if is_operator:
-            admin_button = discord.ui.Button(label="Админ-режим", style=discord.ButtonStyle.danger)
+            admin_button = discord.ui.Button(label="Админ-режим", style=discord.ButtonStyle.danger, row=4)
             admin_button.callback = self.start_admin_game
             self.add_item(admin_button)
         else:
-            packs_button = discord.ui.Button(label="Паки/контент", style=discord.ButtonStyle.secondary, row=4)
-            packs_button.callback = self.open_packs
-            self.add_item(packs_button)
+            rules_button = discord.ui.Button(label="Как играть", style=discord.ButtonStyle.secondary, row=4)
+            rules_button.callback = self.open_rules
+            self.add_item(rules_button)
 
     async def open_rules(self, interaction: discord.Interaction) -> None:
         await self.cog.open_setup_panel(interaction, screen="rules")
 
-    async def open_packs(self, interaction: discord.Interaction) -> None:
-        await self.cog.open_setup_panel(interaction, screen="packs")
+    async def open_content(self, interaction: discord.Interaction) -> None:
+        await self.cog.open_setup_panel(interaction, screen="content")
 
     async def start_admin_game(self, interaction: discord.Interaction) -> None:
         await self.cog.build_admin_bunker(interaction)
@@ -1787,6 +2364,20 @@ def _settings_embed(settings: BunkerSettings) -> discord.Embed:
     embed.add_field(name="Таймер", value=f"{settings.timer_seconds} сек.", inline=True)
     embed.add_field(name="Подсказки", value="вкл" if settings.explain_for_newbies else "выкл", inline=True)
     embed.add_field(name="Нет голоса", value=settings.missing_vote_policy.value, inline=True)
+    embed.add_field(name="Пак", value=f"custom #{settings.content_pack_id}" if settings.content_pack_id else "встроенный", inline=True)
+    return embed
+
+
+def _setup_content_embed(settings: BunkerSettings, packs: list[BunkerContentPack]) -> discord.Embed:
+    selected = next((pack for pack in packs if pack.id == settings.content_pack_id), None)
+    embed = discord.Embed(title="Контент Бункера", color=discord.Color.dark_teal())
+    embed.description = "Выбранный кастомный пак смешивается со встроенным контентом. Если пак выключен или удален, игра использует встроенный набор."
+    embed.add_field(name="Текущий пак", value=selected.name if selected else "встроенный контент", inline=False)
+    if packs:
+        lines = [f"{pack.name}: {_pack_total(pack)} строк" for pack in packs[:10]]
+        embed.add_field(name="Доступные паки", value="\n".join(lines), inline=False)
+    else:
+        embed.add_field(name="Доступные паки", value="Кастомных паков пока нет. Создай их через /bunkeradminpanel.", inline=False)
     return embed
 
 
@@ -1809,6 +2400,66 @@ def _packs_embed() -> discord.Embed:
     return embed
 
 
+def _admin_packs_embed(packs: list[BunkerContentPack], *, status: str | None = None) -> discord.Embed:
+    embed = discord.Embed(title="Админ-панель Бункера", color=discord.Color.dark_teal())
+    embed.description = status or "Создавай кастомные паки и наполняй их строками через категории или JSON."
+    if packs:
+        lines = [
+            f"{pack.id}. {'вкл' if pack.is_enabled else 'выкл'} · {pack.name} · {_pack_total(pack)} строк"
+            for pack in packs[:15]
+        ]
+        embed.add_field(name="Паки", value="\n".join(lines), inline=False)
+    else:
+        embed.add_field(name="Паки", value="Паков пока нет.", inline=False)
+    return embed
+
+
+def _admin_pack_embed(pack: BunkerContentPack, *, status: str | None = None) -> discord.Embed:
+    embed = discord.Embed(title=f"Пак: {pack.name}", color=discord.Color.dark_teal())
+    embed.description = status or (pack.description or "Описание не задано.")
+    embed.add_field(name="Статус", value="включен" if pack.is_enabled else "выключен", inline=True)
+    embed.add_field(name="Всего строк", value=str(_pack_total(pack)), inline=True)
+    counts = [f"{PACK_FIELD_LABELS[field]}: {len(pack.content.get(field, ()))}" for field in PACK_FIELDS]
+    embed.add_field(name="Категории", value="\n".join(counts)[:1024], inline=False)
+    return embed
+
+
+def _admin_category_embed(pack: BunkerContentPack, field: str, *, status: str | None = None) -> discord.Embed:
+    values = list(pack.content.get(field, ()))
+    embed = discord.Embed(title=f"{pack.name} · {PACK_FIELD_LABELS[field]}", color=discord.Color.dark_teal())
+    embed.description = status or f"Строк в категории: {len(values)}."
+    if values:
+        lines = [f"{index + 1}. {value}" for index, value in enumerate(values[:15])]
+        if len(values) > 15:
+            lines.append(f"...еще {len(values) - 15}")
+        embed.add_field(name="Значения", value="\n".join(lines)[:1024], inline=False)
+    else:
+        embed.add_field(name="Значения", value="Пока пусто.", inline=False)
+    return embed
+
+
+def _pack_export_embed(pack: BunkerContentPack) -> discord.Embed:
+    raw = _pack_json_dump(pack)
+    if len(raw) > 3900:
+        raw = raw[:3900] + "\n..."
+    embed = discord.Embed(title=f"JSON экспорт: {pack.name}", color=discord.Color.green())
+    embed.description = f"```json\n{raw}\n```"
+    return embed
+
+
+def _pack_json_dump(pack: BunkerContentPack) -> str:
+    payload = {
+        "name": pack.name,
+        "description": pack.description,
+        "content": {field: list(pack.content.get(field, ())) for field in PACK_FIELDS},
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _pack_total(pack: BunkerContentPack) -> int:
+    return sum(len(values) for values in pack.content.values())
+
+
 def format_player_name(player: BunkerPlayer | None) -> str:
     if player is None:
         return "неизвестный игрок"
@@ -1825,6 +2476,12 @@ def _same_discord_message(left: Any, right: Any) -> bool:
     if left_id is not None and right_id is not None:
         return left_id == right_id
     return left is right
+
+
+def _voice_channel_url(channel: discord.VoiceChannel | None) -> str | None:
+    if channel is None:
+        return None
+    return f"https://discord.com/channels/{channel.guild.id}/{channel.id}"
 
 
 def _room_number(name: str, fallback: int) -> str:

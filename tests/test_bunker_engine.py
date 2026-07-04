@@ -6,11 +6,13 @@ from datetime import UTC, datetime
 
 from siri_bot.bunker.engine import (
     can_start_game,
+    assign_cards,
     generate_card,
     recommended_rounds,
     selectable_reveal_stats,
     tally_votes,
 )
+from siri_bot.bunker.content import ContentPack
 from siri_bot.bunker.models import BunkerPlayer, BunkerSettings, GameMode, Vote, VotePolicy
 
 
@@ -61,6 +63,28 @@ class BunkerEngineTests(unittest.TestCase):
         ok, _ = can_start_game(players)
 
         self.assertTrue(ok)
+
+    def test_assign_cards_uses_selected_content_pack(self) -> None:
+        pack = ContentPack(
+            professions=("Кастомный инженер",),
+            items=("Кастомный предмет",),
+            weaknesses=("Кастомная слабость",),
+            secrets=("Кастомный секрет",),
+            skills=("Кастомный навык",),
+            phobias=("Кастомная фобия",),
+            funny_traits=("Кастомная черта",),
+            apocalypses=("Кастомный апокалипсис",),
+            bunker_defects=("Кастомный дефект",),
+            chaos_events=("Кастомный хаос",),
+            layouts=("Кастомная планировка",),
+            special_actions=("Кастомное действие",),
+        )
+        players = [_player(1, host=True), _player(2)]
+
+        cards = assign_cards(players, BunkerSettings(), random.Random(1), pack)
+
+        self.assertEqual(cards[1].profession, "Кастомный инженер")
+        self.assertEqual(cards[2].special_action, "Кастомное действие")
 
     def test_selectable_reveal_stats_excludes_revealed_values(self) -> None:
         player = _player(1)
