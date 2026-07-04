@@ -94,14 +94,6 @@ class LevelingRepository:
                     PRIMARY KEY (guild_id, user_id)
                 );
 
-                CREATE TABLE IF NOT EXISTS leveling_panel_result_messages (
-                    guild_id BIGINT NOT NULL,
-                    channel_id BIGINT NOT NULL,
-                    message_id BIGINT NOT NULL,
-                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    PRIMARY KEY (guild_id, channel_id)
-                );
-
                 CREATE INDEX IF NOT EXISTS idx_leveling_member_xp_leaderboard
                     ON leveling_member_xp (guild_id, total_xp DESC, updated_at ASC);
                 CREATE INDEX IF NOT EXISTS idx_leveling_boosters_active
@@ -604,31 +596,6 @@ class LevelingRepository:
                     """,
                     guild_id,
                 )
-
-    async def get_panel_result_message_id(self, guild_id: int, channel_id: int) -> int | None:
-        row = await self.pool.fetchrow(
-            """
-            SELECT message_id
-            FROM leveling_panel_result_messages
-            WHERE guild_id = $1 AND channel_id = $2
-            """,
-            guild_id,
-            channel_id,
-        )
-        return int(row["message_id"]) if row is not None else None
-
-    async def upsert_panel_result_message_id(self, guild_id: int, channel_id: int, message_id: int) -> None:
-        await self.pool.execute(
-            """
-            INSERT INTO leveling_panel_result_messages (guild_id, channel_id, message_id)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (guild_id, channel_id)
-            DO UPDATE SET message_id = EXCLUDED.message_id, updated_at = NOW()
-            """,
-            guild_id,
-            channel_id,
-            message_id,
-        )
 
     async def _ensure_settings(self, guild_id: int) -> asyncpg.Record:
         await self.pool.execute(
