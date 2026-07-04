@@ -99,6 +99,11 @@ class BunkerRepository:
                     room_index INTEGER NOT NULL DEFAULT 0,
                     room_status TEXT NOT NULL DEFAULT 'lobby',
                     public_message_ids JSONB NOT NULL DEFAULT '{}',
+                    turn_order JSONB NOT NULL DEFAULT '[]',
+                    current_turn_index INTEGER NOT NULL DEFAULT 0,
+                    reveals_done_this_turn INTEGER NOT NULL DEFAULT 0,
+                    speech_index INTEGER NOT NULL DEFAULT 0,
+                    collapsed_sections JSONB NOT NULL DEFAULT '{}',
                     finished_at TIMESTAMPTZ,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -120,6 +125,7 @@ class BunkerRepository:
                     immune_round INTEGER,
                     personal_bonus INTEGER NOT NULL DEFAULT 0,
                     is_fake BOOLEAN NOT NULL DEFAULT FALSE,
+                    final_revealed BOOLEAN NOT NULL DEFAULT FALSE,
                     PRIMARY KEY (game_id, user_id)
                 );
 
@@ -130,6 +136,7 @@ class BunkerRepository:
                     target_user_id BIGINT,
                     is_abstain BOOLEAN NOT NULL DEFAULT FALSE,
                     changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    confirmed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     PRIMARY KEY (game_id, round_number, voter_id)
                 );
 
@@ -183,6 +190,11 @@ class BunkerRepository:
                 ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS room_index INTEGER NOT NULL DEFAULT 0;
                 ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS room_status TEXT NOT NULL DEFAULT 'lobby';
                 ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS public_message_ids JSONB NOT NULL DEFAULT '{}';
+                ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS turn_order JSONB NOT NULL DEFAULT '[]';
+                ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS current_turn_index INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS reveals_done_this_turn INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS speech_index INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS collapsed_sections JSONB NOT NULL DEFAULT '{}';
                 ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ;
 
                 ALTER TABLE bunker_players ADD COLUMN IF NOT EXISTS ready_at TIMESTAMPTZ;
@@ -196,6 +208,9 @@ class BunkerRepository:
                 ALTER TABLE bunker_players ADD COLUMN IF NOT EXISTS immune_round INTEGER;
                 ALTER TABLE bunker_players ADD COLUMN IF NOT EXISTS personal_bonus INTEGER NOT NULL DEFAULT 0;
                 ALTER TABLE bunker_players ADD COLUMN IF NOT EXISTS is_fake BOOLEAN NOT NULL DEFAULT FALSE;
+                ALTER TABLE bunker_players ADD COLUMN IF NOT EXISTS final_revealed BOOLEAN NOT NULL DEFAULT FALSE;
+
+                ALTER TABLE bunker_votes ADD COLUMN IF NOT EXISTS confirmed_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_bunker_room_setups_setup_channel_id
                     ON bunker_room_setups (setup_channel_id);
@@ -649,7 +664,7 @@ class BunkerRepository:
         row = await self.pool.fetchrow("SELECT * FROM bunker_games WHERE id = $1", game_id)
         return _game_from_row(row) if row else None
 
-    async def set_board_message(self, game_id: int, message_id: int) -> None:
+    async def set_board_message(self, game_id: int, message_id: int | None) -> None:
         await self.pool.execute(
             "UPDATE bunker_games SET board_message_id = $2, updated_at = NOW() WHERE id = $1",
             game_id,
@@ -667,6 +682,60 @@ class BunkerRepository:
             game_id,
             [key],
             message_id,
+        )
+
+    async def set_collapsed_section(self, game_id: int, key: str, collapsed: bool) -> None:
+        await self.pool.execute(
+            """
+            UPDATE bunker_games
+            SET collapsed_sections = jsonb_set(collapsed_sections, $2::text[], to_jsonb($3::boolean), TRUE),
+                updated_at = NOW()
+            WHERE id = $1
+            """,
+            game_id,
+            [key],
+            collapsed,
+        )
+
+    async def set_turn_order(self, game_id: int, user_ids: list[int]) -> None:
+        await self.pool.execute(
+            """
+            UPDATE bunker_games
+            SET turn_order = $2::jsonb,
+                current_turn_index = 0,
+                reveals_done_this_turn = 0,
+                speech_index = 0,
+                updated_at = NOW()
+            WHERE id = $1
+            """,
+            game_id,
+            json.dumps(user_ids),
+        )
+
+    async def set_reveal_progress(self, game_id: int, *, current_turn_index: int, reveals_done_this_turn: int) -> None:
+        await self.pool.execute(
+            """
+            UPDATE bunker_games
+            SET current_turn_index = $2,
+                reveals_done_this_turn = $3,
+                updated_at = NOW()
+            WHERE id = $1
+            """,
+            game_id,
+            current_turn_index,
+            reveals_done_this_turn,
+        )
+
+    async def set_speech_index(self, game_id: int, speech_index: int) -> None:
+        await self.pool.execute(
+            """
+            UPDATE bunker_games
+            SET speech_index = $2,
+                updated_at = NOW()
+            WHERE id = $1
+            """,
+            game_id,
+            speech_index,
         )
 
     async def set_game_state(
@@ -913,6 +982,32 @@ class BunkerRepository:
             json.dumps(revealed, ensure_ascii=False),
         )
 
+    async def reveal_all_stats(self, game_id: int, user_id: int) -> None:
+        await self.pool.execute(
+            """
+            UPDATE bunker_players
+            SET revealed_stats = $3::jsonb,
+                final_revealed = TRUE
+            WHERE game_id = $1 AND user_id = $2
+            """,
+            game_id,
+            user_id,
+            json.dumps(
+                [
+                    "gender",
+                    "body",
+                    "age",
+                    "profession",
+                    "health",
+                    "skill",
+                    "phobia",
+                    "inventory",
+                    "fact",
+                ],
+                ensure_ascii=False,
+            ),
+        )
+
     async def mark_special_used(self, game_id: int, user_id: int) -> None:
         await self.pool.execute(
             """
@@ -935,15 +1030,14 @@ class BunkerRepository:
             user_id,
         )
 
-    async def save_vote(self, vote: Vote) -> None:
-        await self.pool.execute(
+    async def save_vote(self, vote: Vote) -> bool:
+        row = await self.pool.fetchrow(
             """
             INSERT INTO bunker_votes (game_id, round_number, voter_id, target_user_id, is_abstain)
             VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (game_id, round_number, voter_id)
-            DO UPDATE SET target_user_id = EXCLUDED.target_user_id,
-                          is_abstain = EXCLUDED.is_abstain,
-                          changed_at = NOW()
+            DO NOTHING
+            RETURNING game_id
             """,
             vote.game_id,
             vote.round_number,
@@ -951,6 +1045,7 @@ class BunkerRepository:
             vote.target_user_id,
             vote.is_abstain,
         )
+        return row is not None
 
     async def list_votes(self, game_id: int, round_number: int) -> list[Vote]:
         rows = await self.pool.fetch(
@@ -1100,6 +1195,11 @@ def _game_from_row(row: asyncpg.Record) -> BunkerGame:
         room_status=RoomStatus(str(row["room_status"] or RoomStatus.LOBBY.value)),
         is_admin_game=bool(row["is_admin_game"]),
         public_message_ids={str(key): int(value) for key, value in _json_load(row["public_message_ids"], {}).items()},
+        turn_order=tuple(int(user_id) for user_id in _json_load(row["turn_order"], [])),
+        current_turn_index=int(row["current_turn_index"]),
+        reveals_done_this_turn=int(row["reveals_done_this_turn"]),
+        speech_index=int(row["speech_index"]),
+        collapsed_sections={str(key): bool(value) for key, value in _json_load(row["collapsed_sections"], {}).items()},
         recent_events=tuple(str(event) for event in _json_load(row["recent_events"], [])),
         finished_at=row["finished_at"],
     )
@@ -1122,6 +1222,7 @@ def _player_from_row(row: asyncpg.Record) -> BunkerPlayer:
         immune_round=int(row["immune_round"]) if row["immune_round"] is not None else None,
         personal_bonus=int(row["personal_bonus"]),
         is_fake=bool(row["is_fake"]),
+        final_revealed=bool(row["final_revealed"]),
     )
 
 
@@ -1132,6 +1233,7 @@ def _vote_from_row(row: asyncpg.Record) -> Vote:
         voter_id=int(row["voter_id"]),
         target_user_id=int(row["target_user_id"]) if row["target_user_id"] is not None else None,
         is_abstain=bool(row["is_abstain"]),
+        confirmed_at=row["confirmed_at"],
     )
 
 

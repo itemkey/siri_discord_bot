@@ -18,6 +18,7 @@ class GameState(StrEnum):
     LOBBY = "lobby"
     PREPARING = "preparing"
     REVEAL_PHASE = "reveal_phase"
+    SPEECH_PHASE = "speech_phase"
     DISCUSSION_PHASE = "discussion_phase"
     CHAOS_PHASE = "chaos_phase"
     VOTING_PHASE = "voting_phase"
@@ -40,26 +41,27 @@ class VotePolicy(StrEnum):
 
 
 CARD_STAT_LABELS: dict[str, str] = {
-    "profession": "Профессия",
+    "gender": "Пол",
+    "body": "Телосложение",
     "age": "Возраст",
+    "profession": "Профессия",
     "health": "Здоровье",
     "skill": "Навык",
-    "item": "Предмет",
     "phobia": "Фобия",
-    "secret": "Секрет",
-    "funny_trait": "Черта",
-    "special_action": "Спец-действие",
+    "inventory": "Инвентарь",
+    "fact": "Факт",
 }
 
 REVEALABLE_STATS: tuple[str, ...] = (
-    "profession",
+    "gender",
+    "body",
     "age",
+    "profession",
     "health",
     "skill",
-    "item",
     "phobia",
-    "secret",
-    "funny_trait",
+    "inventory",
+    "fact",
 )
 
 
@@ -157,29 +159,92 @@ class BunkerContentPack:
 
 
 @dataclass(frozen=True)
+class SpecialAbility:
+    id: str
+    name: str
+    description: str
+    effect: str
+    target: str = "none"
+    stat_key: str | None = None
+    uses: int = 1
+    timing: str = "any"
+    revealed: bool = False
+    used: bool = False
+    blocked: bool = False
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "description": self.description,
+            "effect": self.effect,
+            "target": self.target,
+            "stat_key": self.stat_key,
+            "uses": self.uses,
+            "timing": self.timing,
+            "revealed": self.revealed,
+            "used": self.used,
+            "blocked": self.blocked,
+        }
+
+    @classmethod
+    def from_json(cls, raw: Any) -> "SpecialAbility":
+        if isinstance(raw, str):
+            slug = raw.lower().replace(" ", "_")[:48] or "custom"
+            return cls(
+                id=slug,
+                name=raw,
+                description="Пользовательская возможность без отдельной логики применяет нейтральный эффект.",
+                effect="generic_note",
+            )
+        if not isinstance(raw, dict):
+            return cls(
+                id="generic",
+                name="Резервный протокол",
+                description="Нейтральная спец. возможность.",
+                effect="generic_note",
+            )
+        return cls(
+            id=str(raw.get("id") or raw.get("name") or "generic")[:64],
+            name=str(raw.get("name") or "Спец. возможность")[:80],
+            description=str(raw.get("description") or raw.get("text") or "")[:300],
+            effect=str(raw.get("effect") or "generic_note"),
+            target=str(raw.get("target") or "none"),
+            stat_key=str(raw["stat_key"]) if raw.get("stat_key") else None,
+            uses=max(1, int(raw.get("uses", 1))),
+            timing=str(raw.get("timing") or "any"),
+            revealed=bool(raw.get("revealed", False)),
+            used=bool(raw.get("used", False)),
+            blocked=bool(raw.get("blocked", False)),
+        )
+
+
+@dataclass(frozen=True)
 class CharacterCard:
-    profession: str
+    gender: str
+    body: str
     age: str
+    profession: str
     health: str
     skill: str
-    item: str
     phobia: str
-    secret: str
-    funny_trait: str
-    special_action: str
+    inventory: str
+    fact: str
+    special_abilities: tuple[SpecialAbility, ...] = field(default_factory=tuple)
     traitor: bool = False
 
     def to_json(self) -> dict[str, Any]:
         return {
-            "profession": self.profession,
+            "gender": self.gender,
+            "body": self.body,
             "age": self.age,
+            "profession": self.profession,
             "health": self.health,
             "skill": self.skill,
-            "item": self.item,
             "phobia": self.phobia,
-            "secret": self.secret,
-            "funny_trait": self.funny_trait,
-            "special_action": self.special_action,
+            "inventory": self.inventory,
+            "fact": self.fact,
+            "special_abilities": [ability.to_json() for ability in self.special_abilities],
             "traitor": self.traitor,
         }
 
@@ -188,18 +253,42 @@ class CharacterCard:
         if not raw:
             return None
 
+        abilities_raw = raw.get("special_abilities")
+        if abilities_raw is None and raw.get("special_action"):
+            abilities_raw = [raw.get("special_action")]
+        if not isinstance(abilities_raw, (list, tuple)):
+            abilities_raw = []
+
         return cls(
-            profession=str(raw.get("profession", "")),
+            gender=str(raw.get("gender", "не указано")),
+            body=str(raw.get("body", raw.get("funny_trait", "среднее телосложение"))),
             age=str(raw.get("age", "")),
+            profession=str(raw.get("profession", "")),
             health=str(raw.get("health", "")),
             skill=str(raw.get("skill", "")),
-            item=str(raw.get("item", "")),
             phobia=str(raw.get("phobia", "")),
-            secret=str(raw.get("secret", "")),
-            funny_trait=str(raw.get("funny_trait", "")),
-            special_action=str(raw.get("special_action", "")),
+            inventory=str(raw.get("inventory", raw.get("item", ""))),
+            fact=str(raw.get("fact", raw.get("secret", ""))),
+            special_abilities=tuple(SpecialAbility.from_json(ability) for ability in abilities_raw)[:2],
             traitor=bool(raw.get("traitor", False)),
         )
+
+    @property
+    def item(self) -> str:
+        return self.inventory
+
+    @property
+    def secret(self) -> str:
+        return self.fact
+
+    @property
+    def funny_trait(self) -> str:
+        return self.body
+
+    @property
+    def special_action(self) -> str:
+        ability = self.special_abilities[0] if self.special_abilities else None
+        return ability.name if ability else ""
 
 
 @dataclass(frozen=True)
@@ -293,6 +382,11 @@ class BunkerGame:
     room_status: RoomStatus = RoomStatus.LOBBY
     is_admin_game: bool = False
     public_message_ids: dict[str, int] = field(default_factory=dict)
+    turn_order: tuple[int, ...] = field(default_factory=tuple)
+    current_turn_index: int = 0
+    reveals_done_this_turn: int = 0
+    speech_index: int = 0
+    collapsed_sections: dict[str, bool] = field(default_factory=dict)
     recent_events: tuple[str, ...] = field(default_factory=tuple)
     finished_at: datetime | None = None
 
@@ -314,6 +408,7 @@ class BunkerPlayer:
     immune_round: int | None
     personal_bonus: int = 0
     is_fake: bool = False
+    final_revealed: bool = False
 
     @property
     def is_active(self) -> bool:
@@ -331,3 +426,4 @@ class Vote:
     voter_id: int
     target_user_id: int | None
     is_abstain: bool
+    confirmed_at: datetime | None = None

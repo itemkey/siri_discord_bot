@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import random
+import json
 from collections import Counter
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Iterable
 
-from siri_bot.bunker.content import BUILTIN_PACK, ContentPack
+from siri_bot.bunker.content import BODY_TYPES, BUILTIN_PACK, ContentPack, GENDERS
 from siri_bot.bunker.models import (
     BunkerGame,
     BunkerPlayer,
@@ -18,6 +19,7 @@ from siri_bot.bunker.models import (
     GameMode,
     GameState,
     REVEALABLE_STATS,
+    SpecialAbility,
     Vote,
     VotePolicy,
 )
@@ -110,18 +112,56 @@ def generate_card(
 ) -> CharacterCard:
     rng = rng or random.Random()
     age = rng.randint(18, 78)
+    abilities = _pick_special_abilities(rng, pack)
     return CharacterCard(
-        profession=rng.choice(pack.professions),
+        gender=rng.choice(GENDERS),
+        body=rng.choice(pack.funny_traits or BODY_TYPES),
         age=f"{age} лет",
+        profession=rng.choice(pack.professions),
         health=rng.choice(pack.weaknesses),
         skill=rng.choice(pack.skills),
-        item=rng.choice(pack.items),
         phobia=rng.choice(pack.phobias),
-        secret=rng.choice(pack.secrets),
-        funny_trait=rng.choice(pack.funny_traits),
-        special_action=rng.choice(pack.special_actions),
+        inventory=rng.choice(pack.items),
+        fact=rng.choice(pack.secrets),
+        special_abilities=abilities,
         traitor=traitor,
     )
+
+
+def _pick_special_abilities(rng: random.Random, pack: ContentPack) -> tuple[SpecialAbility, SpecialAbility]:
+    raw_values = list(pack.special_actions)
+    rng.shuffle(raw_values)
+    abilities: list[SpecialAbility] = []
+    seen: set[str] = set()
+    for raw in raw_values:
+        ability = _parse_special_ability(raw)
+        if ability.id in seen:
+            continue
+        seen.add(ability.id)
+        abilities.append(ability)
+        if len(abilities) == 2:
+            break
+
+    while len(abilities) < 2:
+        abilities.append(
+            SpecialAbility(
+                id=f"reserve_{len(abilities) + 1}",
+                name="Резервный протокол",
+                description="Нейтральная возможность без активного эффекта.",
+                effect="generic_note",
+            )
+        )
+    return tuple(abilities[:2])  # type: ignore[return-value]
+
+
+def _parse_special_ability(raw: str) -> SpecialAbility:
+    text = str(raw).strip()
+    if text.startswith("{"):
+        try:
+            return SpecialAbility.from_json(json.loads(text))
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return SpecialAbility.from_json(text)
+    return SpecialAbility.from_json(text)
 
 
 def assign_cards(
@@ -144,6 +184,11 @@ def selectable_reveal_stats(player: BunkerPlayer) -> list[str]:
     return [stat for stat in REVEALABLE_STATS if stat not in revealed]
 
 
+def next_reveal_stat(player: BunkerPlayer) -> str | None:
+    stats = selectable_reveal_stats(player)
+    return stats[0] if stats else None
+
+
 def reveal_stat(player: BunkerPlayer, stat: str) -> tuple[bool, str]:
     if stat not in REVEALABLE_STATS:
         return False, "Эту характеристику нельзя раскрыть через обычный reveal."
@@ -153,6 +198,10 @@ def reveal_stat(player: BunkerPlayer, stat: str) -> tuple[bool, str]:
 
     if player.card is None:
         return False, "Карточка еще не выдана."
+
+    expected = next_reveal_stat(player)
+    if expected is not None and stat != expected:
+        return False, f"Сначала нужно раскрыть: {CARD_STAT_LABELS[expected]}."
 
     return True, f"{player.display_name} раскрывает: {CARD_STAT_LABELS[stat]} - {getattr(player.card, stat)}"
 
@@ -185,13 +234,18 @@ def tally_votes(
         return None, "В бункере не осталось активных игроков."
 
     vote_by_voter = {vote.voter_id: vote for vote in votes}
+    player_by_id = {player.user_id: player for player in players}
     targets: list[int] = []
     abstains = 0
     for voter_id in alive_ids:
+        voter = player_by_id.get(voter_id)
+        vote_weight = max(0, 1 + (voter.personal_bonus if voter else 0))
+        if vote_weight <= 0:
+            continue
         vote = vote_by_voter.get(voter_id)
         if vote is None:
             if policy == VotePolicy.RANDOM:
-                targets.append(rng.choice([target for target in alive_ids if target != voter_id] or alive_ids))
+                targets.extend([rng.choice(alive_ids)] * vote_weight)
             else:
                 abstains += 1
             continue
@@ -199,7 +253,7 @@ def tally_votes(
         if vote.is_abstain or vote.target_user_id is None:
             abstains += 1
         elif vote.target_user_id in alive_ids:
-            targets.append(vote.target_user_id)
+            targets.extend([vote.target_user_id] * vote_weight)
 
     if not targets:
         return None, f"Никого не выгнали: все воздержались ({abstains})."
@@ -222,7 +276,8 @@ def should_enter_final(game: BunkerGame, players: list[BunkerPlayer]) -> bool:
 
 def next_state_after_timer(state: GameState) -> GameState:
     transitions = {
-        GameState.REVEAL_PHASE: GameState.DISCUSSION_PHASE,
+        GameState.REVEAL_PHASE: GameState.SPEECH_PHASE,
+        GameState.SPEECH_PHASE: GameState.DISCUSSION_PHASE,
         GameState.DISCUSSION_PHASE: GameState.CHAOS_PHASE,
         GameState.CHAOS_PHASE: GameState.VOTING_PHASE,
         GameState.VOTING_PHASE: GameState.ELIMINATION_PHASE,
@@ -238,6 +293,7 @@ def phase_deadline(settings: BunkerSettings, state: GameState, now: datetime | N
 
     seconds_by_state = {
         GameState.REVEAL_PHASE: settings.timer_seconds,
+        GameState.SPEECH_PHASE: settings.speech_seconds,
         GameState.DISCUSSION_PHASE: settings.discussion_seconds,
         GameState.CHAOS_PHASE: max(30, settings.timer_seconds // 2),
         GameState.VOTING_PHASE: settings.voting_seconds,
@@ -251,9 +307,8 @@ def final_epilogue(game: BunkerGame, players: list[BunkerPlayer], rng: random.Ra
     alive = [player for player in players if player.is_alive]
     eliminated = [player for player in players if player.is_eliminated]
     names = ", ".join(player.display_name for player in alive) or "никто"
-    leader = rng.choice(alive).display_name if alive else "пустой стул"
+    leader = rng.choice(alive).display_name if alive else "не назначен"
     mvp = max(alive, key=lambda player: len(player.revealed_stats), default=None)
-    lovable = rng.choice(eliminated or alive).display_name if players else "неизвестный герой"
     base_score = 45 + len(alive) * 7
     if game.profile:
         base_score += (game.profile.resources.food + game.profile.resources.water + game.profile.resources.electricity + game.profile.resources.morale) // 20
@@ -264,27 +319,27 @@ def final_epilogue(game: BunkerGame, players: list[BunkerPlayer], rng: random.Ra
 
     return (
         f"Выжили: {names}.\n"
-        f"Первый год прошел под девизом: '{rng.choice(('не трогай генератор', 'сначала совет, потом паника', 'кто съел пайки'))}'.\n"
-        f"Лидером стал(а): {leader}.\n"
-        f"Важную систему сломал(а): {lovable}, но все сделали вид, что так и было.\n"
+        f"Координатором первого цикла стал(а): {leader}.\n"
         f"MVP: {mvp.display_name if mvp else 'не назначен'}.\n"
-        f"Самая бесполезная, но любимая единица: {lovable}.\n"
+        f"Выгнано до финала: {len(eliminated)}.\n"
         f"Итоговый шанс выживания бункера: {survival}%.\n"
-        "Мемная концовка: бункер выжил, но спор о майонезе теперь внесен в конституцию."
+        "Финальный протокол закрыт. Дальнейшее выживание зависит от дисциплины, распределения ресурсов и состояния систем."
     )
 
 
 def format_card(card: CharacterCard) -> str:
     lines = [
-        f"Профессия: {card.profession}",
+        f"Пол: {card.gender}",
+        f"Телосложение: {card.body}",
         f"Возраст: {card.age}",
+        f"Профессия: {card.profession}",
         f"Здоровье: {card.health}",
         f"Навык: {card.skill}",
-        f"Предмет: {card.item}",
         f"Фобия: {card.phobia}",
-        f"Секрет: {card.secret}",
-        f"Черта: {card.funny_trait}",
-        f"Спец-действие: {card.special_action}",
+        f"Инвентарь: {card.inventory}",
+        f"Факт: {card.fact}",
+        "Спец. возможности:",
+        *[f"- {ability.name}: {ability.description or ability.effect}" for ability in card.special_abilities],
     ]
     if card.traitor:
         lines.append("Скрытая роль: предатель. Доживи до финала и испорть статистику.")

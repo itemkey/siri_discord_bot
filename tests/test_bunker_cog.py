@@ -20,6 +20,7 @@ from siri_bot.cogs.bunker import (
 )
 from siri_bot.bunker.models import BunkerPlayer, BunkerSettings, RoomSetup
 from siri_bot.bunker.models import BunkerGame, GameState
+from siri_bot.bunker.engine import generate_card
 
 
 class FakeGuild:
@@ -320,6 +321,54 @@ class BunkerCogTests(unittest.TestCase):
         self.assertNotIn("Моя карточка", labels)
         self.assertNotIn("Раскрыть стату", labels)
         self.assertNotIn("Голосовать", labels)
+
+    def test_ranked_active_panel_hides_debug_operator_controls(self) -> None:
+        game = BunkerGame(
+            id=55,
+            guild_id=100,
+            setup_id=10,
+            setup_channel_id=300,
+            setup_message_id=500,
+            category_id=None,
+            game_text_channel_id=700,
+            voice_channel_id=800,
+            host_id=201,
+            state=GameState.REVEAL_PHASE,
+            settings=BunkerSettings(is_ranked=True),
+            round_number=1,
+            phase_started_at=None,
+            phase_ends_at=None,
+            paused_at=None,
+            board_message_id=None,
+            profile=None,
+            turn_order=(201,),
+        )
+        player = BunkerPlayer(
+            game_id=55,
+            user_id=201,
+            display_name="Player",
+            is_host=True,
+            ready_at=None,
+            invited_at=None,
+            joined_at=None,
+            left_at=None,
+            is_eliminated=False,
+            card=generate_card(),
+            revealed_stats=(),
+            used_special_action=False,
+            immune_round=None,
+        )
+
+        view = BunkerPrivatePlayerPanelView(object(), game, player, is_operator=True, can_close=True, players=[player])
+        labels = [child.label for child in view.children if isinstance(child, discord.ui.Button)]
+
+        self.assertIn("Личная информация", labels)
+        self.assertIn("Раскрыть", labels)
+        self.assertNotIn("Добавить тест-ботов", labels)
+        self.assertNotIn("Очистить тест-ботов", labels)
+        self.assertNotIn("Форс-старт", labels)
+        self.assertNotIn("Следующая фаза", labels)
+        self.assertNotIn("Правила", labels)
 
     def test_fake_player_name_has_no_discord_mention(self) -> None:
         player = BunkerPlayer(

@@ -9,6 +9,7 @@ from siri_bot.bunker.engine import (
     assign_cards,
     generate_card,
     recommended_rounds,
+    reveal_stat,
     selectable_reveal_stats,
     tally_votes,
 )
@@ -92,17 +93,33 @@ class BunkerEngineTests(unittest.TestCase):
         cards = assign_cards(players, BunkerSettings(), random.Random(1), pack)
 
         self.assertEqual(cards[1].profession, "Кастомный инженер")
-        self.assertEqual(cards[2].special_action, "Кастомное действие")
+        self.assertEqual(cards[2].inventory, "Кастомный предмет")
+        self.assertEqual(len(cards[2].special_abilities), 2)
 
     def test_selectable_reveal_stats_excludes_revealed_values(self) -> None:
         player = _player(1)
-        player = BunkerPlayer(**{**player.__dict__, "revealed_stats": ("profession", "secret")})
+        player = BunkerPlayer(**{**player.__dict__, "revealed_stats": ("gender", "profession", "fact")})
 
         stats = selectable_reveal_stats(player)
 
+        self.assertEqual(stats[0], "body")
+        self.assertNotIn("gender", stats)
         self.assertNotIn("profession", stats)
-        self.assertNotIn("secret", stats)
-        self.assertIn("item", stats)
+        self.assertNotIn("fact", stats)
+        self.assertIn("inventory", stats)
+
+    def test_reveal_requires_ordered_card_schema(self) -> None:
+        player = _player(1)
+
+        ok, message = reveal_stat(player, "profession")
+
+        self.assertFalse(ok)
+        self.assertIn("Пол", message)
+
+        ok, message = reveal_stat(player, "gender")
+
+        self.assertTrue(ok)
+        self.assertIn("Пол", message)
 
     def test_vote_tally_handles_abstain_policy_and_ties(self) -> None:
         players = [_player(index) for index in range(1, 7)]
@@ -116,6 +133,14 @@ class BunkerEngineTests(unittest.TestCase):
 
         self.assertIn(eliminated, {2, 3})
         self.assertIn("Ничья", message)
+
+    def test_vote_tally_allows_self_vote(self) -> None:
+        players = [_player(index) for index in range(1, 7)]
+        votes = [Vote(1, 1, 1, 1, False)]
+
+        eliminated, _ = tally_votes(players, votes, VotePolicy.ABSTAIN, random.Random(1))
+
+        self.assertEqual(eliminated, 1)
 
 
 if __name__ == "__main__":

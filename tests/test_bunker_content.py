@@ -37,6 +37,12 @@ class BunkerContentTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             normalize_pack_content({"unknown": ["value"]})
 
+    def test_builtin_pack_is_neutral_not_meme_pack(self) -> None:
+        raw = "\n".join(value for values in BUILTIN_PACK.to_json().values() for value in values).casefold()
+
+        for banned in ("мем", "кринж", "майонез", "караоке", "ложк", "крысы"):
+            self.assertNotIn(banned, raw)
+
 
 if __name__ == "__main__":
     unittest.main()
