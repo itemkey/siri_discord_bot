@@ -16,15 +16,16 @@ Discord-бот на `discord.py`, готовый к запуску в Docker. К
 - `/purge` - удаление последних сообщений в текущем канале. Нужно право `Manage Messages`.
 - `/rank` и `/leaderboard` - leveling, XP и таблица лидеров.
 - `/leveling ...` - админ-настройки XP, формулы, role rewards, boosters и level-up сообщений.
+- `/createbunker` и `/bunker ...` - интерактивная party/RP-игра “Бункер” с setup-панелью комнаты, закрытым text/voice, готовностью игроков, приватными карточками, голосованиями и PNG-табло.
 
 ## Настройка
 
 1. Создай приложение и бота в Discord Developer Portal.
 2. При приглашении включи scopes `bot` и `applications.commands`.
-3. Выдай нужные права: `Send Messages`, `Embed Links`, `Add Reactions`, `Read Message History`, а для `/purge`, role rewards и first place role ещё `Manage Messages` и `Manage Roles`.
+3. Выдай нужные права: `Send Messages`, `Embed Links`, `Attach Files`, `Add Reactions`, `Read Message History`, а для `/purge`, role rewards и first place role ещё `Manage Messages` и `Manage Roles`. Для “Бункера” также нужны `Manage Channels` и `Move Members`.
 4. Скопируй `.env.example` в `.env` и заполни `DISCORD_TOKEN`.
 5. Для быстрой регистрации команд укажи `GUILD_ID` своего Discord-сервера. Без него команды будут глобальными и могут появляться до часа.
-6. Leveling использует PostgreSQL. В Docker Compose база поднимается автоматически, а данные лежат в volume `postgres-data`.
+6. Leveling и “Бункер” используют PostgreSQL. В Docker Compose база поднимается автоматически, а данные лежат в volume `postgres-data`.
 
 ## Запуск в Docker
 
@@ -121,6 +122,26 @@ python -m siri_bot.bot
 - `/leveling booster add/remove/list`
 - `/leveling member add-xp/set-xp/reset`
 - `/leveling reset-confirm`
+
+## Бункер
+
+1. В командном чате вызови `/createbunker channel` и выбери существующий текстовый канал комнаты, например `БУНКЕР - КОМНАТА 1`.
+2. Бот отправит туда setup-панель с кнопками `Построить бункер`, `Зайти в бункер`, `Настроить бункер`, `Как играть` и `Паки/контент`.
+3. Тот, кто нажал `Построить бункер`, становится хостом. Бот создает в той же категории закрытый text-канал партии и voice `Собрание бункера N`.
+4. Игроки заходят через кнопку, получают доступ к закрытым каналам и нажимают `Готов`. Если игрок уже находится в voice, бот попробует перенести его в голосовой бункера; иначе даст доступ и ссылку.
+5. Хост нажимает `Начать`, когда в лобби минимум 6 игроков и все, кроме хоста, готовы.
+
+Основные команды внутри игрового text-канала:
+
+- `/bunker card`
+- `/bunker reveal`
+- `/bunker vote`
+- `/bunker action`
+- `/bunker pause`
+- `/bunker resume`
+- `/bunker end`
+- `/bunker invite`
+- `/bunker packs`
 
 ## Админ-доступ
 
