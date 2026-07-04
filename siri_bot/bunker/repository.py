@@ -104,16 +104,6 @@ class BunkerRepository:
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
 
-                DROP INDEX IF EXISTS idx_bunker_active_game_per_setup;
-                DROP INDEX IF EXISTS idx_bunker_active_game_by_host;
-                DROP INDEX IF EXISTS idx_bunker_game_text_channel;
-                CREATE INDEX IF NOT EXISTS idx_bunker_active_game_by_host
-                    ON bunker_games (guild_id, host_id)
-                    WHERE room_status IN ('lobby', 'active') AND finished_at IS NULL;
-                CREATE INDEX IF NOT EXISTS idx_bunker_game_text_channel
-                    ON bunker_games (game_text_channel_id)
-                    WHERE room_status IN ('lobby', 'active') AND finished_at IS NULL;
-
                 CREATE TABLE IF NOT EXISTS bunker_players (
                     game_id BIGINT NOT NULL REFERENCES bunker_games(id) ON DELETE CASCADE,
                     user_id BIGINT NOT NULL,
