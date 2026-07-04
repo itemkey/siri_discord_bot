@@ -736,8 +736,9 @@ class Leveling(commands.Cog):
             await interaction.response.send_message("Эта кнопка работает только на сервере.", ephemeral=True)
             return
 
+        await interaction.response.defer()
         embed = await self._build_rank_embed(guild, interaction.user)
-        await interaction.response.edit_message(content=None, embed=embed, view=RankPanelView(self))
+        await self._edit_rank_panel_message(interaction, content=None, embed=embed)
 
     async def _send_leaderboard_panel_response(self, interaction: discord.Interaction) -> None:
         guild = interaction.guild
@@ -745,16 +746,32 @@ class Leveling(commands.Cog):
             await interaction.response.send_message("Эта кнопка работает только на сервере.", ephemeral=True)
             return
 
+        await interaction.response.defer()
         embed = await self._build_leaderboard_embed(guild, page=1)
         if embed is None:
-            await interaction.response.edit_message(
+            await self._edit_rank_panel_message(
+                interaction,
                 content="Пока нет XP в таблице лидеров.",
                 embed=None,
-                view=RankPanelView(self),
             )
             return
 
-        await interaction.response.edit_message(content=None, embed=embed, view=RankPanelView(self))
+        await self._edit_rank_panel_message(interaction, content=None, embed=embed)
+
+    async def _edit_rank_panel_message(
+        self,
+        interaction: discord.Interaction,
+        *,
+        content: str | None,
+        embed: discord.Embed | None,
+    ) -> None:
+        view = RankPanelView(self)
+        message = getattr(interaction, "message", None)
+        if message is None:
+            await interaction.edit_original_response(content=content, embed=embed, view=view)
+            return
+
+        await message.edit(content=content, embed=embed, view=view)
 
     async def _refresh_rank_panel_response(self, interaction: discord.Interaction) -> None:
         guild = interaction.guild
