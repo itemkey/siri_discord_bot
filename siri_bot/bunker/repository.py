@@ -120,6 +120,42 @@ class BunkerRepository:
                 );
                 """
             )
+            await connection.execute(
+                """
+                ALTER TABLE bunker_room_setups ADD COLUMN IF NOT EXISTS guild_id BIGINT;
+                ALTER TABLE bunker_room_setups ADD COLUMN IF NOT EXISTS setup_channel_id BIGINT;
+                ALTER TABLE bunker_room_setups ADD COLUMN IF NOT EXISTS category_id BIGINT;
+                ALTER TABLE bunker_room_setups ADD COLUMN IF NOT EXISTS setup_message_id BIGINT;
+                ALTER TABLE bunker_room_setups ADD COLUMN IF NOT EXISTS room_name TEXT;
+                ALTER TABLE bunker_room_setups ADD COLUMN IF NOT EXISTS active_game_id BIGINT;
+                ALTER TABLE bunker_room_setups ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+                ALTER TABLE bunker_room_setups ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+                ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS setup_message_id BIGINT;
+                ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS category_id BIGINT;
+                ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS game_text_channel_id BIGINT;
+                ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS voice_channel_id BIGINT;
+                ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS board_message_id BIGINT;
+                ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS settings JSONB NOT NULL DEFAULT '{}';
+                ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS bunker_profile JSONB;
+                ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS recent_events JSONB NOT NULL DEFAULT '[]';
+                ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ;
+
+                ALTER TABLE bunker_players ADD COLUMN IF NOT EXISTS ready_at TIMESTAMPTZ;
+                ALTER TABLE bunker_players ADD COLUMN IF NOT EXISTS invited_at TIMESTAMPTZ;
+                ALTER TABLE bunker_players ADD COLUMN IF NOT EXISTS joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+                ALTER TABLE bunker_players ADD COLUMN IF NOT EXISTS left_at TIMESTAMPTZ;
+                ALTER TABLE bunker_players ADD COLUMN IF NOT EXISTS is_eliminated BOOLEAN NOT NULL DEFAULT FALSE;
+                ALTER TABLE bunker_players ADD COLUMN IF NOT EXISTS card JSONB;
+                ALTER TABLE bunker_players ADD COLUMN IF NOT EXISTS revealed_stats JSONB NOT NULL DEFAULT '[]';
+                ALTER TABLE bunker_players ADD COLUMN IF NOT EXISTS used_special_action BOOLEAN NOT NULL DEFAULT FALSE;
+                ALTER TABLE bunker_players ADD COLUMN IF NOT EXISTS immune_round INTEGER;
+                ALTER TABLE bunker_players ADD COLUMN IF NOT EXISTS personal_bonus INTEGER NOT NULL DEFAULT 0;
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_bunker_room_setups_setup_channel_id
+                    ON bunker_room_setups (setup_channel_id);
+                """
+            )
 
     async def upsert_room_setup(
         self,
@@ -626,4 +662,3 @@ def _json_load(raw: Any, default: Any = None) -> Any:
     if isinstance(raw, str):
         return json.loads(raw)
     return raw
-

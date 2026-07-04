@@ -90,21 +90,66 @@ class Bunker(commands.Cog):
     @app_commands.describe(channel="Существующий текстовый канал комнаты, например БУНКЕР - КОМНАТА 1")
     @admin_only()
     async def createbunker(self, interaction: discord.Interaction, channel: discord.TextChannel) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
         guild = interaction.guild
         if guild is None or channel.guild.id != guild.id:
-            await interaction.response.send_message("Выбери текстовый канал на этом же сервере.", ephemeral=True)
+            await interaction.followup.send("Выбери текстовый канал на этом же сервере.", ephemeral=True)
+            return
+
+        bot_member = guild.me
+        if bot_member is None and self.bot.user is not None:
+            bot_member = guild.get_member(self.bot.user.id)
+        if bot_member is None:
+            await interaction.followup.send("Не вижу себя в списке участников сервера. Попробуй перезапустить бота.", ephemeral=True)
+            return
+
+        missing_permissions = _missing_setup_panel_permissions(channel.permissions_for(bot_member))
+        if missing_permissions:
+            await interaction.followup.send(
+                "Не могу отправить панель в выбранный канал. "
+                f"Не хватает прав: {', '.join(missing_permissions)}.",
+                ephemeral=True,
+            )
             return
 
         embed = _setup_embed(channel.name)
-        message = await channel.send(embed=embed, view=BunkerSetupView(self))
-        await self.repository.upsert_room_setup(
-            guild_id=guild.id,
-            setup_channel_id=channel.id,
-            category_id=channel.category_id,
-            setup_message_id=message.id,
-            room_name=channel.name,
-        )
-        await interaction.response.send_message(f"Панель Бункера отправлена в {channel.mention}.", ephemeral=True)
+        try:
+            message = await channel.send(embed=embed, view=BunkerSetupView(self))
+        except discord.Forbidden:
+            await interaction.followup.send(
+                "Discord не дал отправить панель в выбранный канал. "
+                "Проверь права `View Channel`, `Send Messages` и `Embed Links`.",
+                ephemeral=True,
+            )
+            return
+        except discord.HTTPException:
+            LOGGER.exception("Failed to send bunker setup panel to channel %s", channel.id)
+            await interaction.followup.send("Discord отклонил отправку панели. Подробность будет в `docker compose logs discord-bot`.", ephemeral=True)
+            return
+
+        try:
+            await self.repository.upsert_room_setup(
+                guild_id=guild.id,
+                setup_channel_id=channel.id,
+                category_id=channel.category_id,
+                setup_message_id=message.id,
+                room_name=channel.name,
+            )
+        except asyncpg.PostgresError:
+            LOGGER.exception("Failed to save bunker setup for channel %s", channel.id)
+            try:
+                await message.delete()
+            except discord.HTTPException:
+                LOGGER.info("Could not delete bunker setup panel after database failure.", exc_info=True)
+            await interaction.followup.send(
+                "Панель отправилась, но я не смог записать комнату в PostgreSQL. "
+                "Проверь `docker compose logs --tail=200 discord-bot` и доступность базы.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.followup.send(f"Панель Бункера отправлена в {channel.mention}.", ephemeral=True)
 
     @bunker_group.command(name="card", description="Показать свою карточку в текущей партии.")
     async def card_command(self, interaction: discord.Interaction) -> None:
@@ -1238,6 +1283,15 @@ def _room_number(name: str, fallback: int) -> str:
     return match.group(1) if match else str(fallback)
 
 
+def _missing_setup_panel_permissions(permissions: discord.Permissions) -> list[str]:
+    required = {
+        "View Channel": permissions.view_channel,
+        "Send Messages": permissions.send_messages,
+        "Embed Links": permissions.embed_links,
+    }
+    return [name for name, allowed in required.items() if not allowed]
+
+
 async def _create_pool(database_url: str) -> asyncpg.Pool:
     last_error: Exception | None = None
     for attempt in range(1, 6):
@@ -1257,4 +1311,3 @@ async def setup(bot: commands.Bot) -> None:
     repository = BunkerRepository(pool)
     await repository.init_schema()
     await bot.add_cog(Bunker(bot, repository, pool))
-
