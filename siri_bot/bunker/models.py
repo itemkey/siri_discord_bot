@@ -104,6 +104,12 @@ class RoomSetup:
 
 
 @dataclass(frozen=True)
+class BunkerGuildSettings:
+    guild_id: int
+    operator_role_id: int | None
+
+
+@dataclass(frozen=True)
 class CharacterCard:
     profession: str
     age: str
@@ -236,6 +242,7 @@ class BunkerGame:
     paused_at: datetime | None
     board_message_id: int | None
     profile: BunkerProfile | None
+    is_admin_game: bool = False
     recent_events: tuple[str, ...] = field(default_factory=tuple)
     finished_at: datetime | None = None
 
@@ -256,6 +263,7 @@ class BunkerPlayer:
     used_special_action: bool
     immune_round: int | None
     personal_bonus: int = 0
+    is_fake: bool = False
 
     @property
     def is_active(self) -> bool:
@@ -273,4 +281,3 @@ class Vote:
     voter_id: int
     target_user_id: int | None
     is_abstain: bool
-

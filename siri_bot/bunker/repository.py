@@ -8,6 +8,7 @@ import asyncpg
 
 from siri_bot.bunker.models import (
     BunkerGame,
+    BunkerGuildSettings,
     BunkerPlayer,
     BunkerProfile,
     BunkerSettings,
@@ -46,6 +47,13 @@ class BunkerRepository:
                     PRIMARY KEY (setup_id, user_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS bunker_guild_settings (
+                    guild_id BIGINT PRIMARY KEY,
+                    operator_role_id BIGINT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+
                 CREATE TABLE IF NOT EXISTS bunker_games (
                     id BIGSERIAL PRIMARY KEY,
                     guild_id BIGINT NOT NULL,
@@ -70,6 +78,7 @@ class BunkerRepository:
                     settings JSONB NOT NULL,
                     bunker_profile JSONB,
                     recent_events JSONB NOT NULL DEFAULT '[]',
+                    is_admin_game BOOLEAN NOT NULL DEFAULT FALSE,
                     finished_at TIMESTAMPTZ,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -97,6 +106,7 @@ class BunkerRepository:
                     used_special_action BOOLEAN NOT NULL DEFAULT FALSE,
                     immune_round INTEGER,
                     personal_bonus INTEGER NOT NULL DEFAULT 0,
+                    is_fake BOOLEAN NOT NULL DEFAULT FALSE,
                     PRIMARY KEY (game_id, user_id)
                 );
 
@@ -139,6 +149,7 @@ class BunkerRepository:
                 ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS settings JSONB NOT NULL DEFAULT '{}';
                 ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS bunker_profile JSONB;
                 ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS recent_events JSONB NOT NULL DEFAULT '[]';
+                ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS is_admin_game BOOLEAN NOT NULL DEFAULT FALSE;
                 ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ;
 
                 ALTER TABLE bunker_players ADD COLUMN IF NOT EXISTS ready_at TIMESTAMPTZ;
@@ -151,11 +162,42 @@ class BunkerRepository:
                 ALTER TABLE bunker_players ADD COLUMN IF NOT EXISTS used_special_action BOOLEAN NOT NULL DEFAULT FALSE;
                 ALTER TABLE bunker_players ADD COLUMN IF NOT EXISTS immune_round INTEGER;
                 ALTER TABLE bunker_players ADD COLUMN IF NOT EXISTS personal_bonus INTEGER NOT NULL DEFAULT 0;
+                ALTER TABLE bunker_players ADD COLUMN IF NOT EXISTS is_fake BOOLEAN NOT NULL DEFAULT FALSE;
 
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_bunker_room_setups_setup_channel_id
                     ON bunker_room_setups (setup_channel_id);
                 """
             )
+
+    async def get_or_create_guild_settings(self, guild_id: int) -> BunkerGuildSettings:
+        row = await self.pool.fetchrow(
+            """
+            INSERT INTO bunker_guild_settings (guild_id)
+            VALUES ($1)
+            ON CONFLICT (guild_id) DO UPDATE SET updated_at = bunker_guild_settings.updated_at
+            RETURNING *
+            """,
+            guild_id,
+        )
+        return _guild_settings_from_row(row)
+
+    async def set_operator_role(self, guild_id: int, role_id: int | None) -> BunkerGuildSettings:
+        row = await self.pool.fetchrow(
+            """
+            INSERT INTO bunker_guild_settings (guild_id, operator_role_id)
+            VALUES ($1, $2)
+            ON CONFLICT (guild_id)
+            DO UPDATE SET operator_role_id = EXCLUDED.operator_role_id, updated_at = NOW()
+            RETURNING *
+            """,
+            guild_id,
+            role_id,
+        )
+        return _guild_settings_from_row(row)
+
+    async def is_bunker_operator(self, guild_id: int, role_ids: list[int]) -> bool:
+        settings = await self.get_or_create_guild_settings(guild_id)
+        return settings.operator_role_id is not None and settings.operator_role_id in set(role_ids)
 
     async def upsert_room_setup(
         self,
@@ -228,6 +270,7 @@ class BunkerRepository:
         text_channel_id: int,
         voice_channel_id: int,
         host_display_name: str,
+        is_admin_game: bool = False,
     ) -> BunkerGame:
         async with self.pool.acquire() as connection:
             async with connection.transaction():
@@ -243,9 +286,9 @@ class BunkerRepository:
                     INSERT INTO bunker_games (
                         guild_id, setup_id, setup_channel_id, setup_message_id, category_id,
                         game_text_channel_id, voice_channel_id, host_id, state, mode, is_public,
-                        slots, max_rounds, timer_seconds, settings
+                        slots, max_rounds, timer_seconds, settings, is_admin_game
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'lobby', $9, $10, $11, $12, $13, $14::jsonb)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'lobby', $9, $10, $11, $12, $13, $14::jsonb, $15)
                     RETURNING *
                     """,
                     setup.guild_id,
@@ -262,6 +305,7 @@ class BunkerRepository:
                     settings.rounds,
                     settings.timer_seconds,
                     json.dumps(settings.to_json(), ensure_ascii=False),
+                    is_admin_game,
                 )
                 await connection.execute(
                     """
@@ -400,20 +444,75 @@ class BunkerRepository:
             json.dumps(events, ensure_ascii=False),
         )
 
-    async def add_or_restore_player(self, game_id: int, user_id: int, display_name: str) -> BunkerPlayer:
+    async def add_or_restore_player(self, game_id: int, user_id: int, display_name: str, *, is_fake: bool = False) -> BunkerPlayer:
         row = await self.pool.fetchrow(
             """
-            INSERT INTO bunker_players (game_id, user_id, display_name)
-            VALUES ($1, $2, $3)
+            INSERT INTO bunker_players (game_id, user_id, display_name, is_fake)
+            VALUES ($1, $2, $3, $4)
             ON CONFLICT (game_id, user_id)
-            DO UPDATE SET display_name = EXCLUDED.display_name, left_at = NULL
+            DO UPDATE SET display_name = EXCLUDED.display_name, left_at = NULL, is_fake = EXCLUDED.is_fake
             RETURNING *
             """,
             game_id,
             user_id,
             display_name,
+            is_fake,
         )
         return _player_from_row(row)
+
+    async def add_fake_players(self, game_id: int, total_player_target: int) -> list[BunkerPlayer]:
+        existing = await self.list_players(game_id)
+        missing = max(0, total_player_target - len(existing))
+        if missing <= 0:
+            return []
+
+        existing_fake_count = sum(1 for player in existing if player.is_fake)
+        rows: list[asyncpg.Record] = []
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                for offset in range(1, missing + 1):
+                    number = existing_fake_count + offset
+                    user_id = -((game_id * 1000) + number)
+                    row = await connection.fetchrow(
+                        """
+                        INSERT INTO bunker_players (game_id, user_id, display_name, ready_at, is_fake)
+                        VALUES ($1, $2, $3, NOW(), TRUE)
+                        ON CONFLICT (game_id, user_id)
+                        DO UPDATE SET display_name = EXCLUDED.display_name,
+                                      ready_at = NOW(),
+                                      left_at = NULL,
+                                      is_fake = TRUE
+                        RETURNING *
+                        """,
+                        game_id,
+                        user_id,
+                        f"Тестовый выживший {number}",
+                    )
+                    rows.append(row)
+
+        return [_player_from_row(row) for row in rows]
+
+    async def remove_fake_players(self, game_id: int) -> int:
+        result = await self.pool.execute(
+            """
+            DELETE FROM bunker_players
+            WHERE game_id = $1 AND is_fake = TRUE
+            """,
+            game_id,
+        )
+        return int(result.rsplit(" ", 1)[-1])
+
+    async def list_fake_players(self, game_id: int) -> list[BunkerPlayer]:
+        rows = await self.pool.fetch(
+            """
+            SELECT *
+            FROM bunker_players
+            WHERE game_id = $1 AND is_fake = TRUE
+            ORDER BY joined_at ASC, user_id DESC
+            """,
+            game_id,
+        )
+        return [_player_from_row(row) for row in rows]
 
     async def list_players(self, game_id: int, *, include_left: bool = False) -> list[BunkerPlayer]:
         condition = "" if include_left else "AND left_at IS NULL"
@@ -602,6 +701,13 @@ def _setup_from_row(row: asyncpg.Record) -> RoomSetup:
     )
 
 
+def _guild_settings_from_row(row: asyncpg.Record) -> BunkerGuildSettings:
+    return BunkerGuildSettings(
+        guild_id=int(row["guild_id"]),
+        operator_role_id=int(row["operator_role_id"]) if row["operator_role_id"] is not None else None,
+    )
+
+
 def _game_from_row(row: asyncpg.Record) -> BunkerGame:
     settings = BunkerSettings.from_json(_json_load(row["settings"]))
     return BunkerGame(
@@ -622,6 +728,7 @@ def _game_from_row(row: asyncpg.Record) -> BunkerGame:
         paused_at=row["paused_at"],
         board_message_id=int(row["board_message_id"]) if row["board_message_id"] is not None else None,
         profile=BunkerProfile.from_json(_json_load(row["bunker_profile"])),
+        is_admin_game=bool(row["is_admin_game"]),
         recent_events=tuple(str(event) for event in _json_load(row["recent_events"], [])),
         finished_at=row["finished_at"],
     )
@@ -643,6 +750,7 @@ def _player_from_row(row: asyncpg.Record) -> BunkerPlayer:
         used_special_action=bool(row["used_special_action"]),
         immune_round=int(row["immune_round"]) if row["immune_round"] is not None else None,
         personal_bonus=int(row["personal_bonus"]),
+        is_fake=bool(row["is_fake"]),
     )
 
 

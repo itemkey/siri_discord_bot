@@ -14,7 +14,7 @@ from siri_bot.bunker.engine import (
 from siri_bot.bunker.models import BunkerPlayer, BunkerSettings, GameMode, Vote, VotePolicy
 
 
-def _player(user_id: int, *, host: bool = False, ready: bool = True, eliminated: bool = False) -> BunkerPlayer:
+def _player(user_id: int, *, host: bool = False, ready: bool = True, eliminated: bool = False, fake: bool = False) -> BunkerPlayer:
     return BunkerPlayer(
         game_id=1,
         user_id=user_id,
@@ -29,6 +29,7 @@ def _player(user_id: int, *, host: bool = False, ready: bool = True, eliminated:
         revealed_stats=(),
         used_special_action=False,
         immune_round=None,
+        is_fake=fake,
     )
 
 
@@ -52,6 +53,13 @@ class BunkerEngineTests(unittest.TestCase):
 
         players[-1] = _player(6, ready=True)
         ok, _ = can_start_game(players)
+        self.assertTrue(ok)
+
+    def test_fake_players_count_toward_start_gate_when_ready(self) -> None:
+        players = [_player(1, host=True)] + [_player(-index, ready=True, fake=True) for index in range(2, 7)]
+
+        ok, _ = can_start_game(players)
+
         self.assertTrue(ok)
 
     def test_selectable_reveal_stats_excludes_revealed_values(self) -> None:
@@ -80,4 +88,3 @@ class BunkerEngineTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
