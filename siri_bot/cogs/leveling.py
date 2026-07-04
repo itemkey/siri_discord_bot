@@ -242,8 +242,8 @@ class Leveling(commands.Cog):
             color=discord.Color.teal(),
         )
         embed.add_field(name="Мой уровень", value="Личная карточка с твоим текущим прогрессом.", inline=False)
-        embed.add_field(name="Топ сервера", value="Личная таблица лидеров без спама в канал.", inline=False)
-        embed.set_footer(text="Ответы видит только тот, кто нажал кнопку.")
+        embed.add_field(name="Топ сервера", value="Таблица лидеров без новых сообщений в канал.", inline=False)
+        embed.set_footer(text="Кнопки обновляют это сообщение.")
 
         try:
             await channel.send(embed=embed, view=RankPanelView(self))
@@ -737,7 +737,7 @@ class Leveling(commands.Cog):
             return
 
         embed = await self._build_rank_embed(guild, interaction.user)
-        await interaction.response.send_message(embed=embed, view=RankRefreshView(self), ephemeral=True)
+        await interaction.response.edit_message(content=None, embed=embed, view=RankPanelView(self))
 
     async def _send_leaderboard_panel_response(self, interaction: discord.Interaction) -> None:
         guild = interaction.guild
@@ -747,10 +747,14 @@ class Leveling(commands.Cog):
 
         embed = await self._build_leaderboard_embed(guild, page=1)
         if embed is None:
-            await interaction.response.send_message("Пока нет XP в таблице лидеров.", ephemeral=True)
+            await interaction.response.edit_message(
+                content="Пока нет XP в таблице лидеров.",
+                embed=None,
+                view=RankPanelView(self),
+            )
             return
 
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.response.edit_message(content=None, embed=embed, view=RankPanelView(self))
 
     async def _refresh_rank_panel_response(self, interaction: discord.Interaction) -> None:
         guild = interaction.guild
