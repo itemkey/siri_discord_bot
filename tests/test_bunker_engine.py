@@ -8,13 +8,16 @@ from siri_bot.bunker.engine import (
     can_start_game,
     assign_cards,
     generate_card,
+    normalize_settings,
+    next_state_after_timer,
+    phase_deadline,
     recommended_rounds,
     reveal_stat,
     selectable_reveal_stats,
     tally_votes,
 )
 from siri_bot.bunker.content import ContentPack
-from siri_bot.bunker.models import BunkerPlayer, BunkerSettings, GameMode, Vote, VotePolicy
+from siri_bot.bunker.models import BunkerPlayer, BunkerSettings, GameMode, GameState, RoomKind, Vote, VotePolicy
 
 
 def _player(user_id: int, *, host: bool = False, ready: bool = True, eliminated: bool = False, fake: bool = False) -> BunkerPlayer:
@@ -120,6 +123,24 @@ class BunkerEngineTests(unittest.TestCase):
 
         self.assertTrue(ok)
         self.assertIn("Пол", message)
+
+    def test_reveal_phase_is_not_timer_driven(self) -> None:
+        settings = BunkerSettings()
+
+        self.assertIsNone(phase_deadline(settings, GameState.REVEAL_PHASE, datetime.now(UTC)))
+        self.assertEqual(next_state_after_timer(GameState.REVEAL_PHASE), GameState.REVEAL_PHASE)
+
+    def test_old_casual_settings_normalize_to_ranked(self) -> None:
+        settings = BunkerSettings.from_json({"room_kind": "casual", "is_ranked": False})
+
+        self.assertEqual(settings.room_kind, RoomKind.RANKED)
+        self.assertTrue(settings.is_ranked)
+
+    def test_ranked_settings_restore_competitive_min_players(self) -> None:
+        settings = normalize_settings(BunkerSettings(room_kind=RoomKind.RANKED, min_players=1, is_ranked=False))
+
+        self.assertEqual(settings.min_players, 6)
+        self.assertTrue(settings.is_ranked)
 
     def test_vote_tally_handles_abstain_policy_and_ties(self) -> None:
         players = [_player(index) for index in range(1, 7)]

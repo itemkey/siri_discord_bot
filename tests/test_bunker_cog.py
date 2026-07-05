@@ -12,13 +12,16 @@ from siri_bot.cogs.bunker import (
     PUBLIC_SECTION_TOGGLE_ID,
     Bunker,
     BunkerPrivatePlayerPanelView,
+    BunkerPublicAbilityView,
     BunkerPublicGameView,
+    BunkerPublicRevealView,
     BunkerPublicSectionView,
     BunkerSettingsView,
     BunkerSetupIdleView,
     BunkerSetupNavView,
     format_player_name,
     _missing_setup_panel_permissions,
+    _players_table_embed,
     _setup_embed,
 )
 from siri_bot.bunker.models import BunkerPlayer, BunkerSettings, RoomKind, RoomSetup
@@ -196,11 +199,23 @@ class BunkerCogTests(unittest.TestCase):
     def test_settings_view_has_compact_navigation_controls(self) -> None:
         view = BunkerSettingsView(cog=object(), setup_id=1, user_id=2, settings=BunkerSettings())
         labels = [child.label for child in view.children if isinstance(child, discord.ui.Button)]
+        selects = [child for child in view.children if isinstance(child, discord.ui.Select)]
 
         self.assertIn("Как играть", labels)
         self.assertIn("Контент", labels)
-        self.assertIn("Тип комнаты", labels)
+        self.assertNotIn("Тип комнаты", labels)
+        room_kind_select = next(select for select in selects if select.placeholder == "Тип комнаты")
+        self.assertEqual([option.value for option in room_kind_select.options], [RoomKind.RANKED.value])
         self.assertNotIn("Админ-режим", labels)
+
+    def test_operator_settings_room_kind_select_has_only_ranked_and_admin_game(self) -> None:
+        view = BunkerSettingsView(cog=object(), setup_id=1, user_id=2, settings=BunkerSettings(), is_operator=True)
+        selects = [child for child in view.children if isinstance(child, discord.ui.Select)]
+
+        room_kind_select = next(select for select in selects if select.placeholder == "Тип комнаты")
+
+        self.assertEqual([option.value for option in room_kind_select.options], [RoomKind.RANKED.value, RoomKind.ADMIN_TEST.value])
+        self.assertNotIn("casual", [option.value for option in room_kind_select.options])
 
     def test_setup_lookup_repairs_deleted_setup_message_binding(self) -> None:
         setup = RoomSetup(
@@ -380,7 +395,9 @@ class BunkerCogTests(unittest.TestCase):
 
         self.assertIsInstance(view, BunkerSettingsView)
         labels = [child.label for child in view.children if isinstance(child, discord.ui.Button)]
-        self.assertIn("Тип комнаты", labels)
+        selects = [child for child in view.children if isinstance(child, discord.ui.Select)]
+        self.assertNotIn("Тип комнаты", labels)
+        self.assertTrue(any(select.placeholder == "Тип комнаты" for select in selects))
 
     def test_ranked_active_panel_hides_debug_operator_controls(self) -> None:
         game = BunkerGame(
@@ -422,13 +439,146 @@ class BunkerCogTests(unittest.TestCase):
         view = BunkerPrivatePlayerPanelView(object(), game, player, is_operator=True, can_close=True, players=[player])
         labels = [child.label for child in view.children if isinstance(child, discord.ui.Button)]
 
-        self.assertIn("Личная информация", labels)
-        self.assertIn("Раскрыть", labels)
+        self.assertNotIn("Личная информация", labels)
+        self.assertNotIn("Спец. возможности", labels)
+        self.assertNotIn("Раскрыть", labels)
         self.assertNotIn("Добавить тест-ботов", labels)
         self.assertNotIn("Очистить тест-ботов", labels)
         self.assertNotIn("Форс-старт", labels)
         self.assertNotIn("Следующая фаза", labels)
         self.assertNotIn("Правила", labels)
+
+    def test_public_reveal_view_has_nine_gray_stat_buttons_with_only_next_enabled(self) -> None:
+        game = BunkerGame(
+            id=55,
+            guild_id=100,
+            setup_id=10,
+            setup_channel_id=300,
+            setup_message_id=500,
+            category_id=None,
+            game_text_channel_id=700,
+            voice_channel_id=800,
+            host_id=201,
+            state=GameState.REVEAL_PHASE,
+            settings=BunkerSettings(),
+            round_number=1,
+            phase_started_at=None,
+            phase_ends_at=None,
+            paused_at=None,
+            board_message_id=None,
+            profile=None,
+            turn_order=(201,),
+        )
+        player = BunkerPlayer(
+            game_id=55,
+            user_id=201,
+            display_name="Player",
+            is_host=True,
+            ready_at=None,
+            invited_at=None,
+            joined_at=None,
+            left_at=None,
+            is_eliminated=False,
+            card=generate_card(),
+            revealed_stats=(),
+            used_special_action=False,
+            immune_round=None,
+        )
+
+        view = BunkerPublicRevealView(object(), game, player)
+        buttons = [child for child in view.children if isinstance(child, discord.ui.Button)]
+
+        self.assertEqual(len(buttons), 9)
+        self.assertTrue(all(button.style == discord.ButtonStyle.secondary for button in buttons))
+        self.assertFalse(buttons[0].disabled)
+        self.assertTrue(all(button.disabled for button in buttons[1:]))
+
+    def test_public_ability_view_has_two_gray_buttons(self) -> None:
+        game = BunkerGame(
+            id=55,
+            guild_id=100,
+            setup_id=10,
+            setup_channel_id=300,
+            setup_message_id=500,
+            category_id=None,
+            game_text_channel_id=700,
+            voice_channel_id=800,
+            host_id=201,
+            state=GameState.REVEAL_PHASE,
+            settings=BunkerSettings(),
+            round_number=1,
+            phase_started_at=None,
+            phase_ends_at=None,
+            paused_at=None,
+            board_message_id=None,
+            profile=None,
+        )
+        player = BunkerPlayer(
+            game_id=55,
+            user_id=201,
+            display_name="Player",
+            is_host=True,
+            ready_at=None,
+            invited_at=None,
+            joined_at=None,
+            left_at=None,
+            is_eliminated=False,
+            card=generate_card(),
+            revealed_stats=(),
+            used_special_action=False,
+            immune_round=None,
+        )
+
+        view = BunkerPublicAbilityView(object(), game, player)
+        buttons = [child for child in view.children if isinstance(child, discord.ui.Button)]
+
+        self.assertEqual(len(buttons), 2)
+        self.assertTrue(all(button.style == discord.ButtonStyle.secondary for button in buttons))
+
+    def test_players_table_is_readable_embed_fields_not_one_long_row(self) -> None:
+        game = BunkerGame(
+            id=55,
+            guild_id=100,
+            setup_id=10,
+            setup_channel_id=300,
+            setup_message_id=500,
+            category_id=None,
+            game_text_channel_id=700,
+            voice_channel_id=800,
+            host_id=201,
+            state=GameState.REVEAL_PHASE,
+            settings=BunkerSettings(),
+            round_number=1,
+            phase_started_at=None,
+            phase_ends_at=None,
+            paused_at=None,
+            board_message_id=None,
+            profile=None,
+        )
+        players = [
+            BunkerPlayer(
+                game_id=55,
+                user_id=200 + index,
+                display_name=f"Player {index}",
+                is_host=index == 1,
+                ready_at=None,
+                invited_at=None,
+                joined_at=None,
+                left_at=None,
+                is_eliminated=False,
+                card=generate_card(),
+                revealed_stats=("gender", "profession"),
+                used_special_action=False,
+                immune_round=None,
+            )
+            for index in range(1, 9)
+        ]
+
+        embed = _players_table_embed(game, players)
+
+        self.assertNotIn("```text", embed.description or "")
+        self.assertEqual(len(embed.fields), 8)
+        self.assertTrue(all("\n" in field.value for field in embed.fields))
 
     def test_admin_test_lobby_shows_test_controls_only_to_operator(self) -> None:
         game = BunkerGame(

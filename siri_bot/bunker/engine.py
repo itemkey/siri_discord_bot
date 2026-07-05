@@ -45,10 +45,10 @@ def recommended_rounds(slots: int, mode: GameMode = GameMode.CLASSIC) -> int:
 
 
 def normalize_settings(settings: BunkerSettings) -> BunkerSettings:
-    room_kind = settings.room_kind
+    room_kind = RoomKind.ADMIN_TEST if settings.room_kind == RoomKind.ADMIN_TEST else RoomKind.RANKED
     is_ranked = room_kind == RoomKind.RANKED
     slots = max(MIN_PLAYERS, min(MAX_PLAYERS, settings.slots))
-    min_players = max(1, min(slots, settings.min_players))
+    min_players = max(MIN_PLAYERS, min(slots, settings.min_players))
     if room_kind == RoomKind.ADMIN_TEST:
         min_players = 1
     bunker_seats = settings.bunker_seats
@@ -284,7 +284,6 @@ def should_enter_final(game: BunkerGame, players: list[BunkerPlayer]) -> bool:
 
 def next_state_after_timer(state: GameState) -> GameState:
     transitions = {
-        GameState.REVEAL_PHASE: GameState.SPEECH_PHASE,
         GameState.SPEECH_PHASE: GameState.DISCUSSION_PHASE,
         GameState.DISCUSSION_PHASE: GameState.CHAOS_PHASE,
         GameState.CHAOS_PHASE: GameState.VOTING_PHASE,
@@ -296,11 +295,10 @@ def next_state_after_timer(state: GameState) -> GameState:
 
 def phase_deadline(settings: BunkerSettings, state: GameState, now: datetime | None = None) -> datetime | None:
     now = now or datetime.now(UTC)
-    if state in {GameState.LOBBY, GameState.PREPARING, GameState.FINAL_PHASE, GameState.FINISHED}:
+    if state in {GameState.LOBBY, GameState.PREPARING, GameState.REVEAL_PHASE, GameState.FINAL_PHASE, GameState.FINISHED}:
         return None
 
     seconds_by_state = {
-        GameState.REVEAL_PHASE: settings.timer_seconds,
         GameState.SPEECH_PHASE: settings.speech_seconds,
         GameState.DISCUSSION_PHASE: settings.discussion_seconds,
         GameState.CHAOS_PHASE: max(30, settings.timer_seconds // 2),

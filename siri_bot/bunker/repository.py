@@ -204,10 +204,17 @@ class BunkerRepository:
                 UPDATE bunker_games
                 SET room_kind = CASE
                     WHEN is_admin_game THEN 'admin_test'
-                    WHEN COALESCE((settings->>'is_ranked')::boolean, FALSE) THEN 'ranked'
-                    ELSE 'casual'
+                    ELSE 'ranked'
                 END
                 WHERE NOT (settings ? 'room_kind');
+
+                UPDATE bunker_games
+                SET room_kind = 'ranked'
+                WHERE room_kind = 'casual' AND NOT is_admin_game;
+
+                UPDATE bunker_games
+                SET phase_ends_at = NULL
+                WHERE state = 'reveal_phase' AND room_status = 'active';
 
                 ALTER TABLE bunker_players ADD COLUMN IF NOT EXISTS ready_at TIMESTAMPTZ;
                 ALTER TABLE bunker_players ADD COLUMN IF NOT EXISTS invited_at TIMESTAMPTZ;
@@ -1129,6 +1136,7 @@ class BunkerRepository:
               AND paused_at IS NULL
               AND phase_ends_at IS NOT NULL
               AND phase_ends_at <= $1
+              AND state <> 'reveal_phase'
             ORDER BY phase_ends_at ASC
             """,
             now,
@@ -1232,7 +1240,8 @@ def _guild_settings_from_row(row: asyncpg.Record) -> BunkerGuildSettings:
 
 def _game_from_row(row: asyncpg.Record) -> BunkerGame:
     settings = BunkerSettings.from_json(_json_load(row["settings"]))
-    row_room_kind = RoomKind(str(row["room_kind"] or settings.room_kind.value))
+    raw_room_kind = str(row["room_kind"] or settings.room_kind.value)
+    row_room_kind = RoomKind.ADMIN_TEST if raw_room_kind == RoomKind.ADMIN_TEST.value else RoomKind.RANKED
     if settings.room_kind != row_room_kind or settings.is_ranked != (row_room_kind == RoomKind.RANKED):
         settings = replace(
             settings,

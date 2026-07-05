@@ -42,7 +42,6 @@ class VotePolicy(StrEnum):
 
 class RoomKind(StrEnum):
     RANKED = "ranked"
-    CASUAL = "casual"
     ADMIN_TEST = "admin_test"
 
 
@@ -115,11 +114,11 @@ class BunkerSettings:
         if not raw:
             return cls()
 
-        raw_room_kind = raw.get("room_kind")
-        if raw_room_kind is None:
-            room_kind = RoomKind.RANKED if bool(raw.get("is_ranked", True)) else RoomKind.CASUAL
+        raw_room_kind = str(raw.get("room_kind") or "").strip()
+        if raw_room_kind == RoomKind.ADMIN_TEST.value:
+            room_kind = RoomKind.ADMIN_TEST
         else:
-            room_kind = RoomKind(str(raw_room_kind))
+            room_kind = RoomKind.RANKED
 
         return cls(
             mode=GameMode(str(raw.get("mode", GameMode.CLASSIC.value))),
