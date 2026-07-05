@@ -265,6 +265,9 @@ class BunkerCogTests(unittest.TestCase):
         self.assertEqual([option.value for option in room_kind_select.options], [RoomKind.RANKED.value])
         self.assertNotIn("Админ-режим", labels)
 
+        reveal_select = next(select for select in selects if str(select.placeholder).startswith("Характеристик за ход"))
+        self.assertEqual([option.value for option in reveal_select.options], ["1", "2", "3"])
+
     def test_operator_settings_room_kind_select_has_only_ranked_and_admin_game(self) -> None:
         view = BunkerSettingsView(cog=object(), setup_id=1, user_id=2, settings=BunkerSettings(), is_operator=True)
         selects = [child for child in view.children if isinstance(child, discord.ui.Select)]
@@ -544,14 +547,13 @@ class BunkerCogTests(unittest.TestCase):
 
         view = BunkerPublicRevealView(object(), game, player)
         buttons = [child for child in view.children if isinstance(child, discord.ui.Button)]
-        stat_buttons = [button for button in buttons if button.label != "Моя карточка"]
-        my_card = next(button for button in buttons if button.label == "Моя карточка")
+        stat_buttons = [button for button in buttons if button.style == discord.ButtonStyle.secondary]
+        my_card_buttons = [button for button in buttons if button.style == discord.ButtonStyle.primary]
 
-        self.assertEqual([button.label for button in stat_buttons], ["Здоровье", "Возраст"])
-        self.assertTrue(all(button.style == discord.ButtonStyle.secondary for button in stat_buttons))
-        self.assertTrue(stat_buttons[0].disabled)
-        self.assertFalse(stat_buttons[1].disabled)
-        self.assertEqual(my_card.style, discord.ButtonStyle.primary)
+        self.assertEqual(len(stat_buttons), 10)
+        self.assertEqual(len(my_card_buttons), 1)
+        self.assertTrue(any(button.disabled for button in stat_buttons))
+        self.assertTrue(any(not button.disabled for button in stat_buttons))
 
     def test_public_personal_embed_lists_round_stats_together(self) -> None:
         game = BunkerGame(
@@ -591,9 +593,57 @@ class BunkerCogTests(unittest.TestCase):
         )
 
         embed = _public_personal_embed(game, [player])
+        self.assertIn("Можно открыть", embed.description)
+        self.assertIn("Выбери любую скрытую характеристику", embed.description)
+        self.assertNotIn("В этом раунде открываются", embed.description)
 
-        self.assertIn("Здоровье, Возраст", embed.description)
-        self.assertNotIn("Следующая характеристика", embed.description)
+    def test_public_reveal_view_disables_stats_after_turn_limit(self) -> None:
+        game = BunkerGame(
+            id=55,
+            guild_id=100,
+            setup_id=10,
+            setup_channel_id=300,
+            setup_message_id=500,
+            category_id=None,
+            game_text_channel_id=700,
+            voice_channel_id=800,
+            host_id=201,
+            state=GameState.REVEAL_PHASE,
+            settings=BunkerSettings(reveal_stats_per_turn=1),
+            round_number=1,
+            phase_started_at=None,
+            phase_ends_at=None,
+            paused_at=None,
+            board_message_id=None,
+            profile=None,
+            turn_order=(201,),
+            reveals_done_this_turn=1,
+        )
+        player = BunkerPlayer(
+            game_id=55,
+            user_id=201,
+            display_name="Player",
+            is_host=True,
+            ready_at=None,
+            invited_at=None,
+            joined_at=None,
+            left_at=None,
+            is_eliminated=False,
+            card=generate_card(),
+            revealed_stats=("profession",),
+            used_special_action=False,
+            immune_round=None,
+        )
+
+        view = BunkerPublicRevealView(object(), game, player)
+        stat_buttons = [
+            child
+            for child in view.children
+            if isinstance(child, discord.ui.Button) and child.style == discord.ButtonStyle.secondary
+        ]
+
+        self.assertEqual(len(stat_buttons), 10)
+        self.assertTrue(all(button.disabled for button in stat_buttons))
 
     def test_public_personal_embed_shows_admin_test_fake_card_values(self) -> None:
         card = generate_card()
@@ -642,6 +692,8 @@ class BunkerCogTests(unittest.TestCase):
         self.assertIn(card.profession, values)
         self.assertIn(card.health, values)
         self.assertIn("Админ-игра", embed.description)
+        self.assertNotIn("видно", values)
+        self.assertIn("скрыто", values)
 
     def test_public_personal_embed_keeps_ranked_hidden_values_private(self) -> None:
         card = generate_card()

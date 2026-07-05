@@ -108,6 +108,7 @@ class BunkerSettings:
     discussion_seconds: int = 180
     voting_seconds: int = 60
     revote_seconds: int = 45
+    reveal_stats_per_turn: int = 1
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -127,6 +128,7 @@ class BunkerSettings:
             "discussion_seconds": self.discussion_seconds,
             "voting_seconds": self.voting_seconds,
             "revote_seconds": self.revote_seconds,
+            "reveal_stats_per_turn": self.reveal_stats_per_turn,
         }
 
     @classmethod
@@ -157,6 +159,7 @@ class BunkerSettings:
             discussion_seconds=int(raw.get("discussion_seconds", raw.get("timer_seconds", 180))),
             voting_seconds=int(raw.get("voting_seconds", 60)),
             revote_seconds=int(raw.get("revote_seconds", 45)),
+            reveal_stats_per_turn=int(raw.get("reveal_stats_per_turn", 1)),
         )
 
 

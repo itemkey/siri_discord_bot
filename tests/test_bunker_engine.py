@@ -12,12 +12,12 @@ from siri_bot.bunker.engine import (
     next_state_after_timer,
     phase_deadline,
     recommended_rounds,
-    required_stats_for_round,
-    revealable_stats_for_round,
     reveal_stat,
+    reveal_turn_limit,
+    reveal_turn_remaining,
     selectable_reveal_stats,
     tally_votes,
-    player_completed_round_reveal,
+    player_completed_reveal_turn,
 )
 from siri_bot.bunker.content import ContentPack
 from siri_bot.bunker.models import BunkerPlayer, BunkerSettings, CharacterCard, GameMode, GameState, RoomKind, Vote, VotePolicy
@@ -114,32 +114,40 @@ class BunkerEngineTests(unittest.TestCase):
         self.assertNotIn("extra_fact", stats)
         self.assertIn("baggage", stats)
 
-    def test_reveal_uses_round_required_stats(self) -> None:
+    def test_reveal_allows_any_hidden_stat_in_any_round(self) -> None:
         player = _player(1)
-
-        self.assertEqual(required_stats_for_round(1), ("profession",))
-        self.assertEqual(required_stats_for_round(2), ("health", "age"))
 
         ok, message = reveal_stat(player, "age", round_number=1)
 
-        self.assertFalse(ok)
-        self.assertIn("Профессия", message)
-
-        ok, message = reveal_stat(player, "profession", round_number=1)
-
         self.assertTrue(ok)
-        self.assertIn("Профессия", message)
+        self.assertIn("Возраст", message)
 
-    def test_round_reveal_completion_requires_all_round_stats(self) -> None:
+        player = BunkerPlayer(**{**player.__dict__, "revealed_stats": ("age",)})
+        ok, message = reveal_stat(player, "age", round_number=1)
+
+        self.assertFalse(ok)
+        self.assertIn("уже", message)
+
+    def test_reveal_turn_limit_counts_amount_not_specific_stats(self) -> None:
         player = _player(1)
-        player = BunkerPlayer(**{**player.__dict__, "revealed_stats": ("health",)})
+        settings = BunkerSettings(reveal_stats_per_turn=2)
 
-        self.assertEqual(revealable_stats_for_round(player, 2), ["age"])
-        self.assertFalse(player_completed_round_reveal(player, 2))
+        self.assertEqual(reveal_turn_limit(settings), 2)
+        self.assertEqual(reveal_turn_remaining(player, settings, 0), 2)
+        self.assertFalse(player_completed_reveal_turn(player, settings, 1))
+        self.assertTrue(player_completed_reveal_turn(player, settings, 2))
 
-        player = BunkerPlayer(**{**player.__dict__, "revealed_stats": ("health", "age")})
+    def test_reveal_turn_completes_when_no_hidden_stats_left(self) -> None:
+        player = _player(1)
+        player = BunkerPlayer(**{**player.__dict__, "revealed_stats": tuple(selectable_reveal_stats(player))})
+        settings = BunkerSettings(reveal_stats_per_turn=3)
 
-        self.assertTrue(player_completed_round_reveal(player, 2))
+        self.assertEqual(reveal_turn_remaining(player, settings, 0), 0)
+        self.assertTrue(player_completed_reveal_turn(player, settings, 0))
+
+    def test_reveal_stats_per_turn_is_normalized(self) -> None:
+        self.assertEqual(normalize_settings(BunkerSettings(reveal_stats_per_turn=0)).reveal_stats_per_turn, 1)
+        self.assertEqual(normalize_settings(BunkerSettings(reveal_stats_per_turn=9)).reveal_stats_per_turn, 3)
 
     def test_old_card_json_is_read_as_new_schema(self) -> None:
         card = CharacterCard.from_json(

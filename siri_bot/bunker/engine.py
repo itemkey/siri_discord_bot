@@ -78,6 +78,7 @@ def normalize_settings(settings: BunkerSettings) -> BunkerSettings:
     timer = max(30, min(900, settings.timer_seconds))
     if settings.mode == GameMode.TURBO:
         timer = max(30, timer // 2)
+    reveal_stats_per_turn = max(1, min(3, int(settings.reveal_stats_per_turn)))
 
     return replace(
         settings,
@@ -93,6 +94,7 @@ def normalize_settings(settings: BunkerSettings) -> BunkerSettings:
         discussion_seconds=max(30, min(900, settings.discussion_seconds)),
         voting_seconds=max(15, min(300, settings.voting_seconds)),
         revote_seconds=max(15, min(180, settings.revote_seconds)),
+        reveal_stats_per_turn=reveal_stats_per_turn,
     )
 
 
@@ -223,20 +225,33 @@ def required_stats_for_round(round_number: int) -> tuple[str, ...]:
 
 
 def revealable_stats_for_round(player: BunkerPlayer, round_number: int) -> list[str]:
-    revealed = set(player.revealed_stats)
-    return [stat for stat in required_stats_for_round(round_number) if stat not in revealed]
+    return selectable_reveal_stats(player)
 
 
 def player_completed_round_reveal(player: BunkerPlayer, round_number: int) -> bool:
-    required = required_stats_for_round(round_number)
-    if not required:
-        return True
-    revealed = set(player.revealed_stats)
-    return all(stat in revealed for stat in required)
+    return not selectable_reveal_stats(player)
+
+
+def reveal_turn_limit(settings: BunkerSettings) -> int:
+    return max(1, min(3, int(settings.reveal_stats_per_turn)))
+
+
+def reveal_turn_remaining(player: BunkerPlayer, settings: BunkerSettings, reveals_done_this_turn: int) -> int:
+    if not selectable_reveal_stats(player):
+        return 0
+    return max(0, reveal_turn_limit(settings) - max(0, int(reveals_done_this_turn)))
+
+
+def player_completed_reveal_turn(
+    player: BunkerPlayer,
+    settings: BunkerSettings,
+    reveals_done_this_turn: int,
+) -> bool:
+    return reveal_turn_remaining(player, settings, reveals_done_this_turn) <= 0
 
 
 def next_reveal_stat(player: BunkerPlayer, round_number: int | None = None) -> str | None:
-    stats = revealable_stats_for_round(player, round_number) if round_number is not None else selectable_reveal_stats(player)
+    stats = selectable_reveal_stats(player)
     return stats[0] if stats else None
 
 
@@ -250,16 +265,6 @@ def reveal_stat(player: BunkerPlayer, stat: str, *, round_number: int | None = N
 
     if player.card is None:
         return False, "Карточка еще не выдана."
-
-    if round_number is not None:
-        required = required_stats_for_round(round_number)
-        if stat not in required:
-            labels = ", ".join(CARD_STAT_LABELS[item] for item in required) or "нет обязательных характеристик"
-            return False, f"В этом раунде открываются: {labels}."
-    else:
-        expected = next_reveal_stat(player)
-        if expected is not None and stat != expected:
-            return False, f"Сначала нужно раскрыть: {CARD_STAT_LABELS[expected]}."
 
     return True, f"{player.display_name} раскрывает: {CARD_STAT_LABELS[stat]} - {getattr(player.card, stat)}"
 
