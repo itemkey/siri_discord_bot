@@ -40,6 +40,12 @@ class VotePolicy(StrEnum):
     RANDOM = "random"
 
 
+class RoomKind(StrEnum):
+    RANKED = "ranked"
+    CASUAL = "casual"
+    ADMIN_TEST = "admin_test"
+
+
 CARD_STAT_LABELS: dict[str, str] = {
     "gender": "Пол",
     "body": "Телосложение",
@@ -75,7 +81,8 @@ class BunkerSettings:
     explain_for_newbies: bool = True
     missing_vote_policy: VotePolicy = VotePolicy.ABSTAIN
     content_pack_id: int | None = None
-    is_ranked: bool = False
+    is_ranked: bool = True
+    room_kind: RoomKind = RoomKind.RANKED
     min_players: int = 6
     bunker_seats: int | None = None
     speech_seconds: int = 60
@@ -94,6 +101,7 @@ class BunkerSettings:
             "missing_vote_policy": self.missing_vote_policy.value,
             "content_pack_id": self.content_pack_id,
             "is_ranked": self.is_ranked,
+            "room_kind": self.room_kind.value,
             "min_players": self.min_players,
             "bunker_seats": self.bunker_seats,
             "speech_seconds": self.speech_seconds,
@@ -107,6 +115,12 @@ class BunkerSettings:
         if not raw:
             return cls()
 
+        raw_room_kind = raw.get("room_kind")
+        if raw_room_kind is None:
+            room_kind = RoomKind.RANKED if bool(raw.get("is_ranked", True)) else RoomKind.CASUAL
+        else:
+            room_kind = RoomKind(str(raw_room_kind))
+
         return cls(
             mode=GameMode(str(raw.get("mode", GameMode.CLASSIC.value))),
             slots=int(raw.get("slots", 8)),
@@ -116,7 +130,8 @@ class BunkerSettings:
             explain_for_newbies=bool(raw.get("explain_for_newbies", True)),
             missing_vote_policy=VotePolicy(str(raw.get("missing_vote_policy", VotePolicy.ABSTAIN.value))),
             content_pack_id=int(raw["content_pack_id"]) if raw.get("content_pack_id") is not None else None,
-            is_ranked=bool(raw.get("is_ranked", False)),
+            is_ranked=room_kind == RoomKind.RANKED,
+            room_kind=room_kind,
             min_players=int(raw.get("min_players", 6)),
             bunker_seats=int(raw["bunker_seats"]) if raw.get("bunker_seats") is not None else None,
             speech_seconds=int(raw.get("speech_seconds", 60)),
@@ -381,6 +396,7 @@ class BunkerGame:
     room_index: int = 0
     room_status: RoomStatus = RoomStatus.LOBBY
     is_admin_game: bool = False
+    room_kind: RoomKind = RoomKind.RANKED
     public_message_ids: dict[str, int] = field(default_factory=dict)
     turn_order: tuple[int, ...] = field(default_factory=tuple)
     current_turn_index: int = 0

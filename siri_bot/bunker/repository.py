@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -16,6 +17,7 @@ from siri_bot.bunker.models import (
     BunkerSettings,
     CharacterCard,
     GameState,
+    RoomKind,
     RoomStatus,
     RoomSetup,
     Vote,
@@ -96,6 +98,7 @@ class BunkerRepository:
                     bunker_profile JSONB,
                     recent_events JSONB NOT NULL DEFAULT '[]',
                     is_admin_game BOOLEAN NOT NULL DEFAULT FALSE,
+                    room_kind TEXT NOT NULL DEFAULT 'ranked',
                     room_index INTEGER NOT NULL DEFAULT 0,
                     room_status TEXT NOT NULL DEFAULT 'lobby',
                     public_message_ids JSONB NOT NULL DEFAULT '{}',
@@ -187,6 +190,7 @@ class BunkerRepository:
                 ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS bunker_profile JSONB;
                 ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS recent_events JSONB NOT NULL DEFAULT '[]';
                 ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS is_admin_game BOOLEAN NOT NULL DEFAULT FALSE;
+                ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS room_kind TEXT NOT NULL DEFAULT 'ranked';
                 ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS room_index INTEGER NOT NULL DEFAULT 0;
                 ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS room_status TEXT NOT NULL DEFAULT 'lobby';
                 ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS public_message_ids JSONB NOT NULL DEFAULT '{}';
@@ -196,6 +200,14 @@ class BunkerRepository:
                 ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS speech_index INTEGER NOT NULL DEFAULT 0;
                 ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS collapsed_sections JSONB NOT NULL DEFAULT '{}';
                 ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS finished_at TIMESTAMPTZ;
+
+                UPDATE bunker_games
+                SET room_kind = CASE
+                    WHEN is_admin_game THEN 'admin_test'
+                    WHEN COALESCE((settings->>'is_ranked')::boolean, FALSE) THEN 'ranked'
+                    ELSE 'casual'
+                END
+                WHERE NOT (settings ? 'room_kind');
 
                 ALTER TABLE bunker_players ADD COLUMN IF NOT EXISTS ready_at TIMESTAMPTZ;
                 ALTER TABLE bunker_players ADD COLUMN IF NOT EXISTS invited_at TIMESTAMPTZ;
@@ -512,10 +524,10 @@ class BunkerRepository:
                     INSERT INTO bunker_games (
                         guild_id, setup_id, setup_channel_id, setup_message_id, category_id,
                         game_text_channel_id, voice_channel_id, host_id, state, mode, is_public,
-                        slots, max_rounds, timer_seconds, settings, is_admin_game, room_index,
+                        slots, max_rounds, timer_seconds, settings, is_admin_game, room_kind, room_index,
                         room_status
                     )
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'lobby', $9, $10, $11, $12, $13, $14::jsonb, $15, $16, 'lobby')
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'lobby', $9, $10, $11, $12, $13, $14::jsonb, $15, $16, $17, 'lobby')
                     RETURNING *
                     """,
                     setup.guild_id,
@@ -533,6 +545,7 @@ class BunkerRepository:
                     settings.timer_seconds,
                     json.dumps(settings.to_json(), ensure_ascii=False),
                     is_admin_game,
+                    settings.room_kind.value,
                     room_index,
                 )
                 await connection.execute(
@@ -662,6 +675,52 @@ class BunkerRepository:
 
     async def get_game(self, game_id: int) -> BunkerGame | None:
         row = await self.pool.fetchrow("SELECT * FROM bunker_games WHERE id = $1", game_id)
+        return _game_from_row(row) if row else None
+
+    async def get_game_by_public_message(self, message_id: int) -> tuple[BunkerGame, str] | None:
+        row = await self.pool.fetchrow(
+            """
+            SELECT g.*, public_messages.key AS public_message_key
+            FROM bunker_games AS g
+            JOIN LATERAL jsonb_each_text(g.public_message_ids) AS public_messages(key, value) ON TRUE
+            WHERE public_messages.value::bigint = $1
+              AND g.room_status IN ('lobby', 'active')
+              AND g.finished_at IS NULL
+            ORDER BY g.id DESC
+            LIMIT 1
+            """,
+            message_id,
+        )
+        if row is None:
+            return None
+        return _game_from_row(row), str(row["public_message_key"])
+
+    async def update_game_settings(self, game_id: int, settings: BunkerSettings, *, is_admin_game: bool) -> BunkerGame | None:
+        row = await self.pool.fetchrow(
+            """
+            UPDATE bunker_games
+            SET mode = $2,
+                is_public = $3,
+                slots = $4,
+                max_rounds = $5,
+                timer_seconds = $6,
+                settings = $7::jsonb,
+                is_admin_game = $8,
+                room_kind = $9,
+                updated_at = NOW()
+            WHERE id = $1 AND state = 'lobby' AND room_status = 'lobby' AND finished_at IS NULL
+            RETURNING *
+            """,
+            game_id,
+            settings.mode.value,
+            settings.is_public,
+            settings.slots,
+            settings.rounds,
+            settings.timer_seconds,
+            json.dumps(settings.to_json(), ensure_ascii=False),
+            is_admin_game,
+            settings.room_kind.value,
+        )
         return _game_from_row(row) if row else None
 
     async def set_board_message(self, game_id: int, message_id: int | None) -> None:
@@ -1173,6 +1232,14 @@ def _guild_settings_from_row(row: asyncpg.Record) -> BunkerGuildSettings:
 
 def _game_from_row(row: asyncpg.Record) -> BunkerGame:
     settings = BunkerSettings.from_json(_json_load(row["settings"]))
+    row_room_kind = RoomKind(str(row["room_kind"] or settings.room_kind.value))
+    if settings.room_kind != row_room_kind or settings.is_ranked != (row_room_kind == RoomKind.RANKED):
+        settings = replace(
+            settings,
+            room_kind=row_room_kind,
+            is_ranked=row_room_kind == RoomKind.RANKED,
+            is_public=False if row_room_kind == RoomKind.ADMIN_TEST else settings.is_public,
+        )
     return BunkerGame(
         id=int(row["id"]),
         guild_id=int(row["guild_id"]),
@@ -1194,6 +1261,7 @@ def _game_from_row(row: asyncpg.Record) -> BunkerGame:
         room_index=int(row["room_index"]),
         room_status=RoomStatus(str(row["room_status"] or RoomStatus.LOBBY.value)),
         is_admin_game=bool(row["is_admin_game"]),
+        room_kind=row_room_kind,
         public_message_ids={str(key): int(value) for key, value in _json_load(row["public_message_ids"], {}).items()},
         turn_order=tuple(int(user_id) for user_id in _json_load(row["turn_order"], [])),
         current_turn_index=int(row["current_turn_index"]),

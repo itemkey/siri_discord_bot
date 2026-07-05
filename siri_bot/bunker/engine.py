@@ -19,6 +19,7 @@ from siri_bot.bunker.models import (
     GameMode,
     GameState,
     REVEALABLE_STATS,
+    RoomKind,
     SpecialAbility,
     Vote,
     VotePolicy,
@@ -44,8 +45,12 @@ def recommended_rounds(slots: int, mode: GameMode = GameMode.CLASSIC) -> int:
 
 
 def normalize_settings(settings: BunkerSettings) -> BunkerSettings:
+    room_kind = settings.room_kind
+    is_ranked = room_kind == RoomKind.RANKED
     slots = max(MIN_PLAYERS, min(MAX_PLAYERS, settings.slots))
     min_players = max(1, min(slots, settings.min_players))
+    if room_kind == RoomKind.ADMIN_TEST:
+        min_players = 1
     bunker_seats = settings.bunker_seats
     if bunker_seats is not None:
         bunker_seats = max(1, min(slots - 1, bunker_seats))
@@ -61,6 +66,9 @@ def normalize_settings(settings: BunkerSettings) -> BunkerSettings:
         timer_seconds=timer,
         min_players=min_players,
         bunker_seats=bunker_seats,
+        is_ranked=is_ranked,
+        is_public=False if room_kind == RoomKind.ADMIN_TEST else settings.is_public,
+        room_kind=room_kind,
         speech_seconds=max(15, min(300, settings.speech_seconds)),
         discussion_seconds=max(30, min(900, settings.discussion_seconds)),
         voting_seconds=max(15, min(300, settings.voting_seconds)),

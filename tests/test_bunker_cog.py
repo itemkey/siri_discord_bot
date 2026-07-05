@@ -8,9 +8,12 @@ import discord
 
 from siri_bot.cogs.bunker import (
     GAME_PANEL_ID,
+    PUBLIC_SECTION_REFRESH_ID,
+    PUBLIC_SECTION_TOGGLE_ID,
     Bunker,
     BunkerPrivatePlayerPanelView,
     BunkerPublicGameView,
+    BunkerPublicSectionView,
     BunkerSettingsView,
     BunkerSetupIdleView,
     BunkerSetupNavView,
@@ -18,7 +21,7 @@ from siri_bot.cogs.bunker import (
     _missing_setup_panel_permissions,
     _setup_embed,
 )
-from siri_bot.bunker.models import BunkerPlayer, BunkerSettings, RoomSetup
+from siri_bot.bunker.models import BunkerPlayer, BunkerSettings, RoomKind, RoomSetup
 from siri_bot.bunker.models import BunkerGame, GameState
 from siri_bot.bunker.engine import generate_card
 
@@ -69,6 +72,7 @@ class FakeInteraction:
         self.message = message or FakeMessage(500)
         self.original_message = original_message or FakeMessage(900)
         self.original_response = AsyncMock(return_value=self.original_message)
+        self.edit_original_response = AsyncMock()
         self.followup = FakeFollowup(followup_message)
 
 
@@ -118,6 +122,14 @@ class BunkerCogTests(unittest.TestCase):
         self.assertEqual(len(buttons), 1)
         self.assertEqual(buttons[0].label, "Панель")
         self.assertEqual(buttons[0].custom_id, GAME_PANEL_ID)
+
+    def test_public_section_view_uses_persistent_custom_ids(self) -> None:
+        view = BunkerPublicSectionView(cog=object(), game_id=55, key="players", collapsed=False)
+        buttons = [child for child in view.children if isinstance(child, discord.ui.Button)]
+
+        self.assertEqual([button.custom_id for button in buttons], [PUBLIC_SECTION_TOGGLE_ID, PUBLIC_SECTION_REFRESH_ID])
+        self.assertNotIn("55", buttons[0].custom_id)
+        self.assertNotIn("players", buttons[0].custom_id)
 
     def test_setup_embed_is_factory_not_busy_state(self) -> None:
         embed = _setup_embed("build-a-bunker")
@@ -187,6 +199,8 @@ class BunkerCogTests(unittest.TestCase):
 
         self.assertIn("Как играть", labels)
         self.assertIn("Контент", labels)
+        self.assertIn("Тип комнаты", labels)
+        self.assertNotIn("Админ-режим", labels)
 
     def test_setup_lookup_repairs_deleted_setup_message_binding(self) -> None:
         setup = RoomSetup(
@@ -322,6 +336,52 @@ class BunkerCogTests(unittest.TestCase):
         self.assertNotIn("Раскрыть стату", labels)
         self.assertNotIn("Голосовать", labels)
 
+    def test_lobby_settings_panel_returns_editable_view(self) -> None:
+        game = BunkerGame(
+            id=55,
+            guild_id=100,
+            setup_id=10,
+            setup_channel_id=300,
+            setup_message_id=500,
+            category_id=None,
+            game_text_channel_id=700,
+            voice_channel_id=800,
+            host_id=200,
+            state=GameState.LOBBY,
+            settings=BunkerSettings(),
+            round_number=0,
+            phase_started_at=None,
+            phase_ends_at=None,
+            paused_at=None,
+            board_message_id=None,
+            profile=None,
+        )
+        host = BunkerPlayer(
+            game_id=55,
+            user_id=200,
+            display_name="Host",
+            is_host=True,
+            ready_at=None,
+            invited_at=None,
+            joined_at=None,
+            left_at=None,
+            is_eliminated=False,
+            card=None,
+            revealed_stats=(),
+            used_special_action=False,
+            immune_round=None,
+        )
+        cog = Bunker.__new__(Bunker)
+        cog.repository = type("Repo", (), {"list_players": AsyncMock(return_value=[host])})()
+        cog._is_bunker_operator = AsyncMock(return_value=False)
+        interaction = FakeInteraction()
+
+        _, view = asyncio.run(cog._game_panel_payload(interaction, game, screen="settings"))
+
+        self.assertIsInstance(view, BunkerSettingsView)
+        labels = [child.label for child in view.children if isinstance(child, discord.ui.Button)]
+        self.assertIn("Тип комнаты", labels)
+
     def test_ranked_active_panel_hides_debug_operator_controls(self) -> None:
         game = BunkerGame(
             id=55,
@@ -369,6 +429,54 @@ class BunkerCogTests(unittest.TestCase):
         self.assertNotIn("Форс-старт", labels)
         self.assertNotIn("Следующая фаза", labels)
         self.assertNotIn("Правила", labels)
+
+    def test_admin_test_lobby_shows_test_controls_only_to_operator(self) -> None:
+        game = BunkerGame(
+            id=55,
+            guild_id=100,
+            setup_id=10,
+            setup_channel_id=300,
+            setup_message_id=500,
+            category_id=None,
+            game_text_channel_id=700,
+            voice_channel_id=800,
+            host_id=201,
+            state=GameState.LOBBY,
+            settings=BunkerSettings(room_kind=RoomKind.ADMIN_TEST, is_ranked=False, is_public=False, min_players=1),
+            round_number=0,
+            phase_started_at=None,
+            phase_ends_at=None,
+            paused_at=None,
+            board_message_id=None,
+            profile=None,
+            is_admin_game=True,
+            room_kind=RoomKind.ADMIN_TEST,
+        )
+        host = BunkerPlayer(
+            game_id=55,
+            user_id=201,
+            display_name="Host",
+            is_host=True,
+            ready_at=None,
+            invited_at=None,
+            joined_at=None,
+            left_at=None,
+            is_eliminated=False,
+            card=None,
+            revealed_stats=(),
+            used_special_action=False,
+            immune_round=None,
+        )
+
+        operator_view = BunkerPrivatePlayerPanelView(object(), game, host, is_operator=True, can_close=True, players=[host])
+        regular_view = BunkerPrivatePlayerPanelView(object(), game, host, is_operator=False, can_close=True, players=[host])
+        operator_labels = [child.label for child in operator_view.children if isinstance(child, discord.ui.Button)]
+        regular_labels = [child.label for child in regular_view.children if isinstance(child, discord.ui.Button)]
+
+        self.assertIn("Добавить тест-ботов", operator_labels)
+        self.assertIn("Форс-старт", operator_labels)
+        self.assertNotIn("Добавить тест-ботов", regular_labels)
+        self.assertNotIn("Форс-старт", regular_labels)
 
     def test_fake_player_name_has_no_discord_mention(self) -> None:
         player = BunkerPlayer(
