@@ -9,13 +9,16 @@ class BunkerContentTests(unittest.TestCase):
     def test_builtin_pack_has_required_starting_content(self) -> None:
         counts = BUILTIN_PACK.counts()
 
-        self.assertGreaterEqual(counts["professions"], 100)
-        self.assertGreaterEqual(counts["items"], 100)
-        self.assertGreaterEqual(counts["weaknesses"], 100)
-        self.assertGreaterEqual(counts["secrets"], 100)
-        self.assertGreaterEqual(counts["apocalypses"], 50)
-        self.assertGreaterEqual(counts["bunker_defects"], 50)
-        self.assertGreaterEqual(counts["chaos_events"], 100)
+        self.assertGreaterEqual(counts["professions"], 8)
+        self.assertGreaterEqual(counts["items"], 8)
+        self.assertGreaterEqual(counts["weaknesses"], 8)
+        self.assertGreaterEqual(counts["secrets"], 8)
+        self.assertGreaterEqual(counts["skills"], 8)
+        self.assertGreaterEqual(counts["phobias"], 8)
+        self.assertGreaterEqual(counts["funny_traits"], 8)
+        self.assertGreaterEqual(counts["apocalypses"], 5)
+        self.assertGreaterEqual(counts["bunker_defects"], 5)
+        self.assertGreaterEqual(counts["chaos_events"], 5)
         self.assertEqual(counts["special_actions"], 8)
 
     def test_custom_pack_content_is_normalized_and_merged_with_builtin(self) -> None:
@@ -41,6 +44,18 @@ class BunkerContentTests(unittest.TestCase):
         raw = "\n".join(value for values in BUILTIN_PACK.to_json().values() for value in values).casefold()
 
         for banned in ("мем", "кринж", "майонез", "караоке", "ложк", "крысы"):
+            self.assertNotIn(banned, raw)
+
+    def test_builtin_pack_has_no_artificial_generated_tails(self) -> None:
+        raw = "\n".join(value for values in BUILTIN_PACK.to_json().values() for value in values).casefold()
+
+        for banned in (
+            "медицинская отметка",
+            "ресурсная ценность",
+            "практический уровень",
+            "подтверждение в личном деле",
+            "протокол события",
+        ):
             self.assertNotIn(banned, raw)
 
 

@@ -12,12 +12,15 @@ from siri_bot.bunker.engine import (
     next_state_after_timer,
     phase_deadline,
     recommended_rounds,
+    required_stats_for_round,
+    revealable_stats_for_round,
     reveal_stat,
     selectable_reveal_stats,
     tally_votes,
+    player_completed_round_reveal,
 )
 from siri_bot.bunker.content import ContentPack
-from siri_bot.bunker.models import BunkerPlayer, BunkerSettings, GameMode, GameState, RoomKind, Vote, VotePolicy
+from siri_bot.bunker.models import BunkerPlayer, BunkerSettings, CharacterCard, GameMode, GameState, RoomKind, Vote, VotePolicy
 
 
 def _player(user_id: int, *, host: bool = False, ready: bool = True, eliminated: bool = False, fake: bool = False) -> BunkerPlayer:
@@ -101,28 +104,64 @@ class BunkerEngineTests(unittest.TestCase):
 
     def test_selectable_reveal_stats_excludes_revealed_values(self) -> None:
         player = _player(1)
-        player = BunkerPlayer(**{**player.__dict__, "revealed_stats": ("gender", "profession", "fact")})
+        player = BunkerPlayer(**{**player.__dict__, "revealed_stats": ("gender", "profession", "extra_fact")})
 
         stats = selectable_reveal_stats(player)
 
-        self.assertEqual(stats[0], "body")
+        self.assertEqual(stats[0], "age")
         self.assertNotIn("gender", stats)
         self.assertNotIn("profession", stats)
-        self.assertNotIn("fact", stats)
-        self.assertIn("inventory", stats)
+        self.assertNotIn("extra_fact", stats)
+        self.assertIn("baggage", stats)
 
-    def test_reveal_requires_ordered_card_schema(self) -> None:
+    def test_reveal_uses_round_required_stats(self) -> None:
         player = _player(1)
 
-        ok, message = reveal_stat(player, "profession")
+        self.assertEqual(required_stats_for_round(1), ("profession",))
+        self.assertEqual(required_stats_for_round(2), ("health", "age"))
+
+        ok, message = reveal_stat(player, "age", round_number=1)
 
         self.assertFalse(ok)
-        self.assertIn("Пол", message)
+        self.assertIn("Профессия", message)
 
-        ok, message = reveal_stat(player, "gender")
+        ok, message = reveal_stat(player, "profession", round_number=1)
 
         self.assertTrue(ok)
-        self.assertIn("Пол", message)
+        self.assertIn("Профессия", message)
+
+    def test_round_reveal_completion_requires_all_round_stats(self) -> None:
+        player = _player(1)
+        player = BunkerPlayer(**{**player.__dict__, "revealed_stats": ("health",)})
+
+        self.assertEqual(revealable_stats_for_round(player, 2), ["age"])
+        self.assertFalse(player_completed_round_reveal(player, 2))
+
+        player = BunkerPlayer(**{**player.__dict__, "revealed_stats": ("health", "age")})
+
+        self.assertTrue(player_completed_round_reveal(player, 2))
+
+    def test_old_card_json_is_read_as_new_schema(self) -> None:
+        card = CharacterCard.from_json(
+            {
+                "profession": "врач",
+                "age": "40 лет",
+                "gender": "женщина",
+                "health": "стабильное",
+                "phobia": "нет",
+                "skill": "садоводство",
+                "inventory": "аптечка",
+                "fact": "знает склад еды",
+                "body": "выдерживает изоляцию",
+            }
+        )
+
+        self.assertIsNotNone(card)
+        assert card is not None
+        self.assertEqual(card.hobby, "садоводство")
+        self.assertEqual(card.baggage, "аптечка")
+        self.assertEqual(card.extra_fact, "знает склад еды")
+        self.assertEqual(card.character_trait, "выдерживает изоляцию")
 
     def test_reveal_phase_is_not_timer_driven(self) -> None:
         settings = BunkerSettings()

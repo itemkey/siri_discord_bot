@@ -34,8 +34,11 @@ from siri_bot.bunker.engine import (
     pick_chaos_event,
     apply_chaos_to_resources,
     recommended_rounds,
+    required_stats_for_round,
     reveal_stat,
+    revealable_stats_for_round,
     selectable_reveal_stats,
+    player_completed_round_reveal,
     should_enter_final,
     tally_votes,
 )
@@ -52,6 +55,7 @@ from siri_bot.bunker.models import (
     RoomKind,
     Vote,
     VotePolicy,
+    normalize_card_stat_key,
 )
 from siri_bot.bunker.permissions import (
     build_admin_text_overwrites,
@@ -83,6 +87,7 @@ PUBLIC_SECTION_TOGGLE_ID = "siri:bunker:section:toggle"
 PUBLIC_SECTION_REFRESH_ID = "siri:bunker:section:refresh"
 PUBLIC_REVEAL_STAT_PREFIX = "siri:bunker:public:reveal:"
 PUBLIC_ABILITY_PREFIX = "siri:bunker:public:ability:"
+PUBLIC_MY_CARD_ID = "siri:bunker:public:my_card"
 GAME_JOIN_ID = "siri:bunker:game:join"
 GAME_READY_ID = "siri:bunker:game:ready"
 GAME_START_ID = "siri:bunker:game:start"
@@ -719,10 +724,11 @@ class Bunker(commands.Cog):
             if current_player is None or current_player.user_id != interaction.user.id:
                 name = format_player_name(current_player) if current_player else "следующего игрока"
                 return _status_embed(f"Сейчас ход {name}."), back_view
-            stats = selectable_reveal_stats(player)
+            stats = revealable_stats_for_round(player, game.round_number)
             if not stats:
-                return _status_embed("Ты уже раскрыл все обычные характеристики."), back_view
-            return _personal_card_embed(player, status="Раскрой следующую характеристику сверху вниз."), BunkerRevealView(self, game.id, interaction.user.id, player)
+                return _status_embed("Ты уже раскрыл все характеристики этого раунда."), back_view
+            labels = ", ".join(CARD_STAT_LABELS[stat] for stat in required_stats_for_round(game.round_number))
+            return _personal_card_embed(player, status=f"В этом раунде открываются: {labels}."), BunkerRevealView(self, game, interaction.user.id, player)
         if screen == "vote":
             if player is None or player.is_eliminated:
                 return _status_embed("Голосовать могут только живые участники."), back_view
@@ -1258,9 +1264,9 @@ class Bunker(commands.Cog):
             phase_ends_at=None,
             paused_at=None,
         )
-        await self.repository.add_event(started.id, started.round_number, "start", "Бункер закрыт. Карточки и спец. возможности выданы. Начинается раскрытие по очереди.")
+        await self.repository.add_event(started.id, started.round_number, "start", "Бункер закрыт. Карточки и спец. возможности выданы. Начинается раундовое раскрытие характеристик.")
         if game.settings.explain_for_newbies:
-            await self.repository.add_event(started.id, started.round_number, "tutorial", "Раскрытие идет строго сверху вниз: по 2 характеристики за ход текущего игрока.")
+            await self.repository.add_event(started.id, started.round_number, "tutorial", "В каждом раунде все игроки открывают один и тот же набор характеристик, затем идут речи, обсуждение и голосование.")
         await self._delete_lobby_board_message(game)
         await self.refresh_game_message(started.id)
         return "Игра началась. Карточка и действия доступны через личную панель."
@@ -1272,6 +1278,7 @@ class Bunker(commands.Cog):
         await self.open_game_panel(interaction, screen="reveal")
 
     async def reveal_selected_stat(self, interaction: discord.Interaction, game_id: int, user_id: int, stat: str) -> None:
+        stat = normalize_card_stat_key(stat) or stat
         if interaction.user.id != user_id:
             await interaction.response.edit_message(embed=_status_embed("Это меню не для тебя."), view=BunkerPanelBackView(self, game_id))
             return
@@ -1299,7 +1306,7 @@ class Bunker(commands.Cog):
             await interaction.response.edit_message(embed=_status_embed(f"Сейчас ход {name}."), view=BunkerPanelBackView(self, game_id))
             return
 
-        ok, message = reveal_stat(player, stat)
+        ok, message = reveal_stat(player, stat, round_number=game.round_number)
         if not ok:
             await interaction.response.edit_message(embed=_status_embed(message), view=BunkerPanelBackView(self, game_id))
             return
@@ -1313,6 +1320,7 @@ class Bunker(commands.Cog):
         await self.update_current_game_panel(interaction, fresh, status="Раскрыто.")
 
     async def public_reveal_selected_stat(self, interaction: discord.Interaction, stat: str) -> None:
+        stat = normalize_card_stat_key(stat) or stat
         resolved = await self._resolve_public_message_game(interaction, expected_key="personal")
         if resolved is None:
             await interaction.response.send_message("Это действие больше недоступно. Открой актуальную панель.", ephemeral=True)
@@ -1335,7 +1343,7 @@ class Bunker(commands.Cog):
             await interaction.followup.send(f"Сейчас ход {format_player_name(current_player)}.", ephemeral=True)
             return
 
-        ok, message = reveal_stat(current_player, stat)
+        ok, message = reveal_stat(current_player, stat, round_number=game.round_number)
         if not ok:
             await interaction.followup.send(message, ephemeral=True)
             await self.refresh_game_message(game.id)
@@ -1348,6 +1356,15 @@ class Bunker(commands.Cog):
         await self.refresh_game_message(game.id)
         await interaction.followup.send("Раскрыто.", ephemeral=True)
 
+    async def public_show_my_card(self, interaction: discord.Interaction) -> None:
+        resolved = await self._resolve_public_message_game(interaction, expected_key="personal")
+        if resolved is None:
+            await interaction.response.send_message("Карточка недоступна: сообщение устарело.", ephemeral=True)
+            return
+
+        game, _ = resolved
+        await self.send_or_edit_private_panel(interaction, game, screen="card")
+
     async def _advance_reveal_progress(
         self,
         game: BunkerGame,
@@ -1359,18 +1376,16 @@ class Bunker(commands.Cog):
             return
 
         current_index = min(game.current_turn_index, len(ordered) - 1)
-        reveals_done = game.reveals_done_this_turn + 1
-        must_pass_turn = reveals_done >= 2 or next_reveal_stat(revealed_player) is None
-        if not must_pass_turn:
+        if not player_completed_round_reveal(revealed_player, game.round_number):
             await self.repository.set_reveal_progress(
                 game.id,
                 current_turn_index=current_index,
-                reveals_done_this_turn=reveals_done,
+                reveals_done_this_turn=0,
             )
             return
 
         current_index += 1
-        while current_index < len(ordered) and next_reveal_stat(ordered[current_index]) is None:
+        while current_index < len(ordered) and player_completed_round_reveal(ordered[current_index], game.round_number):
             current_index += 1
 
         if current_index < len(ordered):
@@ -1454,6 +1469,9 @@ class Bunker(commands.Cog):
             await interaction.response.edit_message(embed=_status_embed("Эта спец. возможность не найдена."), view=BunkerPanelBackView(self, game_id))
             return
         ability = abilities[ability_index]
+        if not ability.revealed:
+            await interaction.response.edit_message(embed=_status_embed("Сначала раскрой эту спец. возможность в публичной таблице."), view=BunkerPanelBackView(self, game_id))
+            return
         if ability.used or ability.blocked:
             await interaction.response.edit_message(embed=_status_embed("Эта спец. возможность уже недоступна."), view=BunkerPanelBackView(self, game_id))
             return
@@ -1506,6 +1524,16 @@ class Bunker(commands.Cog):
         ability = abilities[ability_index]
         if ability.used or ability.blocked or player.is_eliminated:
             await interaction.response.send_message("Эта спец. возможность уже недоступна.", ephemeral=True)
+            return
+
+        if not ability.revealed:
+            await interaction.response.defer(ephemeral=True)
+            abilities[ability_index] = replace(ability, revealed=True)
+            updated_card = replace(player.card, special_abilities=tuple(abilities))
+            await self.repository.assign_cards(game.id, {player.user_id: updated_card})
+            await self.repository.add_event(game.id, game.round_number, "action", f"{format_player_name(player)} раскрывает спец. возможность: {ability.name}.")
+            await self.refresh_game_message(game.id)
+            await interaction.followup.send("Спец. возможность раскрыта. Теперь ее можно использовать отдельным нажатием.", ephemeral=True)
             return
 
         alive_targets = [target for target in players if target.is_alive and target.user_id != player.user_id]
@@ -2244,7 +2272,9 @@ class Bunker(commands.Cog):
         target = next((candidate for candidate in alive_targets if candidate.user_id == target_id), None)
         if target is None and ability.target not in {"alive_other", "other"}:
             target = rng.choice(alive_targets) if alive_targets else None
-        stat = ability.stat_key if ability.stat_key in CARD_STAT_LABELS else "skill"
+        stat = normalize_card_stat_key(ability.stat_key)
+        if stat not in CARD_STAT_LABELS:
+            stat = "hobby"
 
         if ability.effect == "reveal_other_stat" and target is not None and target.card is not None:
             await self.repository.reveal_stat(game.id, target.user_id, stat)
@@ -2263,12 +2293,12 @@ class Bunker(commands.Cog):
             content_pack = await self._content_pack_for_game(game)
             values = {
                 "health": content_pack.weaknesses,
-                "skill": content_pack.skills,
+                "hobby": content_pack.skills,
                 "phobia": content_pack.phobias,
-                "inventory": content_pack.items,
-                "fact": content_pack.secrets,
+                "baggage": content_pack.items,
+                "extra_fact": content_pack.secrets,
                 "profession": content_pack.professions,
-                "body": content_pack.funny_traits,
+                "character_trait": content_pack.funny_traits,
             }.get(stat, ())
             if values:
                 await self.repository.assign_cards(game.id, {player.user_id: replace(player.card, **{stat: rng.choice(values)})})
@@ -2582,15 +2612,19 @@ class BunkerPublicRevealView(discord.ui.View):
     ) -> None:
         super().__init__(timeout=None)
         self.cog = cog
-        next_stat = next_reveal_stat(player) if game is not None and player is not None and game.state == GameState.REVEAL_PHASE else None
+        stats = (
+            required_stats_for_round(game.round_number)
+            if game is not None and game.state == GameState.REVEAL_PHASE
+            else REVEALABLE_STATS
+        )
         revealed_stats = set(player.revealed_stats) if player is not None else set()
-        for index, stat in enumerate(REVEALABLE_STATS):
+        for index, stat in enumerate(stats):
             revealed = stat in revealed_stats
             button = discord.ui.Button(
                 label=CARD_STAT_LABELS[stat],
                 style=discord.ButtonStyle.secondary,
                 custom_id=f"{PUBLIC_REVEAL_STAT_PREFIX}{stat}",
-                disabled=player is None or game is None or game.state != GameState.REVEAL_PHASE or revealed or stat != next_stat,
+                disabled=game is not None and (player is None or game.state != GameState.REVEAL_PHASE or revealed),
                 row=index // 3,
             )
 
@@ -2599,6 +2633,18 @@ class BunkerPublicRevealView(discord.ui.View):
 
             button.callback = callback
             self.add_item(button)
+
+        my_card = discord.ui.Button(
+            label="Моя карточка",
+            style=discord.ButtonStyle.primary,
+            custom_id=PUBLIC_MY_CARD_ID,
+            row=4,
+        )
+        my_card.callback = self.my_card
+        self.add_item(my_card)
+
+    async def my_card(self, interaction: discord.Interaction) -> None:
+        await self.cog.public_show_my_card(interaction)
 
 
 class BunkerPublicAbilityView(discord.ui.View):
@@ -2613,15 +2659,19 @@ class BunkerPublicAbilityView(discord.ui.View):
         abilities = tuple(player.card.special_abilities[:2]) if player is not None and player.card is not None else ()
         for index in range(2):
             ability = abilities[index] if index < len(abilities) else None
-            disabled = (
-                game is None
-                or player is None
+            disabled = game is not None and (
+                player is None
                 or player.is_eliminated
                 or ability is None
                 or ability.used
                 or ability.blocked
             )
-            label = ability.name[:80] if ability is not None else f"Способность {index + 1}"
+            if ability is None:
+                label = f"Способность {index + 1}"
+            elif ability.revealed:
+                label = f"Использовать: {ability.name}"[:80]
+            else:
+                label = f"Раскрыть спец. {index + 1}"[:80]
             button = discord.ui.Button(
                 label=label,
                 style=discord.ButtonStyle.secondary,
@@ -3305,7 +3355,7 @@ class BunkerSettingsView(discord.ui.View):
 
     @discord.ui.button(label="Раунды", style=discord.ButtonStyle.secondary, row=4)
     async def cycle_rounds(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        values = [3, 4, 5, 6]
+        values = [3, 4, 5, 6, 7]
         current = self.settings.rounds if self.settings.rounds in values else recommended_rounds(self.settings.slots, self.settings.mode)
         rounds = values[(values.index(current) + 1) % len(values)]
         await self.save(interaction, replace(self.settings, rounds=rounds))
@@ -3408,7 +3458,7 @@ class BunkerTimerSelect(discord.ui.Select):
 class BunkerRoundsSelect(discord.ui.Select):
     def __init__(self, owner: BunkerSettingsView, *, row: int) -> None:
         self.owner = owner
-        values = (3, 4, 5, 6)
+        values = (3, 4, 5, 6, 7)
         super().__init__(
             placeholder=f"Раунды: {owner.settings.rounds}",
             min_values=1,
@@ -3425,20 +3475,20 @@ class BunkerRoundsSelect(discord.ui.Select):
 
 
 class BunkerRevealView(discord.ui.View):
-    def __init__(self, cog: Bunker, game_id: int, user_id: int, player: BunkerPlayer) -> None:
+    def __init__(self, cog: Bunker, game: BunkerGame, user_id: int, player: BunkerPlayer) -> None:
         super().__init__(timeout=900)
-        next_stat = next_reveal_stat(player)
-        for index, stat in enumerate(REVEALABLE_STATS):
+        required = required_stats_for_round(game.round_number)
+        for index, stat in enumerate(required):
             revealed = stat in player.revealed_stats
             button = discord.ui.Button(
                 label=CARD_STAT_LABELS[stat],
                 style=discord.ButtonStyle.secondary,
-                disabled=revealed or stat != next_stat,
+                disabled=revealed,
                 row=index // 3,
             )
 
             async def callback(interaction: discord.Interaction, selected_stat: str = stat) -> None:
-                await cog.reveal_selected_stat(interaction, game_id, user_id, selected_stat)
+                await cog.reveal_selected_stat(interaction, game.id, user_id, selected_stat)
 
             button.callback = callback
             self.add_item(button)
@@ -3592,20 +3642,23 @@ def _public_personal_embed(game: BunkerGame, players: list[BunkerPlayer]) -> dis
     if player is None:
         embed.description = "Сейчас нет активного reveal-хода."
         return embed
-    next_stat = next_reveal_stat(player)
-    progress = f"{game.reveals_done_this_turn}/2 за этот ход"
+    required = required_stats_for_round(game.round_number)
+    remaining = revealable_stats_for_round(player, game.round_number)
+    opened = len(required) - len(remaining)
+    round_labels = ", ".join(CARD_STAT_LABELS[stat] for stat in required) or "нет обязательных характеристик"
     embed.description = (
         f"Ход: {format_player_name(player)}\n"
-        f"Раскрыто за ход: {progress}\n"
-        f"Следующая характеристика: {CARD_STAT_LABELS[next_stat] if next_stat else 'все раскрыто'}"
+        f"В этом раунде открываются: {round_labels}\n"
+        f"Раскрыто за ход: {opened}/{len(required)}\n"
+        "Полная личная карточка доступна приватно по кнопке ниже."
     )
     for stat in REVEALABLE_STATS:
         if player.card is not None and stat in player.revealed_stats:
-            value = _short_cell(getattr(player.card, stat), limit=80)
+            value = str(getattr(player.card, stat))
         else:
             value = "?"
         marker = "открыто" if stat in player.revealed_stats else "скрыто"
-        embed.add_field(name=CARD_STAT_LABELS[stat], value=f"{value}\n`{marker}`", inline=True)
+        embed.add_field(name=CARD_STAT_LABELS[stat], value=f"{_limit_embed_value(value, 180)}\n`{marker}`", inline=True)
     return embed
 
 
@@ -3623,6 +3676,9 @@ def _public_specials_embed(game: BunkerGame, players: list[BunkerPlayer]) -> dis
             embed.add_field(name=f"{index + 1}. Способность", value="?", inline=False)
             continue
         status = _ability_status(player, ability)
+        if not ability.revealed:
+            embed.add_field(name=f"{index + 1}. Способность", value=f"Статус: `{status}`", inline=False)
+            continue
         embed.add_field(
             name=f"{index + 1}. {ability.name}",
             value=f"{ability.description or ability.effect}\nСтатус: `{status}`",
@@ -3643,10 +3699,10 @@ def _players_table_embed(game: BunkerGame, players: list[BunkerPlayer]) -> disco
         stat_lines = []
         for stat in REVEALABLE_STATS:
             value = getattr(player.card, stat, "?") if player.card and stat in player.revealed_stats else "?"
-            stat_lines.append(f"{CARD_STAT_LABELS[stat]}: {_short_cell(value, limit=32)}")
+            stat_lines.append(f"{CARD_STAT_LABELS[stat]}: {value}")
         embed.add_field(
             name=f"{index}. {_compact_player_name(player)} · {status}",
-            value="\n".join(stat_lines)[:1024],
+            value=_limit_embed_value("\n".join(stat_lines), 1024),
             inline=False,
         )
     if len(players) > 16:
@@ -3660,8 +3716,6 @@ def _abilities_table_embed(players: list[BunkerPlayer]) -> discord.Embed:
     for index, player in enumerate(players[:16], start=1):
         if player.card is None:
             status = "скрыта / скрыта"
-        elif player.used_special_action:
-            status = "использована"
         elif player.is_eliminated:
             status = "заблокирована"
         else:
@@ -3706,7 +3760,7 @@ def _room_kind_label(room_kind: RoomKind) -> str:
 def _ability_status(player: BunkerPlayer, ability: Any) -> str:
     if player.is_eliminated or getattr(ability, "blocked", False):
         return "заблокирована"
-    if player.used_special_action or getattr(ability, "used", False):
+    if getattr(ability, "used", False):
         return "использована"
     if getattr(ability, "revealed", False):
         return "раскрыта"
@@ -3716,6 +3770,13 @@ def _ability_status(player: BunkerPlayer, ability: Any) -> str:
 def _short_cell(value: str, *, limit: int = 18) -> str:
     text = str(value).replace("\n", " ").strip()
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _limit_embed_value(value: str, limit: int) -> str:
+    text = str(value).strip() or "?"
+    if len(text) <= limit:
+        return text
+    return text[: max(1, limit - 1)].rstrip() + "…"
 
 
 def _setup_embed(room_name: str, active_game: BunkerGame | None = None) -> discord.Embed:
@@ -3737,9 +3798,13 @@ def _reveal_prompt(game: BunkerGame, players: list[BunkerPlayer]) -> str:
     player = _current_ordered_player(game, players, kind="reveal")
     if player is None:
         return "Раскрытие завершается. Ожидается переход к речам."
-    next_stat = next_reveal_stat(player)
-    label = CARD_STAT_LABELS[next_stat] if next_stat else "все характеристики раскрыты"
-    return f"Ход {format_player_name(player)}. Нужно раскрыть: {label}. За ход раскрывается до 2 характеристик."
+    required = required_stats_for_round(game.round_number)
+    remaining = revealable_stats_for_round(player, game.round_number)
+    labels = ", ".join(CARD_STAT_LABELS[stat] for stat in required) or "нет обязательных характеристик"
+    return (
+        f"Раунд {game.round_number}: открываются {labels}. "
+        f"Ход {format_player_name(player)}. Осталось раскрыть: {len(remaining)}/{len(required)}."
+    )
 
 
 def _speech_prompt(game: BunkerGame, players: list[BunkerPlayer]) -> str:
@@ -3826,7 +3891,8 @@ def _personal_card_embed(player: BunkerPlayer, *, status: str | None = None) -> 
     for stat in REVEALABLE_STATS:
         marker = "открыто" if stat in player.revealed_stats else "скрыто"
         rows.append((CARD_STAT_LABELS[stat], f"{getattr(player.card, stat)} ({marker})"))
-    embed.description = _two_column_table(rows)
+    table = _two_column_table(rows)
+    embed.description = f"{status}\n\n{table}" if status else table
     return embed
 
 
@@ -3836,12 +3902,14 @@ def _abilities_embed(player: BunkerPlayer) -> discord.Embed:
         embed.description = "Спец. возможности появятся после старта."
         return embed
     for index, ability in enumerate(player.card.special_abilities[:2], start=1):
-        if player.used_special_action or ability.used:
+        if ability.used:
             status = "использована"
         elif player.is_eliminated or ability.blocked:
             status = "заблокирована"
+        elif ability.revealed:
+            status = "раскрыта"
         else:
-            status = "доступна"
+            status = "скрыта"
         embed.add_field(
             name=f"{index}. {ability.name}",
             value=f"{ability.description or ability.effect}\nСтатус: {status}",

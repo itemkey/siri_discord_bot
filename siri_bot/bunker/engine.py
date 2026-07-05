@@ -23,11 +23,31 @@ from siri_bot.bunker.models import (
     SpecialAbility,
     Vote,
     VotePolicy,
+    normalize_card_stat_key,
 )
 
 MIN_PLAYERS = 6
 MAX_PLAYERS = 16
 FINAL_ALIVE_FLOOR = 2
+
+BIOLOGY_TRAITS: tuple[str, ...] = (
+    "может иметь детей, хронических ограничений не выявлено",
+    "репродуктивная функция снижена, но общее состояние стабильное",
+    "имеет медицинское ограничение по репродукции",
+    "генетических рисков по базовому скринингу не обнаружено",
+    "требуется дополнительное обследование репродуктивного здоровья",
+    "репродуктивный статус неизвестен",
+)
+
+ROUND_REVEAL_STATS: tuple[tuple[str, ...], ...] = (
+    ("profession",),
+    ("health", "age"),
+    ("hobby",),
+    ("baggage",),
+    ("phobia", "character_trait"),
+    ("extra_fact",),
+    ("gender", "biology"),
+)
 
 
 def recommended_rounds(slots: int, mode: GameMode = GameMode.CLASSIC) -> int:
@@ -54,7 +74,7 @@ def normalize_settings(settings: BunkerSettings) -> BunkerSettings:
     bunker_seats = settings.bunker_seats
     if bunker_seats is not None:
         bunker_seats = max(1, min(slots - 1, bunker_seats))
-    rounds = max(3, min(6, settings.rounds or recommended_rounds(slots, settings.mode)))
+    rounds = max(3, min(7, settings.rounds or recommended_rounds(slots, settings.mode)))
     timer = max(30, min(900, settings.timer_seconds))
     if settings.mode == GameMode.TURBO:
         timer = max(30, timer // 2)
@@ -122,15 +142,16 @@ def generate_card(
     age = rng.randint(18, 78)
     abilities = _pick_special_abilities(rng, pack)
     return CharacterCard(
-        gender=rng.choice(GENDERS),
-        body=rng.choice(pack.funny_traits or BODY_TYPES),
-        age=f"{age} лет",
         profession=rng.choice(pack.professions),
+        age=f"{age} лет",
+        gender=rng.choice(GENDERS),
         health=rng.choice(pack.weaknesses),
-        skill=rng.choice(pack.skills),
         phobia=rng.choice(pack.phobias),
-        inventory=rng.choice(pack.items),
-        fact=rng.choice(pack.secrets),
+        hobby=rng.choice(pack.skills),
+        baggage=rng.choice(pack.items),
+        extra_fact=rng.choice(pack.secrets),
+        character_trait=rng.choice(pack.funny_traits or BODY_TYPES),
+        biology=rng.choice(BIOLOGY_TRAITS),
         special_abilities=abilities,
         traitor=traitor,
     )
@@ -192,12 +213,35 @@ def selectable_reveal_stats(player: BunkerPlayer) -> list[str]:
     return [stat for stat in REVEALABLE_STATS if stat not in revealed]
 
 
-def next_reveal_stat(player: BunkerPlayer) -> str | None:
-    stats = selectable_reveal_stats(player)
+def required_stats_for_round(round_number: int) -> tuple[str, ...]:
+    if round_number <= 0:
+        return ROUND_REVEAL_STATS[0]
+    index = round_number - 1
+    if index < len(ROUND_REVEAL_STATS):
+        return ROUND_REVEAL_STATS[index]
+    return tuple(stat for stat in REVEALABLE_STATS if stat not in {item for group in ROUND_REVEAL_STATS for item in group})
+
+
+def revealable_stats_for_round(player: BunkerPlayer, round_number: int) -> list[str]:
+    revealed = set(player.revealed_stats)
+    return [stat for stat in required_stats_for_round(round_number) if stat not in revealed]
+
+
+def player_completed_round_reveal(player: BunkerPlayer, round_number: int) -> bool:
+    required = required_stats_for_round(round_number)
+    if not required:
+        return True
+    revealed = set(player.revealed_stats)
+    return all(stat in revealed for stat in required)
+
+
+def next_reveal_stat(player: BunkerPlayer, round_number: int | None = None) -> str | None:
+    stats = revealable_stats_for_round(player, round_number) if round_number is not None else selectable_reveal_stats(player)
     return stats[0] if stats else None
 
 
-def reveal_stat(player: BunkerPlayer, stat: str) -> tuple[bool, str]:
+def reveal_stat(player: BunkerPlayer, stat: str, *, round_number: int | None = None) -> tuple[bool, str]:
+    stat = normalize_card_stat_key(stat) or ""
     if stat not in REVEALABLE_STATS:
         return False, "Эту характеристику нельзя раскрыть через обычный reveal."
 
@@ -207,9 +251,15 @@ def reveal_stat(player: BunkerPlayer, stat: str) -> tuple[bool, str]:
     if player.card is None:
         return False, "Карточка еще не выдана."
 
-    expected = next_reveal_stat(player)
-    if expected is not None and stat != expected:
-        return False, f"Сначала нужно раскрыть: {CARD_STAT_LABELS[expected]}."
+    if round_number is not None:
+        required = required_stats_for_round(round_number)
+        if stat not in required:
+            labels = ", ".join(CARD_STAT_LABELS[item] for item in required) or "нет обязательных характеристик"
+            return False, f"В этом раунде открываются: {labels}."
+    else:
+        expected = next_reveal_stat(player)
+        if expected is not None and stat != expected:
+            return False, f"Сначала нужно раскрыть: {CARD_STAT_LABELS[expected]}."
 
     return True, f"{player.display_name} раскрывает: {CARD_STAT_LABELS[stat]} - {getattr(player.card, stat)}"
 
@@ -335,15 +385,16 @@ def final_epilogue(game: BunkerGame, players: list[BunkerPlayer], rng: random.Ra
 
 def format_card(card: CharacterCard) -> str:
     lines = [
-        f"Пол: {card.gender}",
-        f"Телосложение: {card.body}",
-        f"Возраст: {card.age}",
         f"Профессия: {card.profession}",
+        f"Возраст: {card.age}",
+        f"Пол: {card.gender}",
         f"Здоровье: {card.health}",
-        f"Навык: {card.skill}",
         f"Фобия: {card.phobia}",
-        f"Инвентарь: {card.inventory}",
-        f"Факт: {card.fact}",
+        f"Хобби/навык: {card.hobby}",
+        f"Багаж: {card.baggage}",
+        f"Доп. факт: {card.extra_fact}",
+        f"Черта характера: {card.character_trait}",
+        f"Биологическая характеристика: {card.biology}",
         "Спец. возможности:",
         *[f"- {ability.name}: {ability.description or ability.effect}" for ability in card.special_abilities],
     ]

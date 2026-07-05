@@ -129,12 +129,12 @@ PACK_FIELDS: tuple[str, ...] = (
 
 PACK_FIELD_LABELS: dict[str, str] = {
     "professions": "Профессии",
-    "items": "Инвентарь",
+    "items": "Багаж",
     "weaknesses": "Здоровье",
-    "secrets": "Факты",
-    "skills": "Навыки",
+    "secrets": "Доп. факты",
+    "skills": "Хобби/навыки",
     "phobias": "Фобии",
-    "funny_traits": "Телосложение",
+    "funny_traits": "Черты характера",
     "apocalypses": "Катаклизмы",
     "bunker_defects": "Состояние бункера",
     "chaos_events": "События",
@@ -332,6 +332,19 @@ CORE_PHOBIAS = (
     "страх замкнутых лифтов",
 )
 
+CORE_CHARACTER_TRAITS = (
+    "спокойный и дисциплинированный",
+    "склонен брать ответственность",
+    "быстро конфликтует под давлением",
+    "хорошо работает в группе",
+    "замкнутый, но надежный",
+    "легко поддается панике",
+    "умеет договариваться в споре",
+    "строго соблюдает правила",
+    "склонен скрывать проблемы",
+    "выдерживает долгую изоляцию",
+)
+
 CORE_APOCALYPSES = (
     "Серия ядерных ударов разрушила крупные города. Поверхность заражена, связь нестабильна, ближайшие месяцы решают судьбу выживших.",
     "Пандемия неизвестного патогена вызвала распад систем здравоохранения. Без изоляции и контроля ресурсов группа не продержится.",
@@ -378,15 +391,15 @@ def _extend(seed: tuple[str, ...], target: int, pattern: str) -> tuple[str, ...]
 
 
 BUILTIN_PACK = ContentPack(
-    professions=_extend(CORE_PROFESSIONS, 100, "{base}; подтвержден опыт работы на объекте уровня {index}"),
-    items=_extend(CORE_ITEMS, 100, "{base}; ресурсная ценность {index}"),
-    weaknesses=_extend(CORE_HEALTH, 100, "{base}; требуется контроль состояния {index}"),
-    secrets=_extend(CORE_FACTS, 100, "{base}; подтверждение в личном деле {index}"),
-    skills=_extend(CORE_SKILLS, 100, "{base}; практический уровень {index}"),
-    phobias=_extend(CORE_PHOBIAS, 100, "{base}; выраженность {index}"),
-    funny_traits=_extend(BODY_TYPES, 40, "{base}; медицинская отметка {index}"),
-    apocalypses=_extend(CORE_APOCALYPSES, 50, "{base} Прогноз стабилизации: не ранее контрольного периода {index}."),
-    bunker_defects=_extend(CORE_DEFECTS, 50, "{base}; приоритет ремонта {index}"),
-    chaos_events=_extend(CORE_EVENTS, 100, "{base} Протокол события {index} внесен в журнал ведущего."),
-    layouts=_extend(CORE_LAYOUTS, 20, "{base}; дополнительный отсек указан в схеме {index}"),
+    professions=CORE_PROFESSIONS,
+    items=CORE_ITEMS,
+    weaknesses=CORE_HEALTH,
+    secrets=CORE_FACTS,
+    skills=CORE_SKILLS,
+    phobias=CORE_PHOBIAS,
+    funny_traits=CORE_CHARACTER_TRAITS,
+    apocalypses=CORE_APOCALYPSES,
+    bunker_defects=CORE_DEFECTS,
+    chaos_events=CORE_EVENTS,
+    layouts=CORE_LAYOUTS,
 )

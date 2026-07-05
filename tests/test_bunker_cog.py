@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from dataclasses import replace
 from unittest.mock import AsyncMock
 
 import discord
@@ -20,8 +21,10 @@ from siri_bot.cogs.bunker import (
     BunkerSetupIdleView,
     BunkerSetupNavView,
     format_player_name,
+    _abilities_table_embed,
     _missing_setup_panel_permissions,
     _players_table_embed,
+    _public_personal_embed,
     _setup_embed,
 )
 from siri_bot.bunker.models import BunkerPlayer, BunkerSettings, RoomKind, RoomSetup
@@ -448,7 +451,7 @@ class BunkerCogTests(unittest.TestCase):
         self.assertNotIn("Следующая фаза", labels)
         self.assertNotIn("Правила", labels)
 
-    def test_public_reveal_view_has_nine_gray_stat_buttons_with_only_next_enabled(self) -> None:
+    def test_public_reveal_view_has_round_stat_buttons_and_my_card(self) -> None:
         game = BunkerGame(
             id=55,
             guild_id=100,
@@ -461,7 +464,55 @@ class BunkerCogTests(unittest.TestCase):
             host_id=201,
             state=GameState.REVEAL_PHASE,
             settings=BunkerSettings(),
-            round_number=1,
+            round_number=2,
+            phase_started_at=None,
+            phase_ends_at=None,
+            paused_at=None,
+            board_message_id=None,
+            profile=None,
+            turn_order=(201,),
+        )
+        player = BunkerPlayer(
+            game_id=55,
+            user_id=201,
+            display_name="Player",
+            is_host=True,
+            ready_at=None,
+            invited_at=None,
+            joined_at=None,
+            left_at=None,
+            is_eliminated=False,
+            card=generate_card(),
+            revealed_stats=("health",),
+            used_special_action=False,
+            immune_round=None,
+        )
+
+        view = BunkerPublicRevealView(object(), game, player)
+        buttons = [child for child in view.children if isinstance(child, discord.ui.Button)]
+        stat_buttons = [button for button in buttons if button.label != "Моя карточка"]
+        my_card = next(button for button in buttons if button.label == "Моя карточка")
+
+        self.assertEqual([button.label for button in stat_buttons], ["Здоровье", "Возраст"])
+        self.assertTrue(all(button.style == discord.ButtonStyle.secondary for button in stat_buttons))
+        self.assertTrue(stat_buttons[0].disabled)
+        self.assertFalse(stat_buttons[1].disabled)
+        self.assertEqual(my_card.style, discord.ButtonStyle.primary)
+
+    def test_public_personal_embed_lists_round_stats_together(self) -> None:
+        game = BunkerGame(
+            id=55,
+            guild_id=100,
+            setup_id=10,
+            setup_channel_id=300,
+            setup_message_id=500,
+            category_id=None,
+            game_text_channel_id=700,
+            voice_channel_id=800,
+            host_id=201,
+            state=GameState.REVEAL_PHASE,
+            settings=BunkerSettings(),
+            round_number=2,
             phase_started_at=None,
             phase_ends_at=None,
             paused_at=None,
@@ -485,13 +536,10 @@ class BunkerCogTests(unittest.TestCase):
             immune_round=None,
         )
 
-        view = BunkerPublicRevealView(object(), game, player)
-        buttons = [child for child in view.children if isinstance(child, discord.ui.Button)]
+        embed = _public_personal_embed(game, [player])
 
-        self.assertEqual(len(buttons), 9)
-        self.assertTrue(all(button.style == discord.ButtonStyle.secondary for button in buttons))
-        self.assertFalse(buttons[0].disabled)
-        self.assertTrue(all(button.disabled for button in buttons[1:]))
+        self.assertIn("Здоровье, Возраст", embed.description)
+        self.assertNotIn("Следующая характеристика", embed.description)
 
     def test_public_ability_view_has_two_gray_buttons(self) -> None:
         game = BunkerGame(
@@ -534,6 +582,33 @@ class BunkerCogTests(unittest.TestCase):
 
         self.assertEqual(len(buttons), 2)
         self.assertTrue(all(button.style == discord.ButtonStyle.secondary for button in buttons))
+
+    def test_abilities_table_distinguishes_revealed_from_used(self) -> None:
+        card = generate_card()
+        abilities = (
+            replace(card.special_abilities[0], revealed=True, used=False),
+            replace(card.special_abilities[1], revealed=False, used=False),
+        )
+        player = BunkerPlayer(
+            game_id=55,
+            user_id=201,
+            display_name="Player",
+            is_host=True,
+            ready_at=None,
+            invited_at=None,
+            joined_at=None,
+            left_at=None,
+            is_eliminated=False,
+            card=replace(card, special_abilities=abilities),
+            revealed_stats=(),
+            used_special_action=True,
+            immune_round=None,
+        )
+
+        embed = _abilities_table_embed([player])
+
+        self.assertIn("раскрыта", embed.description)
+        self.assertNotIn("использована", embed.description)
 
     def test_players_table_is_readable_embed_fields_not_one_long_row(self) -> None:
         game = BunkerGame(

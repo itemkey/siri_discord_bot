@@ -46,28 +46,48 @@ class RoomKind(StrEnum):
 
 
 CARD_STAT_LABELS: dict[str, str] = {
-    "gender": "Пол",
-    "body": "Телосложение",
-    "age": "Возраст",
     "profession": "Профессия",
+    "age": "Возраст",
+    "gender": "Пол",
     "health": "Здоровье",
-    "skill": "Навык",
     "phobia": "Фобия",
-    "inventory": "Инвентарь",
-    "fact": "Факт",
+    "hobby": "Хобби/навык",
+    "baggage": "Багаж",
+    "extra_fact": "Доп. факт",
+    "character_trait": "Черта характера",
+    "biology": "Биологическая характеристика",
 }
 
 REVEALABLE_STATS: tuple[str, ...] = (
-    "gender",
-    "body",
-    "age",
     "profession",
+    "age",
+    "gender",
     "health",
-    "skill",
     "phobia",
-    "inventory",
-    "fact",
+    "hobby",
+    "baggage",
+    "extra_fact",
+    "character_trait",
+    "biology",
 )
+
+STAT_KEY_ALIASES: dict[str, str] = {
+    "skill": "hobby",
+    "inventory": "baggage",
+    "item": "baggage",
+    "fact": "extra_fact",
+    "secret": "extra_fact",
+    "body": "character_trait",
+    "funny_trait": "character_trait",
+    "biological": "biology",
+}
+
+
+def normalize_card_stat_key(stat: str | None) -> str | None:
+    if stat is None:
+        return None
+    raw = str(stat).strip()
+    return STAT_KEY_ALIASES.get(raw, raw)
 
 
 @dataclass(frozen=True)
@@ -235,29 +255,31 @@ class SpecialAbility:
 
 @dataclass(frozen=True)
 class CharacterCard:
-    gender: str
-    body: str
-    age: str
     profession: str
+    age: str
+    gender: str
     health: str
-    skill: str
     phobia: str
-    inventory: str
-    fact: str
+    hobby: str
+    baggage: str
+    extra_fact: str
+    character_trait: str
+    biology: str
     special_abilities: tuple[SpecialAbility, ...] = field(default_factory=tuple)
     traitor: bool = False
 
     def to_json(self) -> dict[str, Any]:
         return {
-            "gender": self.gender,
-            "body": self.body,
-            "age": self.age,
             "profession": self.profession,
+            "age": self.age,
+            "gender": self.gender,
             "health": self.health,
-            "skill": self.skill,
             "phobia": self.phobia,
-            "inventory": self.inventory,
-            "fact": self.fact,
+            "hobby": self.hobby,
+            "baggage": self.baggage,
+            "extra_fact": self.extra_fact,
+            "character_trait": self.character_trait,
+            "biology": self.biology,
             "special_abilities": [ability.to_json() for ability in self.special_abilities],
             "traitor": self.traitor,
         }
@@ -274,30 +296,47 @@ class CharacterCard:
             abilities_raw = []
 
         return cls(
-            gender=str(raw.get("gender", "не указано")),
-            body=str(raw.get("body", raw.get("funny_trait", "среднее телосложение"))),
-            age=str(raw.get("age", "")),
             profession=str(raw.get("profession", "")),
+            age=str(raw.get("age", "")),
+            gender=str(raw.get("gender", "не указано")),
             health=str(raw.get("health", "")),
-            skill=str(raw.get("skill", "")),
             phobia=str(raw.get("phobia", "")),
-            inventory=str(raw.get("inventory", raw.get("item", ""))),
-            fact=str(raw.get("fact", raw.get("secret", ""))),
+            hobby=str(raw.get("hobby", raw.get("skill", ""))),
+            baggage=str(raw.get("baggage", raw.get("inventory", raw.get("item", "")))),
+            extra_fact=str(raw.get("extra_fact", raw.get("fact", raw.get("secret", "")))),
+            character_trait=str(raw.get("character_trait", raw.get("body", raw.get("funny_trait", "уравновешенный характер")))),
+            biology=str(raw.get("biology", raw.get("biological", "репродуктивный статус не подтвержден"))),
             special_abilities=tuple(SpecialAbility.from_json(ability) for ability in abilities_raw)[:2],
             traitor=bool(raw.get("traitor", False)),
         )
 
     @property
+    def body(self) -> str:
+        return self.character_trait
+
+    @property
+    def skill(self) -> str:
+        return self.hobby
+
+    @property
+    def inventory(self) -> str:
+        return self.baggage
+
+    @property
+    def fact(self) -> str:
+        return self.extra_fact
+
+    @property
     def item(self) -> str:
-        return self.inventory
+        return self.baggage
 
     @property
     def secret(self) -> str:
-        return self.fact
+        return self.extra_fact
 
     @property
     def funny_trait(self) -> str:
-        return self.body
+        return self.character_trait
 
     @property
     def special_action(self) -> str:
