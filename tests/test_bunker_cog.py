@@ -46,9 +46,17 @@ class FakeChannel:
 
 class FakeResponse:
     def __init__(self) -> None:
-        self.defer = AsyncMock()
-        self.send_message = AsyncMock()
-        self.edit_message = AsyncMock()
+        self._done = False
+
+        async def mark_done(*args, **kwargs) -> None:
+            self._done = True
+
+        self.defer = AsyncMock(side_effect=mark_done)
+        self.send_message = AsyncMock(side_effect=mark_done)
+        self.edit_message = AsyncMock(side_effect=mark_done)
+
+    def is_done(self) -> bool:
+        return self._done
 
 
 class FakeMessage:
@@ -78,7 +86,7 @@ class FakeInteraction:
         self.message = message or FakeMessage(500)
         self.original_message = original_message or FakeMessage(900)
         self.original_response = AsyncMock(return_value=self.original_message)
-        self.edit_original_response = AsyncMock()
+        self.edit_original_response = AsyncMock(return_value=self.original_message)
         self.followup = FakeFollowup(followup_message)
 
 
@@ -198,6 +206,51 @@ class BunkerCogTests(unittest.TestCase):
         kwargs = interaction.response.edit_message.await_args.kwargs
         self.assertEqual(kwargs["embed"].title, "Встроенный контент-пак")
         self.assertIsInstance(kwargs["view"], BunkerSetupNavView)
+
+    def test_private_panel_uses_deferred_original_response_without_new_message(self) -> None:
+        cog = Bunker.__new__(Bunker)
+        registry = {}
+        interaction = FakeInteraction()
+        asyncio.run(interaction.response.defer(ephemeral=True))
+
+        asyncio.run(
+            cog._send_or_edit_private_message(
+                interaction,
+                registry,
+                (1, 2, 3),
+                embed=_setup_embed("build-a-bunker"),
+                view=None,
+            )
+        )
+
+        interaction.response.send_message.assert_not_called()
+        interaction.edit_original_response.assert_awaited_once()
+        interaction.followup.send.assert_not_called()
+        self.assertIs(registry[(1, 2, 3)], interaction.original_message)
+
+    def test_setup_status_after_ack_edits_saved_private_panel_without_duplicate(self) -> None:
+        setup = RoomSetup(
+            id=10,
+            guild_id=100,
+            setup_channel_id=300,
+            category_id=None,
+            setup_message_id=500,
+            room_name="build-a-bunker",
+            active_game_id=None,
+        )
+        saved = FakeMessage(900)
+        cog = Bunker.__new__(Bunker)
+        cog.repository = FakeBunkerRepository(setup)
+        cog._setup_private_panels = {(10, 300, 200): saved}
+
+        interaction = FakeInteraction(message=FakeMessage(500))
+        asyncio.run(interaction.response.defer(ephemeral=True))
+        asyncio.run(cog.send_or_edit_setup_status(interaction, setup, "Ð“Ð¾Ñ‚Ð¾Ð²Ð¾."))
+
+        interaction.response.send_message.assert_not_called()
+        interaction.edit_original_response.assert_not_called()
+        interaction.followup.send.assert_not_called()
+        saved.edit.assert_awaited_once()
 
     def test_settings_view_has_compact_navigation_controls(self) -> None:
         view = BunkerSettingsView(cog=object(), setup_id=1, user_id=2, settings=BunkerSettings())

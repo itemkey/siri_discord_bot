@@ -766,22 +766,31 @@ class Bunker(commands.Cog):
         view: discord.ui.View | None,
     ) -> None:
         active_message = registry.get(key)
+        response_done = _interaction_response_done(interaction)
         if active_message is None:
-            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-            try:
-                registry[key] = await interaction.original_response()
-            except discord.HTTPException:
-                LOGGER.info("Could not remember bunker private panel.", exc_info=True)
+            if response_done:
+                try:
+                    message = await interaction.edit_original_response(content=None, embed=embed, view=view)
+                except discord.HTTPException:
+                    message = await interaction.followup.send(embed=embed, view=view, ephemeral=True, wait=True)
+                registry[key] = message
+            else:
+                await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+                try:
+                    registry[key] = await interaction.original_response()
+                except discord.HTTPException:
+                    LOGGER.info("Could not remember bunker private panel.", exc_info=True)
             return
 
-        if _same_discord_message(active_message, getattr(interaction, "message", None)):
+        if not response_done and _same_discord_message(active_message, getattr(interaction, "message", None)):
             try:
                 await interaction.response.edit_message(content=None, embed=embed, view=view)
                 return
             except discord.HTTPException:
                 LOGGER.info("Could not edit current bunker private panel.", exc_info=True)
 
-        await interaction.response.defer(ephemeral=True)
+        if not response_done:
+            await interaction.response.defer(ephemeral=True)
         try:
             await active_message.edit(content=None, embed=embed, view=view)
         except discord.HTTPException:
@@ -1039,6 +1048,8 @@ class Bunker(commands.Cog):
         if setup is None:
             await interaction.response.send_message("Не нашел setup этой комнаты. Создай панель через /createbunker заново.", ephemeral=True)
             return
+
+        await self.send_or_edit_setup_status(interaction, setup, "Строю бункер... Создаю text/voice каналы и права доступа.")
 
         guild = interaction.guild
         if guild is None or not isinstance(interaction.user, discord.Member):
@@ -4149,6 +4160,11 @@ def _same_discord_message(left: Any, right: Any) -> bool:
     if left_id is not None and right_id is not None:
         return left_id == right_id
     return left is right
+
+
+def _interaction_response_done(interaction: discord.Interaction) -> bool:
+    is_done = getattr(interaction.response, "is_done", None)
+    return bool(is_done()) if callable(is_done) else False
 
 
 def _voice_channel_url(channel: discord.VoiceChannel | None) -> str | None:
