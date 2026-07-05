@@ -25,6 +25,7 @@ from siri_bot.cogs.bunker import (
     _missing_setup_panel_permissions,
     _players_table_embed,
     _public_personal_embed,
+    _public_specials_embed,
     _setup_embed,
 )
 from siri_bot.bunker.models import BunkerPlayer, BunkerSettings, RoomKind, RoomSetup
@@ -593,6 +594,190 @@ class BunkerCogTests(unittest.TestCase):
 
         self.assertIn("Здоровье, Возраст", embed.description)
         self.assertNotIn("Следующая характеристика", embed.description)
+
+    def test_public_personal_embed_shows_admin_test_fake_card_values(self) -> None:
+        card = generate_card()
+        game = BunkerGame(
+            id=55,
+            guild_id=100,
+            setup_id=10,
+            setup_channel_id=300,
+            setup_message_id=500,
+            category_id=None,
+            game_text_channel_id=700,
+            voice_channel_id=800,
+            host_id=201,
+            state=GameState.REVEAL_PHASE,
+            settings=BunkerSettings(room_kind=RoomKind.ADMIN_TEST, is_ranked=False, min_players=1),
+            round_number=1,
+            phase_started_at=None,
+            phase_ends_at=None,
+            paused_at=None,
+            board_message_id=None,
+            profile=None,
+            turn_order=(201,),
+            is_admin_game=True,
+            room_kind=RoomKind.ADMIN_TEST,
+        )
+        player = BunkerPlayer(
+            game_id=55,
+            user_id=201,
+            display_name="Test survivor",
+            is_host=True,
+            ready_at=None,
+            invited_at=None,
+            joined_at=None,
+            left_at=None,
+            is_eliminated=False,
+            card=card,
+            revealed_stats=(),
+            used_special_action=False,
+            immune_round=None,
+            is_fake=True,
+        )
+
+        embed = _public_personal_embed(game, [player])
+        values = "\n".join(str(field.value) for field in embed.fields)
+
+        self.assertIn(card.profession, values)
+        self.assertIn(card.health, values)
+        self.assertIn("Админ-игра", embed.description)
+
+    def test_public_personal_embed_keeps_ranked_hidden_values_private(self) -> None:
+        card = generate_card()
+        game = BunkerGame(
+            id=55,
+            guild_id=100,
+            setup_id=10,
+            setup_channel_id=300,
+            setup_message_id=500,
+            category_id=None,
+            game_text_channel_id=700,
+            voice_channel_id=800,
+            host_id=201,
+            state=GameState.REVEAL_PHASE,
+            settings=BunkerSettings(),
+            round_number=1,
+            phase_started_at=None,
+            phase_ends_at=None,
+            paused_at=None,
+            board_message_id=None,
+            profile=None,
+            turn_order=(201,),
+        )
+        player = BunkerPlayer(
+            game_id=55,
+            user_id=201,
+            display_name="Player",
+            is_host=True,
+            ready_at=None,
+            invited_at=None,
+            joined_at=None,
+            left_at=None,
+            is_eliminated=False,
+            card=card,
+            revealed_stats=(),
+            used_special_action=False,
+            immune_round=None,
+        )
+
+        embed = _public_personal_embed(game, [player])
+        values = "\n".join(str(field.value) for field in embed.fields)
+
+        self.assertNotIn(card.profession, values)
+        self.assertIn("?", values)
+
+    def test_public_specials_embed_shows_admin_test_fake_abilities(self) -> None:
+        card = generate_card()
+        game = BunkerGame(
+            id=55,
+            guild_id=100,
+            setup_id=10,
+            setup_channel_id=300,
+            setup_message_id=500,
+            category_id=None,
+            game_text_channel_id=700,
+            voice_channel_id=800,
+            host_id=201,
+            state=GameState.REVEAL_PHASE,
+            settings=BunkerSettings(room_kind=RoomKind.ADMIN_TEST, is_ranked=False, min_players=1),
+            round_number=1,
+            phase_started_at=None,
+            phase_ends_at=None,
+            paused_at=None,
+            board_message_id=None,
+            profile=None,
+            turn_order=(201,),
+            is_admin_game=True,
+            room_kind=RoomKind.ADMIN_TEST,
+        )
+        player = BunkerPlayer(
+            game_id=55,
+            user_id=201,
+            display_name="Test survivor",
+            is_host=True,
+            ready_at=None,
+            invited_at=None,
+            joined_at=None,
+            left_at=None,
+            is_eliminated=False,
+            card=card,
+            revealed_stats=(),
+            used_special_action=False,
+            immune_round=None,
+            is_fake=True,
+        )
+
+        embed = _public_specials_embed(game, [player])
+        names = "\n".join(field.name for field in embed.fields)
+
+        self.assertIn(card.special_abilities[0].name, names)
+        self.assertIn(card.special_abilities[1].name, names)
+        self.assertIn("Админ-игра", embed.description)
+
+    def test_public_specials_embed_keeps_ranked_hidden_abilities_private(self) -> None:
+        card = generate_card()
+        game = BunkerGame(
+            id=55,
+            guild_id=100,
+            setup_id=10,
+            setup_channel_id=300,
+            setup_message_id=500,
+            category_id=None,
+            game_text_channel_id=700,
+            voice_channel_id=800,
+            host_id=201,
+            state=GameState.REVEAL_PHASE,
+            settings=BunkerSettings(),
+            round_number=1,
+            phase_started_at=None,
+            phase_ends_at=None,
+            paused_at=None,
+            board_message_id=None,
+            profile=None,
+            turn_order=(201,),
+        )
+        player = BunkerPlayer(
+            game_id=55,
+            user_id=201,
+            display_name="Player",
+            is_host=True,
+            ready_at=None,
+            invited_at=None,
+            joined_at=None,
+            left_at=None,
+            is_eliminated=False,
+            card=card,
+            revealed_stats=(),
+            used_special_action=False,
+            immune_round=None,
+        )
+
+        embed = _public_specials_embed(game, [player])
+        names = "\n".join(field.name for field in embed.fields)
+
+        self.assertNotIn(card.special_abilities[0].name, names)
+        self.assertNotIn(card.special_abilities[1].name, names)
 
     def test_public_ability_view_has_two_gray_buttons(self) -> None:
         game = BunkerGame(

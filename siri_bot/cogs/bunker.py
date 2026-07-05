@@ -3653,22 +3653,28 @@ def _public_personal_embed(game: BunkerGame, players: list[BunkerPlayer]) -> dis
     if player is None:
         embed.description = "Сейчас нет активного reveal-хода."
         return embed
+    show_private_data = _public_can_show_current_player_private_data(game, player)
     required = required_stats_for_round(game.round_number)
     remaining = revealable_stats_for_round(player, game.round_number)
     opened = len(required) - len(remaining)
     round_labels = ", ".join(CARD_STAT_LABELS[stat] for stat in required) or "нет обязательных характеристик"
+    privacy_hint = (
+        "Админ-игра: карточка тестового игрока показана полностью."
+        if show_private_data
+        else "Полная личная карточка доступна приватно по кнопке ниже."
+    )
     embed.description = (
         f"Ход: {format_player_name(player)}\n"
         f"В этом раунде открываются: {round_labels}\n"
         f"Раскрыто за ход: {opened}/{len(required)}\n"
-        "Полная личная карточка доступна приватно по кнопке ниже."
+        f"{privacy_hint}"
     )
     for stat in REVEALABLE_STATS:
-        if player.card is not None and stat in player.revealed_stats:
+        if player.card is not None and (show_private_data or stat in player.revealed_stats):
             value = str(getattr(player.card, stat))
         else:
             value = "?"
-        marker = "открыто" if stat in player.revealed_stats else "скрыто"
+        marker = "видно" if show_private_data and stat not in player.revealed_stats else ("открыто" if stat in player.revealed_stats else "скрыто")
         embed.add_field(name=CARD_STAT_LABELS[stat], value=f"{_limit_embed_value(value, 180)}\n`{marker}`", inline=True)
     return embed
 
@@ -3680,6 +3686,9 @@ def _public_specials_embed(game: BunkerGame, players: list[BunkerPlayer]) -> dis
         embed.description = "Сейчас нет активного игрока для спец. возможностей."
         return embed
     embed.description = f"Активный игрок: {format_player_name(player)}"
+    show_private_data = _public_can_show_current_player_private_data(game, player)
+    if show_private_data:
+        embed.description += "\nАдмин-игра: спец. возможности тестового игрока показаны полностью."
     abilities = tuple(player.card.special_abilities[:2]) if player.card else ()
     for index in range(2):
         ability = abilities[index] if index < len(abilities) else None
@@ -3687,7 +3696,7 @@ def _public_specials_embed(game: BunkerGame, players: list[BunkerPlayer]) -> dis
             embed.add_field(name=f"{index + 1}. Способность", value="?", inline=False)
             continue
         status = _ability_status(player, ability)
-        if not ability.revealed:
+        if not ability.revealed and not show_private_data:
             embed.add_field(name=f"{index + 1}. Способность", value=f"Статус: `{status}`", inline=False)
             continue
         embed.add_field(
@@ -3776,6 +3785,10 @@ def _ability_status(player: BunkerPlayer, ability: Any) -> str:
     if getattr(ability, "revealed", False):
         return "раскрыта"
     return "скрыта"
+
+
+def _public_can_show_current_player_private_data(game: BunkerGame, player: BunkerPlayer) -> bool:
+    return bool(game.is_admin_game or game.room_kind == RoomKind.ADMIN_TEST or player.is_fake)
 
 
 def _short_cell(value: str, *, limit: int = 18) -> str:
