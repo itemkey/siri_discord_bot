@@ -200,6 +200,63 @@ class BunkerCogTests(unittest.TestCase):
         self.assertEqual(buttons[0].label, "Панель")
         self.assertEqual(buttons[0].custom_id, GAME_PANEL_ID)
 
+    def test_public_panel_button_reopens_current_response_instead_of_hidden_saved_panel(self) -> None:
+        game = BunkerGame(
+            id=55,
+            guild_id=100,
+            setup_id=10,
+            setup_channel_id=300,
+            setup_message_id=500,
+            category_id=None,
+            game_text_channel_id=300,
+            voice_channel_id=800,
+            host_id=200,
+            state=GameState.LOBBY,
+            settings=BunkerSettings(),
+            round_number=0,
+            phase_started_at=None,
+            phase_ends_at=None,
+            paused_at=None,
+            board_message_id=None,
+            profile=None,
+        )
+        host = BunkerPlayer(
+            game_id=55,
+            user_id=200,
+            display_name="Host",
+            is_host=True,
+            ready_at=None,
+            invited_at=None,
+            joined_at=None,
+            left_at=None,
+            is_eliminated=False,
+            card=None,
+            revealed_stats=(),
+            used_special_action=False,
+            immune_round=None,
+        )
+        hidden = FakeMessage(700)
+        cog = Bunker.__new__(Bunker)
+        cog.repository = type(
+            "Repo",
+            (),
+            {
+                "get_active_game_by_text_channel": AsyncMock(return_value=game),
+                "list_players": AsyncMock(return_value=[host]),
+            },
+        )()
+        cog._is_bunker_operator = AsyncMock(return_value=False)
+        cog._is_bunker_admin_or_operator = AsyncMock(return_value=False)
+        cog._game_private_panels = {(55, 300, 200): hidden}
+        interaction = FakeInteraction(message=FakeMessage(500), original_message=FakeMessage(900))
+
+        asyncio.run(cog.open_game_panel(interaction))
+
+        hidden.edit.assert_not_called()
+        interaction.response.defer.assert_awaited_once()
+        interaction.edit_original_response.assert_awaited_once()
+        self.assertIs(cog._game_private_panels[(55, 300, 200)], interaction.original_message)
+
     def test_public_section_view_uses_persistent_custom_ids(self) -> None:
         view = BunkerPublicSectionView(cog=object(), game_id=55, key="players", collapsed=False)
         buttons = [child for child in view.children if isinstance(child, discord.ui.Button)]
@@ -315,15 +372,63 @@ class BunkerCogTests(unittest.TestCase):
         interaction.followup.send.assert_not_called()
         saved.edit.assert_awaited_once()
 
+    def test_setup_build_statuses_replace_current_response_without_duplicate(self) -> None:
+        setup = RoomSetup(
+            id=10,
+            guild_id=100,
+            setup_channel_id=300,
+            category_id=None,
+            setup_message_id=500,
+            room_name="build-a-bunker",
+            active_game_id=None,
+        )
+        cog = Bunker.__new__(Bunker)
+        cog.repository = FakeBunkerRepository(setup)
+        cog._setup_private_panels = {}
+        interaction = FakeInteraction(message=FakeMessage(500), original_message=FakeMessage(900))
+
+        asyncio.run(cog.send_or_edit_setup_status(interaction, setup, "Строю.", prefer_current_response=True))
+        asyncio.run(cog.send_or_edit_setup_status(interaction, setup, "Готово.", prefer_current_response=True))
+
+        interaction.response.defer.assert_awaited_once()
+        interaction.response.send_message.assert_not_called()
+        interaction.followup.send.assert_not_called()
+        self.assertEqual(interaction.edit_original_response.await_count + interaction.original_message.edit.await_count, 2)
+        self.assertIs(cog._setup_private_panels[(10, 300, 200)], interaction.original_message)
+
+    def test_setup_build_status_falls_back_to_current_response_when_saved_message_expired(self) -> None:
+        setup = RoomSetup(
+            id=10,
+            guild_id=100,
+            setup_channel_id=300,
+            category_id=None,
+            setup_message_id=500,
+            room_name="build-a-bunker",
+            active_game_id=None,
+        )
+        expired = FakeMessage(800)
+        response = type("Response", (), {"status": 404, "reason": "not found"})()
+        expired.edit.side_effect = discord.HTTPException(response, "expired")
+        cog = Bunker.__new__(Bunker)
+        cog.repository = FakeBunkerRepository(setup)
+        cog._setup_private_panels = {(10, 300, 200): expired}
+        interaction = FakeInteraction(message=FakeMessage(500), original_message=FakeMessage(900))
+
+        asyncio.run(cog.send_or_edit_setup_status(interaction, setup, "Готово.", prefer_current_response=True))
+
+        interaction.response.defer.assert_awaited_once()
+        expired.edit.assert_awaited_once()
+        interaction.edit_original_response.assert_awaited_once()
+        interaction.followup.send.assert_not_called()
+        self.assertIs(cog._setup_private_panels[(10, 300, 200)], interaction.original_message)
+
     def test_settings_view_uses_select_only_main_page(self) -> None:
         view = BunkerSettingsView(cog=object(), setup_id=1, user_id=2, settings=BunkerSettings())
         labels = [child.label for child in view.children if isinstance(child, discord.ui.Button)]
         selects = [child for child in view.children if isinstance(child, discord.ui.Select)]
 
-        self.assertEqual(labels, [])
-        self.assertEqual(len(selects), 5)
-        section_select = next(select for select in selects if str(select.placeholder).startswith("Раздел настроек"))
-        self.assertEqual([option.value for option in section_select.options], ["settings", "settings_rules", "content", "rules"])
+        self.assertEqual(labels, ["Правила/таймеры", "Контент", "Как играть", "Назад к панели"])
+        self.assertEqual(len(selects), 4)
         self.assertNotIn("Тип комнаты", labels)
         room_kind_select = next(select for select in selects if str(select.placeholder).startswith("Тип комнаты"))
         self.assertEqual([option.value for option in room_kind_select.options], [RoomKind.RANKED.value])
@@ -338,8 +443,8 @@ class BunkerCogTests(unittest.TestCase):
         labels = [child.label for child in view.children if isinstance(child, discord.ui.Button)]
         selects = [child for child in view.children if isinstance(child, discord.ui.Select)]
 
-        self.assertEqual(labels, [])
-        self.assertEqual(len(selects), 5)
+        self.assertEqual(labels, ["Основные", "Контент", "Как играть", "Назад к панели"])
+        self.assertEqual(len(selects), 4)
         reveal_select = next(select for select in selects if str(select.placeholder).startswith("Reveal-ход"))
         self.assertEqual([option.value for option in reveal_select.options], ["1", "2", "3"])
         self.assertIn("1 характеристика за ход", [option.label for option in reveal_select.options])
@@ -542,7 +647,7 @@ class BunkerCogTests(unittest.TestCase):
         selects = [child for child in view.children if isinstance(child, discord.ui.Select)]
         self.assertNotIn("Тип комнаты", labels)
         self.assertTrue(any(str(select.placeholder).startswith("Тип комнаты") for select in selects))
-        self.assertTrue(any(str(select.placeholder).startswith("Раздел настроек") for select in selects))
+        self.assertIn("Назад к панели", labels)
 
     def test_ranked_active_panel_hides_debug_operator_controls(self) -> None:
         game = BunkerGame(
@@ -781,10 +886,11 @@ class BunkerCogTests(unittest.TestCase):
             if button.style == discord.ButtonStyle.secondary and button.disabled
         ]
 
-        self.assertEqual(len(buttons), 10)
+        self.assertEqual(len(buttons), 11)
         self.assertEqual(len(hidden_buttons), 9)
         self.assertTrue(all(not button.disabled for button in hidden_buttons))
         self.assertEqual(len(revealed_buttons), 1)
+        self.assertTrue(any(button.label == "Назад к панели" for button in buttons))
 
     def test_public_personal_embed_keeps_admin_test_fake_values_private(self) -> None:
         card = generate_card()
