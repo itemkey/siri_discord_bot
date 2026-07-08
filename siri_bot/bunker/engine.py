@@ -339,7 +339,8 @@ def should_enter_final(game: BunkerGame, players: list[BunkerPlayer]) -> bool:
 
 def next_state_after_timer(state: GameState) -> GameState:
     transitions = {
-        GameState.SPEECH_PHASE: GameState.DISCUSSION_PHASE,
+        GameState.SPEECH_PHASE: GameState.SPEECH_PAUSE,
+        GameState.SPEECH_PAUSE: GameState.SPEECH_PHASE,
         GameState.DISCUSSION_PHASE: GameState.CHAOS_PHASE,
         GameState.CHAOS_PHASE: GameState.VOTING_PHASE,
         GameState.VOTING_PHASE: GameState.ELIMINATION_PHASE,
@@ -355,6 +356,7 @@ def phase_deadline(settings: BunkerSettings, state: GameState, now: datetime | N
 
     seconds_by_state = {
         GameState.SPEECH_PHASE: settings.speech_seconds,
+        GameState.SPEECH_PAUSE: 15,
         GameState.DISCUSSION_PHASE: settings.discussion_seconds,
         GameState.CHAOS_PHASE: max(30, settings.timer_seconds // 2),
         GameState.VOTING_PHASE: settings.voting_seconds,

@@ -19,6 +19,7 @@ class GameState(StrEnum):
     PREPARING = "preparing"
     REVEAL_PHASE = "reveal_phase"
     SPEECH_PHASE = "speech_phase"
+    SPEECH_PAUSE = "speech_pause"
     DISCUSSION_PHASE = "discussion_phase"
     CHAOS_PHASE = "chaos_phase"
     VOTING_PHASE = "voting_phase"

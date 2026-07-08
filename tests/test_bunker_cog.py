@@ -3,12 +3,15 @@ from __future__ import annotations
 import asyncio
 import unittest
 from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from unittest.mock import ANY, AsyncMock
 
 import discord
 
 from siri_bot.cogs.bunker import (
+    GAME_FINISH_SPEECH_ID,
     GAME_PANEL_ID,
+    PUBLIC_REVEAL_SELF_ID,
     PUBLIC_SECTION_REFRESH_ID,
     PUBLIC_SECTION_TOGGLE_ID,
     Bunker,
@@ -21,6 +24,8 @@ from siri_bot.cogs.bunker import (
     BunkerSettingsView,
     BunkerSetupIdleView,
     BunkerSetupNavView,
+    _game_embed,
+    _leader_view_for_game,
     format_player_name,
     _abilities_table_embed,
     _missing_setup_panel_permissions,
@@ -39,7 +44,8 @@ class FakeGuild:
 
 
 class FakeUser:
-    id = 200
+    def __init__(self, user_id: int = 200) -> None:
+        self.id = user_id
 
 
 class FakeChannel:
@@ -81,9 +87,10 @@ class FakeInteraction:
         message: FakeMessage | None = None,
         original_message: FakeMessage | None = None,
         followup_message: FakeMessage | None = None,
+        user_id: int = 200,
     ) -> None:
         self.guild = FakeGuild()
-        self.user = FakeUser()
+        self.user = FakeUser(user_id)
         self.channel = FakeChannel()
         self.response = FakeResponse()
         self.message = message or FakeMessage(500)
@@ -123,6 +130,8 @@ class FakeRevealRepository:
         self.get_game_by_public_message = AsyncMock(side_effect=self._get_game_by_public_message)
         self.list_players = AsyncMock(side_effect=self._list_players)
         self.reveal_stat = AsyncMock(side_effect=self._reveal_stat)
+        self.assign_cards = AsyncMock(side_effect=self._assign_cards)
+        self.get_enabled_content_pack = AsyncMock(return_value=None)
         self.add_event = AsyncMock()
         self.set_reveal_progress = AsyncMock(side_effect=self._set_reveal_progress)
         self.set_speech_index = AsyncMock(side_effect=self._set_speech_index)
@@ -141,6 +150,14 @@ class FakeRevealRepository:
         self.players = [
             replace(player, revealed_stats=(*player.revealed_stats, stat))
             if player.user_id == user_id and stat not in player.revealed_stats
+            else player
+            for player in self.players
+        ]
+
+    async def _assign_cards(self, game_id: int, cards: dict[int, object]) -> None:
+        self.players = [
+            replace(player, card=cards[player.user_id])
+            if player.user_id in cards
             else player
             for player in self.players
         ]
@@ -200,6 +217,41 @@ class BunkerCogTests(unittest.TestCase):
         self.assertEqual(len(buttons), 1)
         self.assertEqual(buttons[0].label, "Панель")
         self.assertEqual(buttons[0].custom_id, GAME_PANEL_ID)
+
+    def test_public_game_view_can_show_finish_speech_button_for_leader(self) -> None:
+        view = BunkerPublicGameView(cog=object(), show_finish_speech=True)
+        buttons = [child for child in view.children if isinstance(child, discord.ui.Button)]
+
+        self.assertEqual([button.custom_id for button in buttons], [GAME_PANEL_ID, GAME_FINISH_SPEECH_ID])
+
+    def test_leader_view_shows_finish_speech_only_during_speech_phase(self) -> None:
+        base_game = BunkerGame(
+            id=55,
+            guild_id=100,
+            setup_id=10,
+            setup_channel_id=300,
+            setup_message_id=500,
+            category_id=None,
+            game_text_channel_id=700,
+            voice_channel_id=800,
+            host_id=200,
+            state=GameState.SPEECH_PHASE,
+            settings=BunkerSettings(),
+            round_number=1,
+            phase_started_at=None,
+            phase_ends_at=None,
+            paused_at=None,
+            board_message_id=None,
+            profile=None,
+        )
+
+        speech_view = _leader_view_for_game(object(), base_game)
+        pause_view = _leader_view_for_game(object(), replace(base_game, state=GameState.SPEECH_PAUSE))
+        speech_ids = [child.custom_id for child in speech_view.children if isinstance(child, discord.ui.Button)]
+        pause_ids = [child.custom_id for child in pause_view.children if isinstance(child, discord.ui.Button)]
+
+        self.assertIn(GAME_FINISH_SPEECH_ID, speech_ids)
+        self.assertNotIn(GAME_FINISH_SPEECH_ID, pause_ids)
 
     def test_public_panel_button_reopens_current_response_instead_of_hidden_saved_panel(self) -> None:
         game = BunkerGame(
@@ -679,6 +731,206 @@ class BunkerCogTests(unittest.TestCase):
         self.assertNotIn("Раскрыть стату", labels)
         self.assertNotIn("Голосовать", labels)
 
+    def test_speech_turn_advances_to_handoff_pause_before_next_speaker(self) -> None:
+        now = datetime(2026, 7, 8, 12, 0, tzinfo=UTC)
+        game = BunkerGame(
+            id=55,
+            guild_id=100,
+            setup_id=10,
+            setup_channel_id=300,
+            setup_message_id=500,
+            category_id=None,
+            game_text_channel_id=700,
+            voice_channel_id=800,
+            host_id=200,
+            state=GameState.SPEECH_PHASE,
+            settings=BunkerSettings(speech_seconds=60, explain_for_newbies=False),
+            round_number=1,
+            phase_started_at=now - timedelta(seconds=60),
+            phase_ends_at=now,
+            paused_at=None,
+            board_message_id=None,
+            profile=None,
+            speech_index=0,
+            turn_order=(200, 201),
+        )
+        players = [
+            BunkerPlayer(55, 200, "Host", True, None, None, None, None, False, generate_card(), (), False, None),
+            BunkerPlayer(55, 201, "Player", False, None, None, None, None, False, generate_card(), (), False, None),
+        ]
+        repository = FakeRevealRepository(game, players)
+        cog = Bunker.__new__(Bunker)
+        cog.repository = repository
+        cog.refresh_game_message = AsyncMock()
+
+        asyncio.run(cog._advance_speech_turn(game, now=now))
+
+        self.assertEqual(repository.game.state, GameState.SPEECH_PAUSE)
+        self.assertEqual(repository.game.speech_index, 1)
+        self.assertEqual(repository.game.phase_ends_at, now + timedelta(seconds=15))
+        cog.refresh_game_message.assert_awaited_once_with(55)
+
+    def test_private_panel_does_not_show_finish_speech_button(self) -> None:
+        now = datetime(2026, 7, 8, 12, 0, tzinfo=UTC)
+        game = BunkerGame(
+            id=55,
+            guild_id=100,
+            setup_id=10,
+            setup_channel_id=300,
+            setup_message_id=500,
+            category_id=None,
+            game_text_channel_id=700,
+            voice_channel_id=800,
+            host_id=200,
+            state=GameState.SPEECH_PHASE,
+            settings=BunkerSettings(speech_seconds=60, explain_for_newbies=False),
+            round_number=1,
+            phase_started_at=now - timedelta(seconds=5),
+            phase_ends_at=now + timedelta(seconds=55),
+            paused_at=None,
+            board_message_id=None,
+            profile=None,
+            speech_index=0,
+            turn_order=(200,),
+        )
+        player = BunkerPlayer(55, 200, "Host", True, None, None, None, None, False, generate_card(), (), False, None)
+
+        view = BunkerPrivatePlayerPanelView(object(), game, player, is_operator=False, can_close=True, players=[player])
+        labels = [child.label for child in view.children if isinstance(child, discord.ui.Button)]
+
+        self.assertNotIn("Закончить речь", labels)
+
+    def test_public_finish_speech_button_advances_without_editing_leader_message(self) -> None:
+        now = datetime(2026, 7, 8, 12, 0, tzinfo=UTC)
+        game = BunkerGame(
+            id=55,
+            guild_id=100,
+            setup_id=10,
+            setup_channel_id=300,
+            setup_message_id=500,
+            category_id=None,
+            game_text_channel_id=300,
+            voice_channel_id=800,
+            host_id=200,
+            state=GameState.SPEECH_PHASE,
+            settings=BunkerSettings(speech_seconds=60, explain_for_newbies=False),
+            round_number=1,
+            phase_started_at=now - timedelta(seconds=5),
+            phase_ends_at=now + timedelta(seconds=55),
+            paused_at=None,
+            board_message_id=None,
+            profile=None,
+            speech_index=0,
+            turn_order=(200,),
+        )
+        player = BunkerPlayer(55, 200, "Host", True, None, None, None, None, False, generate_card(), (), False, None)
+        repository = FakeRevealRepository(game, [player])
+        repository.get_active_game_by_text_channel = AsyncMock(return_value=game)
+        cog = Bunker.__new__(Bunker)
+        cog.repository = repository
+        cog.refresh_game_message = AsyncMock()
+        interaction = FakeInteraction(message=FakeMessage(900), user_id=200)
+
+        asyncio.run(cog.public_finish_speech(interaction))
+
+        repository.add_event.assert_awaited_once()
+        interaction.response.send_message.assert_awaited_once()
+        interaction.response.edit_message.assert_not_awaited()
+
+    def test_speech_pause_starts_next_speaker_with_fresh_timer(self) -> None:
+        now = datetime(2026, 7, 8, 12, 0, tzinfo=UTC)
+        game = BunkerGame(
+            id=55,
+            guild_id=100,
+            setup_id=10,
+            setup_channel_id=300,
+            setup_message_id=500,
+            category_id=None,
+            game_text_channel_id=700,
+            voice_channel_id=800,
+            host_id=200,
+            state=GameState.SPEECH_PAUSE,
+            settings=BunkerSettings(speech_seconds=60),
+            round_number=1,
+            phase_started_at=now - timedelta(seconds=15),
+            phase_ends_at=now,
+            paused_at=None,
+            board_message_id=None,
+            profile=None,
+            speech_index=1,
+            turn_order=(200, 201),
+        )
+        repository = FakeRevealRepository(game, [])
+        cog = Bunker.__new__(Bunker)
+        cog.repository = repository
+        cog.refresh_game_message = AsyncMock()
+
+        asyncio.run(cog.advance_phase(game, now=now))
+
+        self.assertEqual(repository.game.state, GameState.SPEECH_PHASE)
+        self.assertEqual(repository.game.phase_ends_at, now + timedelta(seconds=60))
+        cog.refresh_game_message.assert_awaited_once_with(55)
+
+    def test_game_embed_never_formats_expired_timer_as_relative_past(self) -> None:
+        now = datetime.now(UTC)
+        game = BunkerGame(
+            id=55,
+            guild_id=100,
+            setup_id=10,
+            setup_channel_id=300,
+            setup_message_id=500,
+            category_id=None,
+            game_text_channel_id=700,
+            voice_channel_id=800,
+            host_id=200,
+            state=GameState.SPEECH_PHASE,
+            settings=BunkerSettings(),
+            round_number=1,
+            phase_started_at=now - timedelta(seconds=72),
+            phase_ends_at=now - timedelta(seconds=12),
+            paused_at=None,
+            board_message_id=None,
+            profile=None,
+            turn_order=(200,),
+        )
+        player = BunkerPlayer(55, 200, "Host", True, None, None, None, None, False, generate_card(), (), False, None)
+
+        embed = _game_embed(game, [player])
+
+        self.assertIn("...", embed.description)
+        self.assertNotIn("<t:", embed.description)
+
+    def test_overdue_phase_advances_before_board_render(self) -> None:
+        now = datetime(2026, 7, 8, 12, 0, tzinfo=UTC)
+        game = BunkerGame(
+            id=55,
+            guild_id=100,
+            setup_id=10,
+            setup_channel_id=300,
+            setup_message_id=500,
+            category_id=None,
+            game_text_channel_id=700,
+            voice_channel_id=800,
+            host_id=200,
+            state=GameState.SPEECH_PHASE,
+            settings=BunkerSettings(),
+            round_number=1,
+            phase_started_at=now - timedelta(seconds=72),
+            phase_ends_at=now - timedelta(seconds=12),
+            paused_at=None,
+            board_message_id=None,
+            profile=None,
+        )
+        fresh = replace(game, state=GameState.SPEECH_PAUSE, phase_ends_at=now + timedelta(seconds=15))
+        cog = Bunker.__new__(Bunker)
+        cog.repository = type("Repo", (), {"get_game": AsyncMock(return_value=fresh)})()
+        cog.advance_phase = AsyncMock()
+
+        result = asyncio.run(cog._advance_overdue_phase_if_needed(game, now=now))
+
+        cog.advance_phase.assert_awaited_once_with(game, now=now)
+        self.assertIs(result, fresh)
+
     def test_lobby_settings_panel_returns_editable_view(self) -> None:
         game = BunkerGame(
             id=55,
@@ -823,10 +1075,11 @@ class BunkerCogTests(unittest.TestCase):
             if button.style == discord.ButtonStyle.secondary and button.disabled
         ]
 
-        self.assertEqual(len(buttons), 10)
+        self.assertEqual(len(buttons), 11)
         self.assertEqual(len(hidden_buttons), 9)
         self.assertTrue(all(not button.disabled for button in hidden_buttons))
         self.assertEqual(len(revealed_buttons), 1)
+        self.assertIn(PUBLIC_REVEAL_SELF_ID, [button.custom_id for button in buttons])
         self.assertFalse(any(button.label == "Моя карточка" for button in buttons))
 
     def test_public_personal_embed_lists_round_stats_together(self) -> None:
@@ -1114,6 +1367,105 @@ class BunkerCogTests(unittest.TestCase):
         repository.reveal_stat.assert_not_awaited()
         interaction.followup.send.assert_awaited_once()
 
+    def test_public_reveal_self_button_shows_full_card_only_to_current_player(self) -> None:
+        game = BunkerGame(
+            id=55,
+            guild_id=100,
+            setup_id=10,
+            setup_channel_id=300,
+            setup_message_id=500,
+            category_id=None,
+            game_text_channel_id=300,
+            voice_channel_id=800,
+            host_id=200,
+            state=GameState.REVEAL_PHASE,
+            settings=BunkerSettings(),
+            round_number=1,
+            phase_started_at=None,
+            phase_ends_at=None,
+            paused_at=None,
+            board_message_id=None,
+            profile=None,
+            turn_order=(200,),
+        )
+        player = BunkerPlayer(
+            game_id=55,
+            user_id=200,
+            display_name="Player",
+            is_host=True,
+            ready_at=None,
+            invited_at=None,
+            joined_at=None,
+            left_at=None,
+            is_eliminated=False,
+            card=generate_card(),
+            revealed_stats=(),
+            used_special_action=False,
+            immune_round=None,
+        )
+        repository = FakeRevealRepository(game, [player])
+        cog = Bunker.__new__(Bunker)
+        cog.repository = repository
+        cog._game_private_panels = {}
+        interaction = FakeInteraction(message=FakeMessage(900), original_message=FakeMessage(901), user_id=200)
+
+        asyncio.run(cog.public_show_current_reveal_card(interaction))
+
+        repository.reveal_stat.assert_not_awaited()
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+        interaction.edit_original_response.assert_awaited_once()
+        kwargs = interaction.edit_original_response.await_args.kwargs
+        self.assertIn(player.card.profession, kwargs["embed"].description)
+        self.assertIsInstance(kwargs["view"], BunkerRevealView)
+
+    def test_public_reveal_self_button_rejects_other_players(self) -> None:
+        game = BunkerGame(
+            id=55,
+            guild_id=100,
+            setup_id=10,
+            setup_channel_id=300,
+            setup_message_id=500,
+            category_id=None,
+            game_text_channel_id=300,
+            voice_channel_id=800,
+            host_id=201,
+            state=GameState.REVEAL_PHASE,
+            settings=BunkerSettings(),
+            round_number=1,
+            phase_started_at=None,
+            phase_ends_at=None,
+            paused_at=None,
+            board_message_id=None,
+            profile=None,
+            turn_order=(201,),
+        )
+        player = BunkerPlayer(
+            game_id=55,
+            user_id=201,
+            display_name="Player",
+            is_host=True,
+            ready_at=None,
+            invited_at=None,
+            joined_at=None,
+            left_at=None,
+            is_eliminated=False,
+            card=generate_card(),
+            revealed_stats=(),
+            used_special_action=False,
+            immune_round=None,
+        )
+        repository = FakeRevealRepository(game, [player])
+        cog = Bunker.__new__(Bunker)
+        cog.repository = repository
+        cog._game_private_panels = {}
+        interaction = FakeInteraction(message=FakeMessage(900), user_id=200)
+
+        asyncio.run(cog.public_show_current_reveal_card(interaction))
+
+        interaction.response.send_message.assert_awaited_once()
+        interaction.edit_original_response.assert_not_awaited()
+        repository.reveal_stat.assert_not_awaited()
+
     def test_auto_reveal_fake_player_opens_random_stat_and_advances_to_real_player(self) -> None:
         game = BunkerGame(
             id=55,
@@ -1244,6 +1596,61 @@ class BunkerCogTests(unittest.TestCase):
         self.assertEqual(repository.add_event.await_count, 2)
         self.assertEqual(repository.game.current_turn_index, 1)
         self.assertEqual(len(repository.players[0].revealed_stats), 2)
+
+    def test_auto_reveal_fake_players_assigns_missing_cards_before_revealing(self) -> None:
+        fake_ids = tuple(-1000 - index for index in range(1, 8))
+        game = BunkerGame(
+            id=55,
+            guild_id=100,
+            setup_id=10,
+            setup_channel_id=300,
+            setup_message_id=500,
+            category_id=None,
+            game_text_channel_id=700,
+            voice_channel_id=800,
+            host_id=200,
+            state=GameState.REVEAL_PHASE,
+            settings=BunkerSettings(room_kind=RoomKind.ADMIN_TEST, is_ranked=False, min_players=1),
+            round_number=1,
+            phase_started_at=None,
+            phase_ends_at=None,
+            paused_at=None,
+            board_message_id=None,
+            profile=None,
+            turn_order=fake_ids,
+            is_admin_game=True,
+            room_kind=RoomKind.ADMIN_TEST,
+        )
+        players = [
+            BunkerPlayer(
+                game_id=55,
+                user_id=user_id,
+                display_name=f"Test survivor {index}",
+                is_host=False,
+                ready_at=None,
+                invited_at=None,
+                joined_at=None,
+                left_at=None,
+                is_eliminated=False,
+                card=generate_card() if index <= 4 else None,
+                revealed_stats=(),
+                used_special_action=False,
+                immune_round=None,
+                is_fake=True,
+            )
+            for index, user_id in enumerate(fake_ids, start=1)
+        ]
+        repository = FakeRevealRepository(game, players)
+        cog = Bunker.__new__(Bunker)
+        cog.repository = repository
+
+        asyncio.run(cog._auto_reveal_fake_turns(game.id))
+
+        self.assertEqual(repository.reveal_stat.await_count, 7)
+        self.assertEqual(repository.assign_cards.await_count, 3)
+        self.assertTrue(all(player.card is not None for player in repository.players))
+        self.assertTrue(all(len(player.revealed_stats) == 1 for player in repository.players))
+        self.assertEqual(repository.game.state, GameState.SPEECH_PHASE)
 
     def test_public_specials_embed_shows_admin_test_fake_abilities(self) -> None:
         card = generate_card()
@@ -1448,10 +1855,15 @@ class BunkerCogTests(unittest.TestCase):
         embed = _players_table_embed(game, players)
 
         self.assertNotIn("```text", embed.description or "")
-        self.assertEqual(len(embed.fields), 8)
-        self.assertTrue(all("\n" in field.value for field in embed.fields))
-        self.assertIn("1. Player 1 · жив", embed.fields[0].name)
-        self.assertNotIn("host", embed.fields[0].name)
+        self.assertEqual(len(embed.fields), 11)
+        self.assertTrue(all("\n" in field.value for field in embed.fields[3:]))
+        self.assertEqual(embed.fields[0].name, "Мест в бункере")
+        player_fields = embed.fields[3:]
+        self.assertEqual(len(player_fields), 8)
+        self.assertEqual(player_fields[0].name, "1. Player 1")
+        self.assertIn("Статус:", player_fields[0].value)
+        self.assertIn("Открыто:", player_fields[0].value)
+        self.assertNotIn("host", player_fields[0].name)
 
     def test_admin_test_lobby_shows_test_controls_only_to_operator(self) -> None:
         game = BunkerGame(

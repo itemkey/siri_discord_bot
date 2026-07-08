@@ -27,6 +27,7 @@ from siri_bot.bunker.engine import (
     can_start_game,
     final_epilogue,
     format_card,
+    generate_card,
     generate_profile,
     normalize_settings,
     phase_deadline,
@@ -85,17 +86,21 @@ GAME_PANEL_ID = "siri:bunker:game:panel"
 PUBLIC_SECTION_TOGGLE_ID = "siri:bunker:section:toggle"
 PUBLIC_SECTION_REFRESH_ID = "siri:bunker:section:refresh"
 PUBLIC_REVEAL_STAT_PREFIX = "siri:bunker:public:reveal:"
+PUBLIC_REVEAL_SELF_ID = "siri:bunker:public:reveal:self"
 PUBLIC_ABILITY_PREFIX = "siri:bunker:public:ability:"
 GAME_JOIN_ID = "siri:bunker:game:join"
 GAME_READY_ID = "siri:bunker:game:ready"
 GAME_START_ID = "siri:bunker:game:start"
 GAME_LEAVE_ID = "siri:bunker:game:leave"
+GAME_FINISH_SPEECH_ID = "siri:bunker:game:finish_speech"
 GAME_CARD_ID = "siri:bunker:game:card"
 GAME_REVEAL_ID = "siri:bunker:game:reveal"
 GAME_ACTION_ID = "siri:bunker:game:action"
 GAME_VOTE_ID = "siri:bunker:game:vote"
 GAME_RULES_ID = "siri:bunker:game:rules"
 GAME_CHAOS_ID = "siri:bunker:game:chaos"
+
+SPEECH_HANDOFF_SECONDS = 15
 
 
 class Bunker(commands.Cog):
@@ -117,7 +122,7 @@ class Bunker(commands.Cog):
         self._game_private_panels: dict[tuple[int, int, int], Any] = {}
         self._admin_private_panels: dict[tuple[int, int, int], Any] = {}
         self.bot.add_view(BunkerSetupIdleView(self))
-        self.bot.add_view(BunkerPublicGameView(self))
+        self.bot.add_view(BunkerPublicGameView(self, show_finish_speech=True))
         self.bot.add_view(BunkerPublicSectionView(self))
         self.bot.add_view(BunkerPublicRevealView(self))
         self.bot.add_view(BunkerPublicAbilityView(self))
@@ -946,19 +951,35 @@ class Bunker(commands.Cog):
         if game is None:
             await interaction.response.edit_message(embed=_status_embed("Партия не найдена."), view=None)
             return
-        if game.state != GameState.SPEECH_PHASE:
-            await interaction.response.edit_message(embed=_status_embed("Это действие больше не доступно."), view=BunkerPanelBackView(self, game_id))
+        ok, message = await self._finish_speech_turn_for_user(game, interaction.user.id)
+        if not ok:
+            await interaction.response.edit_message(embed=_status_embed(message), view=BunkerPanelBackView(self, game_id))
             return
+
+        fresh = await self.repository.get_game(game.id) or game
+        await self.update_current_game_panel(interaction, fresh, status=message)
+
+    async def public_finish_speech(self, interaction: discord.Interaction) -> None:
+        game = await self._game_from_interaction_channel(interaction)
+        if game is None:
+            await interaction.response.send_message("Эта кнопка работает в игровом text-канале бункера.", ephemeral=True)
+            return
+
+        ok, message = await self._finish_speech_turn_for_user(game, interaction.user.id)
+        await interaction.response.send_message(message, ephemeral=True)
+
+    async def _finish_speech_turn_for_user(self, game: BunkerGame, user_id: int) -> tuple[bool, str]:
+        if game.state != GameState.SPEECH_PHASE:
+            return False, "Это действие больше не доступно."
+
         players = await self.repository.list_players(game.id)
         speaker = _current_ordered_player(game, players, kind="speech")
-        if speaker is None or speaker.user_id != interaction.user.id:
-            await interaction.response.edit_message(embed=_status_embed("Закончить речь может только текущий говорящий."), view=BunkerPanelBackView(self, game_id))
-            return
+        if speaker is None or speaker.user_id != user_id:
+            return False, "Закончить речь может только текущий говорящий."
 
         await self.repository.add_event(game.id, game.round_number, "speech", f"{format_player_name(speaker)} завершает речь.")
         await self._advance_speech_turn(game)
-        fresh = await self.repository.get_game(game.id) or game
-        await self.update_current_game_panel(interaction, fresh, status="Речь завершена.")
+        return True, "Речь завершена."
 
     async def panel_reveal_all(self, interaction: discord.Interaction, game_id: int, user_id: int) -> None:
         if interaction.user.id != user_id:
@@ -1444,6 +1465,46 @@ class Bunker(commands.Cog):
         await self.refresh_game_message(game.id)
         await interaction.followup.send("Раскрыто.", ephemeral=True)
 
+    async def public_show_current_reveal_card(self, interaction: discord.Interaction) -> None:
+        resolved = await self._resolve_public_message_game(interaction, expected_key="personal")
+        if resolved is None:
+            await interaction.response.send_message("Эта reveal-панель больше не доступна. Открой актуальную панель.", ephemeral=True)
+            return
+
+        game, _ = resolved
+        game = await self.repository.get_game(game.id) or game
+        if game.state != GameState.REVEAL_PHASE:
+            await interaction.response.send_message("Сейчас не фаза раскрытия.", ephemeral=True)
+            return
+
+        players = await self.repository.list_players(game.id)
+        current_player = _current_ordered_player(game, players, kind="reveal")
+        if current_player is None:
+            await interaction.response.send_message("Reveal-очередь уже завершена.", ephemeral=True)
+            await self.refresh_game_message(game.id)
+            return
+
+        if interaction.user.id != current_player.user_id:
+            await interaction.response.send_message(
+                f"Полная карточка видна только текущему игроку. Сейчас ход {format_player_name(current_player)}.",
+                ephemeral=True,
+            )
+            return
+
+        remaining = reveal_turn_remaining(current_player, game.settings, game.reveals_done_this_turn)
+        view: discord.ui.View = (
+            BunkerRevealView(self, game, current_player.user_id, current_player)
+            if remaining > 0 and selectable_reveal_stats(current_player)
+            else BunkerPanelBackView(self, game.id)
+        )
+        await self.send_or_edit_private_panel(
+            interaction,
+            game,
+            embed=_personal_card_embed(current_player, status=_reveal_choice_status(game, current_player)),
+            view=view,
+            force_current_response=True,
+        )
+
     async def _advance_reveal_progress(
         self,
         game: BunkerGame,
@@ -1510,6 +1571,7 @@ class Bunker(commands.Cog):
             if not player.is_fake:
                 return game
 
+            player = await self._ensure_fake_reveal_card(game, player, rng)
             reveals_done = max(0, int(game.reveals_done_this_turn))
             while reveal_turn_remaining(player, game.settings, reveals_done) > 0:
                 stats = selectable_reveal_stats(player)
@@ -1524,11 +1586,17 @@ class Bunker(commands.Cog):
                 player = replace(player, revealed_stats=(*player.revealed_stats, stat))
                 reveals_done += 1
 
-            next_index = current_index + 1
-            while next_index < len(ordered) and player_completed_reveal_turn(ordered[next_index], game.settings, 0):
+            fresh_players = await self.repository.list_players(game.id)
+            fresh_ordered = _ordered_alive_players(game, fresh_players)
+            current_position = next(
+                (index for index, candidate in enumerate(fresh_ordered) if candidate.user_id == player.user_id),
+                current_index,
+            )
+            next_index = current_position + 1
+            while next_index < len(fresh_ordered) and player_completed_reveal_turn(fresh_ordered[next_index], game.settings, 0):
                 next_index += 1
 
-            if next_index < len(ordered):
+            if next_index < len(fresh_ordered):
                 await self.repository.set_reveal_progress(
                     game.id,
                     current_turn_index=next_index,
@@ -1538,6 +1606,20 @@ class Bunker(commands.Cog):
 
             await self._finish_reveal_phase(game)
             return await self.repository.get_game(game.id)
+
+    async def _ensure_fake_reveal_card(
+        self,
+        game: BunkerGame,
+        player: BunkerPlayer,
+        rng: random.Random,
+    ) -> BunkerPlayer:
+        if not player.is_fake or player.card is not None:
+            return player
+
+        content_pack = await self._content_pack_for_game(game)
+        card = generate_card(rng, content_pack)
+        await self.repository.assign_cards(game.id, {player.user_id: card})
+        return replace(player, card=card)
 
     async def show_vote_menu(self, interaction: discord.Interaction) -> None:
         await self.open_game_panel(interaction, screen="vote")
@@ -2016,8 +2098,8 @@ class Bunker(commands.Cog):
             except Exception:
                 LOGGER.exception("Failed to reconcile bunker game %s", game.id)
 
-    async def advance_phase(self, game: BunkerGame) -> None:
-        now = datetime.now(UTC)
+    async def advance_phase(self, game: BunkerGame, *, now: datetime | None = None) -> None:
+        now = now or datetime.now(UTC)
         if game.state == GameState.REVEAL_PHASE:
             await self.repository.add_event(game.id, game.round_number, "reveal", "Раскрытие не переключается вручную: дождитесь завершения reveal-ходов игроков.")
             await self.refresh_game_message(game.id)
@@ -2025,6 +2107,10 @@ class Bunker(commands.Cog):
 
         if game.state == GameState.SPEECH_PHASE:
             await self._advance_speech_turn(game, now=now)
+            return
+
+        if game.state == GameState.SPEECH_PAUSE:
+            await self._start_current_speech_turn(game, now=now)
             return
 
         if game.state == GameState.DISCUSSION_PHASE:
@@ -2110,10 +2196,10 @@ class Bunker(commands.Cog):
             await self.repository.set_speech_index(game.id, next_index)
             next_game = await self.repository.set_game_state(
                 game.id,
-                GameState.SPEECH_PHASE,
+                GameState.SPEECH_PAUSE,
                 round_number=game.round_number,
                 phase_started_at=now,
-                phase_ends_at=phase_deadline(game.settings, GameState.SPEECH_PHASE, now),
+                phase_ends_at=now + timedelta(seconds=SPEECH_HANDOFF_SECONDS),
                 paused_at=None,
             )
             await self.refresh_game_message(next_game.id)
@@ -2129,6 +2215,18 @@ class Bunker(commands.Cog):
         )
         if game.settings.explain_for_newbies:
             await self.repository.add_event(game.id, game.round_number, "tutorial", "Открыто общее обсуждение. Все живые игроки могут говорить.")
+        await self.refresh_game_message(next_game.id)
+
+    async def _start_current_speech_turn(self, game: BunkerGame, *, now: datetime | None = None) -> None:
+        now = now or datetime.now(UTC)
+        next_game = await self.repository.set_game_state(
+            game.id,
+            GameState.SPEECH_PHASE,
+            round_number=game.round_number,
+            phase_started_at=now,
+            phase_ends_at=phase_deadline(game.settings, GameState.SPEECH_PHASE, now),
+            paused_at=None,
+        )
         await self.refresh_game_message(next_game.id)
 
     async def finish_with_epilogue(self, game: BunkerGame) -> None:
@@ -2175,6 +2273,7 @@ class Bunker(commands.Cog):
             return
         if game.state == GameState.REVEAL_PHASE:
             game = await self._auto_reveal_fake_turns(game.id) or game
+        game = await self._advance_overdue_phase_if_needed(game) or game
 
         channel = await self._fetch_text_channel(game.game_text_channel_id)
         voice_channel = await self._fetch_voice_channel(game.voice_channel_id)
@@ -2233,6 +2332,24 @@ class Bunker(commands.Cog):
             return None
         await self.repository.set_board_message(game.id, message.id)
         return message
+
+    async def _advance_overdue_phase_if_needed(
+        self,
+        game: BunkerGame,
+        *,
+        now: datetime | None = None,
+    ) -> BunkerGame | None:
+        now = now or datetime.now(UTC)
+        if (
+            game.phase_ends_at is None
+            or game.paused_at is not None
+            or game.state == GameState.REVEAL_PHASE
+            or game.phase_ends_at > now
+        ):
+            return game
+
+        await self.advance_phase(game, now=now)
+        return await self.repository.get_game(game.id)
 
     async def _sync_public_game_messages(
         self,
@@ -2671,6 +2788,7 @@ class Bunker(commands.Cog):
         should_mute = game.settings.is_ranked and game.state == GameState.VOTING_PHASE
         should_unmute = game.state in {
             GameState.LOBBY,
+            GameState.SPEECH_PAUSE,
             GameState.DISCUSSION_PHASE,
             GameState.FINAL_PHASE,
             GameState.FINISHED,
@@ -2717,13 +2835,24 @@ class BunkerSetupIdleView(discord.ui.View):
 
 
 class BunkerPublicGameView(discord.ui.View):
-    def __init__(self, cog: Bunker) -> None:
+    def __init__(self, cog: Bunker, *, show_finish_speech: bool = False) -> None:
         super().__init__(timeout=None)
         self.cog = cog
+        if show_finish_speech:
+            finish = discord.ui.Button(
+                label="Закончить речь",
+                style=discord.ButtonStyle.primary,
+                custom_id=GAME_FINISH_SPEECH_ID,
+            )
+            finish.callback = self.finish_speech
+            self.add_item(finish)
 
     @discord.ui.button(label="Панель", style=discord.ButtonStyle.primary, custom_id=GAME_PANEL_ID)
     async def panel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.cog.open_game_panel(interaction)
+
+    async def finish_speech(self, interaction: discord.Interaction) -> None:
+        await self.cog.public_finish_speech(interaction)
 
 
 class BunkerPublicSectionView(discord.ui.View):
@@ -2788,6 +2917,18 @@ class BunkerPublicRevealView(discord.ui.View):
 
             button.callback = callback
             self.add_item(button)
+
+        self_button = discord.ui.Button(
+            label="Мои данные",
+            style=discord.ButtonStyle.primary,
+            custom_id=PUBLIC_REVEAL_SELF_ID,
+            row=4,
+        )
+        self_button.callback = self.show_current_card
+        self.add_item(self_button)
+
+    async def show_current_card(self, interaction: discord.Interaction) -> None:
+        await self.cog.public_show_current_reveal_card(interaction)
 
 
 class BunkerPublicAbilityView(discord.ui.View):
@@ -2854,7 +2995,6 @@ class BunkerPrivatePlayerPanelView(discord.ui.View):
         in_lobby = self.game.state == GameState.LOBBY
         is_active_player = self.player is not None and self.player.is_active
         is_alive_player = is_active_player and not self.player.is_eliminated
-        current_speaker = _current_ordered_player(self.game, self.players, kind="speech") if self.players else None
 
         if in_lobby and self.player is None:
             self._add_button("Войти", discord.ButtonStyle.success, self._join, row=0)
@@ -2872,8 +3012,6 @@ class BunkerPrivatePlayerPanelView(discord.ui.View):
         if in_lobby and self.can_close:
             self._add_button("Настройки", discord.ButtonStyle.secondary, self._settings, row=1)
 
-        if is_alive_player and self.game.state == GameState.SPEECH_PHASE and current_speaker and current_speaker.user_id == self.player.user_id:
-            self._add_button("Закончить речь", discord.ButtonStyle.primary, self._finish_speech, row=2)
         if is_alive_player and self.game.state == GameState.VOTING_PHASE:
             self._add_button("Голосовать", discord.ButtonStyle.primary, self._vote, row=2)
         if is_active_player and self.player.is_eliminated and not self.player.final_revealed:
@@ -2935,9 +3073,6 @@ class BunkerPrivatePlayerPanelView(discord.ui.View):
 
     async def _vote(self, interaction: discord.Interaction) -> None:
         await self.cog.panel_vote(interaction, self.game.id)
-
-    async def _finish_speech(self, interaction: discord.Interaction) -> None:
-        await self.cog.panel_finish_speech(interaction, self.game.id)
 
     async def _reveal_all(self, interaction: discord.Interaction) -> None:
         await self.cog.panel_reveal_all(interaction, self.game.id, self.player.user_id if self.player else 0)
@@ -3978,6 +4113,7 @@ def _phase_label(state: GameState) -> str:
         GameState.PREPARING: "подготовка",
         GameState.REVEAL_PHASE: "раскрытие характеристик",
         GameState.SPEECH_PHASE: "речи игроков",
+        GameState.SPEECH_PAUSE: "пауза перед речью",
         GameState.DISCUSSION_PHASE: "обсуждение",
         GameState.CHAOS_PHASE: "событие",
         GameState.VOTING_PHASE: "голосование",
@@ -4091,26 +4227,49 @@ def _public_specials_embed(game: BunkerGame, players: list[BunkerPlayer]) -> dis
 
 def _players_table_embed(game: BunkerGame, players: list[BunkerPlayer]) -> discord.Embed:
     seats = game.settings.bunker_seats or max(2, game.settings.slots // 2)
+    visible_players = players[:16]
+    alive_count = sum(1 for player in players if player.is_alive)
+    eliminated_count = sum(1 for player in players if player.is_eliminated)
+    left_count = sum(1 for player in players if player.left_at is not None)
     embed = discord.Embed(
         title="Желающие попасть в бункер",
-        description=f"Мест в бункере: {seats}. Скрытые характеристики отмечены `?`.",
+        description="Участники разделены на отдельные карточки, чтобы состав было проще читать.",
         color=discord.Color.blurple(),
     )
-    for index, player in enumerate(players[:16], start=1):
-        status = _player_status_label(player)
-        stat_lines = []
-        for stat in REVEALABLE_STATS:
-            value = getattr(player.card, stat, "?") if player.card and stat in player.revealed_stats else "?"
-            stat_lines.append(f"{CARD_STAT_LABELS[stat]}: {value}")
+    embed.add_field(name="Мест в бункере", value=str(seats), inline=True)
+    embed.add_field(name="Живые", value=str(alive_count), inline=True)
+    embed.add_field(name="Выбыли", value=str(eliminated_count + left_count), inline=True)
+
+    for index, player in enumerate(visible_players, start=1):
         embed.add_field(
-            name=f"{index}. {_compact_player_name(player)} · {status}",
-            value=_limit_embed_value("\n".join(stat_lines), 1024),
-            inline=False,
+            name=f"{index}. {_compact_player_name(player)}",
+            value=_player_roster_card_value(player),
+            inline=True,
         )
     if len(players) > 16:
         embed.add_field(name="Еще игроки", value=f"Не показано: {len(players) - 16}", inline=False)
     embed.set_footer(text=f"Обновлено: раунд {game.round_number}, {_phase_label(game.state)}")
     return embed
+
+
+def _player_roster_card_value(player: BunkerPlayer) -> str:
+    revealed = [stat for stat in REVEALABLE_STATS if stat in player.revealed_stats]
+    hidden_count = len(REVEALABLE_STATS) - len(revealed)
+    lines = [
+        f"Статус: `{_player_status_label(player)}`",
+        f"Открыто: `{len(revealed)}` · скрыто: `{hidden_count}`",
+    ]
+    if player.card is None or not revealed:
+        lines.append("Пока нет открытых характеристик.")
+        return "\n".join(lines)
+
+    lines.append("Открытые данные:")
+    for stat in revealed[:3]:
+        value = getattr(player.card, stat, "?")
+        lines.append(f"- {CARD_STAT_LABELS[stat]}: {_limit_embed_value(str(value), 72)}")
+    if len(revealed) > 3:
+        lines.append(f"- еще {len(revealed) - 3}")
+    return _limit_embed_value("\n".join(lines), 1024)
 
 
 def _abilities_table_embed(players: list[BunkerPlayer]) -> discord.Embed:
@@ -4212,6 +4371,13 @@ def _speech_prompt(game: BunkerGame, players: list[BunkerPlayer]) -> str:
     return f"Говорит {format_player_name(player)}. Остальные участники voice приглушаются до конца речи."
 
 
+def _speech_pause_prompt(game: BunkerGame, players: list[BunkerPlayer]) -> str:
+    player = _current_ordered_player(game, players, kind="speech")
+    if player is None:
+        return "Пауза завершает речи. Следом начнется общее обсуждение."
+    return f"Короткая пауза перед речью {format_player_name(player)}. Можно быстро отреагировать, затем voice снова переключится на говорящего."
+
+
 def _voting_prompt(game: BunkerGame, players: list[BunkerPlayer]) -> str:
     alive = [player for player in players if player.is_alive]
     return f"Живые игроки голосуют в личной панели. Нужно выбрать одного из {len(alive)} живых участников; self-vote разрешен."
@@ -4220,7 +4386,7 @@ def _voting_prompt(game: BunkerGame, players: list[BunkerPlayer]) -> str:
 def _leader_view_for_game(cog: Bunker, game: BunkerGame) -> discord.ui.View | None:
     if game.state == GameState.REVEAL_PHASE:
         return None
-    return BunkerPublicGameView(cog)
+    return BunkerPublicGameView(cog, show_finish_speech=game.state == GameState.SPEECH_PHASE)
 
 
 def _game_embed(game: BunkerGame, players: list[BunkerPlayer]) -> discord.Embed:
@@ -4229,7 +4395,10 @@ def _game_embed(game: BunkerGame, players: list[BunkerPlayer]) -> discord.Embed:
     non_hosts = sum(1 for player in players if not player.is_host and player.is_active)
     status = f"{_phase_label(game.state)}, раунд {game.round_number}/{game.settings.rounds}"
     if game.phase_ends_at is not None and game.paused_at is None:
-        status += f", до следующего шага: {discord.utils.format_dt(game.phase_ends_at, style='R')}"
+        if game.phase_ends_at <= datetime.now(UTC):
+            status += ", до следующего шага: переход..."
+        else:
+            status += f", до следующего шага: {discord.utils.format_dt(game.phase_ends_at, style='R')}"
     if game.paused_at is not None:
         status += ", пауза"
 
@@ -4265,6 +4434,7 @@ def _game_embed(game: BunkerGame, players: list[BunkerPlayer]) -> discord.Embed:
     prompt = {
         GameState.REVEAL_PHASE: _reveal_prompt(game, players),
         GameState.SPEECH_PHASE: _speech_prompt(game, players),
+        GameState.SPEECH_PAUSE: _speech_pause_prompt(game, players),
         GameState.DISCUSSION_PHASE: "Открыто общее обсуждение. Все живые участники могут говорить.",
         GameState.CHAOS_PHASE: "Событие раунда. Следите за обновлением таблиц.",
         GameState.VOTING_PHASE: _voting_prompt(game, players),
