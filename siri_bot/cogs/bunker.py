@@ -774,7 +774,7 @@ class Bunker(commands.Cog):
         response_done = _interaction_response_done(interaction)
         if force_current_response:
             if not response_done:
-                await interaction.response.defer(ephemeral=True)
+                await interaction.response.defer(ephemeral=True, thinking=True)
             try:
                 message = await interaction.edit_original_response(content=None, embed=embed, view=view)
             except discord.HTTPException:
@@ -802,7 +802,7 @@ class Bunker(commands.Cog):
                     LOGGER.info("Could not edit saved bunker private panel.", exc_info=True)
 
             if not response_done:
-                await interaction.response.defer(ephemeral=True)
+                await interaction.response.defer(ephemeral=True, thinking=True)
             try:
                 message = await interaction.edit_original_response(content=None, embed=embed, view=view)
                 registry[key] = message
@@ -1102,6 +1102,7 @@ class Bunker(commands.Cog):
                 message,
                 voice_channel=voice_channel,
                 prefer_current_response=True,
+                force_current_response=True,
             )
 
         await build_status("Строю бункер... Создаю text/voice каналы и права доступа.")
@@ -1113,7 +1114,13 @@ class Bunker(commands.Cog):
 
         active_host_game = await self._live_active_game_for_host(guild.id, interaction.user.id)
         if active_host_game is not None:
-            await self.send_host_conflict_status(interaction, setup, active_host_game, prefer_current_response=True)
+            await self.send_host_conflict_status(
+                interaction,
+                setup,
+                active_host_game,
+                prefer_current_response=True,
+                force_current_response=True,
+            )
             return
 
         setup_channel = guild.get_channel(setup.setup_channel_id)
@@ -1186,7 +1193,13 @@ class Bunker(commands.Cog):
             conflicting = await self.repository.get_game(exc.game_id)
             live_conflict = await self._ensure_game_discord_state(conflicting)
             if live_conflict is not None:
-                await self.send_host_conflict_status(interaction, setup, live_conflict, prefer_current_response=True)
+                await self.send_host_conflict_status(
+                    interaction,
+                    setup,
+                    live_conflict,
+                    prefer_current_response=True,
+                    force_current_response=True,
+                )
             else:
                 await build_status("Старый бункер был очищен. Нажми 'Построить бункер' еще раз.")
             return
@@ -1761,6 +1774,7 @@ class Bunker(commands.Cog):
             self._setup_panel_key(interaction, setup),
             embed=embed,
             view=view,
+            force_current_response=_message_has_setup_panel_embed(getattr(interaction, "message", None)),
         )
 
     async def show_setup_rules(self, interaction: discord.Interaction) -> None:
@@ -1780,6 +1794,7 @@ class Bunker(commands.Cog):
         *,
         voice_channel: discord.VoiceChannel | None = None,
         prefer_current_response: bool = False,
+        force_current_response: bool = False,
     ) -> None:
         settings = normalize_settings(await self.repository.get_draft(setup.id, interaction.user.id))
         is_operator = await self._is_bunker_operator(interaction)
@@ -1798,6 +1813,7 @@ class Bunker(commands.Cog):
                 voice_url=_voice_channel_url(voice_channel),
             ),
             prefer_current_response=prefer_current_response,
+            force_current_response=force_current_response,
         )
 
     async def send_host_conflict_status(
@@ -1807,6 +1823,7 @@ class Bunker(commands.Cog):
         game: BunkerGame,
         *,
         prefer_current_response: bool = False,
+        force_current_response: bool = False,
     ) -> None:
         settings = normalize_settings(await self.repository.get_draft(setup.id, interaction.user.id))
         is_operator = await self._is_bunker_operator(interaction)
@@ -1828,6 +1845,7 @@ class Bunker(commands.Cog):
                 is_operator=is_operator,
             ),
             prefer_current_response=prefer_current_response,
+            force_current_response=force_current_response,
         )
 
     async def update_draft_settings(
@@ -2594,7 +2612,12 @@ class Bunker(commands.Cog):
                 return setup
         if interaction.channel is not None:
             setup = await self.repository.get_setup_by_channel(interaction.channel.id)
-            if setup is not None and message is not None and setup.setup_message_id != message.id:
+            if (
+                setup is not None
+                and message is not None
+                and setup.setup_message_id != message.id
+                and _message_has_setup_panel_embed(message)
+            ):
                 repaired = await self.repository.repair_setup_message_id(setup.id, message.id)
                 return repaired or setup
             return setup
@@ -4530,6 +4553,17 @@ def _same_discord_message(left: Any, right: Any) -> bool:
 def _interaction_response_done(interaction: discord.Interaction) -> bool:
     is_done = getattr(interaction.response, "is_done", None)
     return bool(is_done()) if callable(is_done) else False
+
+
+def _message_has_setup_panel_embed(message: Any) -> bool:
+    if message is None:
+        return False
+    expected_prefix = _setup_embed("").title
+    for embed in getattr(message, "embeds", ()) or ():
+        title = getattr(embed, "title", None)
+        if isinstance(title, str) and title.startswith(expected_prefix):
+            return True
+    return False
 
 
 def _voice_channel_url(channel: discord.VoiceChannel | None) -> str | None:
