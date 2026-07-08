@@ -750,6 +750,18 @@ class BunkerRepository:
             message_id,
         )
 
+    async def remove_public_message_id(self, game_id: int, key: str) -> None:
+        await self.pool.execute(
+            """
+            UPDATE bunker_games
+            SET public_message_ids = public_message_ids - $2,
+                updated_at = NOW()
+            WHERE id = $1
+            """,
+            game_id,
+            key,
+        )
+
     async def set_collapsed_section(self, game_id: int, key: str, collapsed: bool) -> None:
         await self.pool.execute(
             """
