@@ -86,7 +86,6 @@ PUBLIC_SECTION_TOGGLE_ID = "siri:bunker:section:toggle"
 PUBLIC_SECTION_REFRESH_ID = "siri:bunker:section:refresh"
 PUBLIC_REVEAL_STAT_PREFIX = "siri:bunker:public:reveal:"
 PUBLIC_ABILITY_PREFIX = "siri:bunker:public:ability:"
-PUBLIC_MY_CARD_ID = "siri:bunker:public:my_card"
 GAME_JOIN_ID = "siri:bunker:game:join"
 GAME_READY_ID = "siri:bunker:game:ready"
 GAME_START_ID = "siri:bunker:game:start"
@@ -671,7 +670,7 @@ class Bunker(commands.Cog):
         can_close = (player is not None and player.is_host) or await self._is_bunker_admin_or_operator(interaction)
         back_view = BunkerPanelBackView(self, game.id)
 
-        if screen == "settings":
+        if screen in {"settings", "settings_rules"}:
             embed = _settings_embed(game.settings)
             if status:
                 embed.description = status
@@ -683,6 +682,7 @@ class Bunker(commands.Cog):
                     game.settings,
                     is_operator=is_operator,
                     game_id=game.id,
+                    screen=screen,
                 )
             return embed, back_view
         if screen == "content":
@@ -1279,6 +1279,7 @@ class Bunker(commands.Cog):
         await self.repository.add_event(started.id, started.round_number, "start", "Бункер закрыт. Карточки и спец. возможности выданы. Начинается раундовое раскрытие характеристик.")
         if game.settings.explain_for_newbies:
             await self.repository.add_event(started.id, started.round_number, "tutorial", "В reveal-ход игрок выбирает любые скрытые характеристики в пределах лимита комнаты, затем идут речи, обсуждение и голосование.")
+        started = await self._auto_reveal_fake_turns(started.id) or started
         await self._delete_lobby_board_message(game)
         await self.refresh_game_message(started.id)
         return "Игра началась. Карточка и действия доступны через личную панель."
@@ -1356,7 +1357,7 @@ class Bunker(commands.Cog):
             await self.refresh_game_message(game.id)
             return
 
-        if not await self._can_act_as_public_player(interaction, game, current_player):
+        if interaction.user.id != current_player.user_id:
             await interaction.followup.send(f"Сейчас ход {format_player_name(current_player)}.", ephemeral=True)
             return
         remaining = reveal_turn_remaining(current_player, game.settings, game.reveals_done_this_turn)
@@ -1377,15 +1378,6 @@ class Bunker(commands.Cog):
         await self._advance_reveal_progress(game, players, fresh_player, game.reveals_done_this_turn + 1)
         await self.refresh_game_message(game.id)
         await interaction.followup.send("Раскрыто.", ephemeral=True)
-
-    async def public_show_my_card(self, interaction: discord.Interaction) -> None:
-        resolved = await self._resolve_public_message_game(interaction, expected_key="personal")
-        if resolved is None:
-            await interaction.response.send_message("Карточка недоступна: сообщение устарело.", ephemeral=True)
-            return
-
-        game, _ = resolved
-        await self.send_or_edit_private_panel(interaction, game, screen="card")
 
     async def _advance_reveal_progress(
         self,
@@ -1417,8 +1409,12 @@ class Bunker(commands.Cog):
                 current_turn_index=current_index,
                 reveals_done_this_turn=0,
             )
+            await self._auto_reveal_fake_turns(game.id)
             return
 
+        await self._finish_reveal_phase(game)
+
+    async def _finish_reveal_phase(self, game: BunkerGame) -> None:
         now = datetime.now(UTC)
         await self.repository.set_reveal_progress(game.id, current_turn_index=0, reveals_done_this_turn=0)
         await self.repository.set_speech_index(game.id, 0)
@@ -1431,6 +1427,52 @@ class Bunker(commands.Cog):
             paused_at=None,
         )
         await self.repository.add_event(game.id, game.round_number, "speech", "Раскрытие раунда завершено. Начинаются речи игроков.")
+
+    async def _auto_reveal_fake_turns(self, game_id: int) -> BunkerGame | None:
+        rng = random.Random()
+        while True:
+            game = await self.repository.get_game(game_id)
+            if game is None or game.state != GameState.REVEAL_PHASE:
+                return game
+
+            players = await self.repository.list_players(game.id)
+            ordered = _ordered_alive_players(game, players)
+            if not ordered:
+                return game
+
+            current_index = min(game.current_turn_index, len(ordered) - 1)
+            player = ordered[current_index]
+            if not player.is_fake:
+                return game
+
+            reveals_done = max(0, int(game.reveals_done_this_turn))
+            while reveal_turn_remaining(player, game.settings, reveals_done) > 0:
+                stats = selectable_reveal_stats(player)
+                if not stats:
+                    break
+                stat = rng.choice(stats)
+                ok, message = reveal_stat(player, stat, round_number=game.round_number)
+                if not ok:
+                    break
+                await self.repository.reveal_stat(game.id, player.user_id, stat)
+                await self.repository.add_event(game.id, game.round_number, "reveal", message)
+                player = replace(player, revealed_stats=(*player.revealed_stats, stat))
+                reveals_done += 1
+
+            next_index = current_index + 1
+            while next_index < len(ordered) and player_completed_reveal_turn(ordered[next_index], game.settings, 0):
+                next_index += 1
+
+            if next_index < len(ordered):
+                await self.repository.set_reveal_progress(
+                    game.id,
+                    current_turn_index=next_index,
+                    reveals_done_this_turn=0,
+                )
+                continue
+
+            await self._finish_reveal_phase(game)
+            return await self.repository.get_game(game.id)
 
     async def show_vote_menu(self, interaction: discord.Interaction) -> None:
         await self.open_game_panel(interaction, screen="vote")
@@ -1648,6 +1690,9 @@ class Bunker(commands.Cog):
         elif screen == "packs":
             embed = _packs_embed()
             view = BunkerSetupNavView(self, setup.id, interaction.user.id, settings, screen=screen, is_operator=is_operator)
+        elif screen in {"settings", "settings_rules"}:
+            embed = _settings_embed(settings)
+            view = BunkerSettingsView(self, setup.id, interaction.user.id, settings, is_operator=is_operator, screen=screen)
         else:
             embed = _settings_embed(settings)
             view = BunkerSettingsView(self, setup.id, interaction.user.id, settings, is_operator=is_operator)
@@ -1755,7 +1800,7 @@ class Bunker(commands.Cog):
 
         await interaction.response.edit_message(
             embed=_settings_embed(settings),
-            view=BunkerSettingsView(self, setup_id, user_id, settings, is_operator=is_operator),
+            view=BunkerSettingsView(self, setup_id, user_id, settings, is_operator=is_operator, screen=screen),
         )
 
     async def update_live_game_settings(
@@ -1826,6 +1871,7 @@ class Bunker(commands.Cog):
                 updated.settings,
                 is_operator=is_operator,
                 game_id=updated.id,
+                screen=screen,
             ),
         )
 
@@ -1977,6 +2023,7 @@ class Bunker(commands.Cog):
             await self.repository.set_reveal_progress(game.id, current_turn_index=0, reveals_done_this_turn=0)
             await self.repository.set_speech_index(game.id, 0)
             await self.repository.add_event(game.id, next_round, "round", f"Начался раунд {next_round}.")
+            next_game = await self._auto_reveal_fake_turns(next_game.id) or next_game
             await self.refresh_game_message(next_game.id)
 
     async def _advance_speech_turn(self, game: BunkerGame, *, now: datetime | None = None) -> None:
@@ -2051,6 +2098,8 @@ class Bunker(commands.Cog):
         game = await self.repository.get_game(game_id)
         if game is None:
             return
+        if game.state == GameState.REVEAL_PHASE:
+            game = await self._auto_reveal_fake_turns(game.id) or game
 
         channel = await self._fetch_text_channel(game.game_text_channel_id)
         voice_channel = await self._fetch_voice_channel(game.voice_channel_id)
@@ -2645,11 +2694,12 @@ class BunkerPublicRevealView(discord.ui.View):
         )
         for index, stat in enumerate(stats):
             revealed = stat in revealed_stats
+            disabled = game is not None and (player is None or game.state != GameState.REVEAL_PHASE or revealed or turn_limit_reached)
             button = discord.ui.Button(
                 label=CARD_STAT_LABELS[stat],
-                style=discord.ButtonStyle.secondary,
+                style=discord.ButtonStyle.secondary if disabled else discord.ButtonStyle.danger,
                 custom_id=f"{PUBLIC_REVEAL_STAT_PREFIX}{stat}",
-                disabled=game is not None and (player is None or game.state != GameState.REVEAL_PHASE or revealed or turn_limit_reached),
+                disabled=disabled,
                 row=index // 3,
             )
 
@@ -2658,18 +2708,6 @@ class BunkerPublicRevealView(discord.ui.View):
 
             button.callback = callback
             self.add_item(button)
-
-        my_card = discord.ui.Button(
-            label="Моя карточка",
-            style=discord.ButtonStyle.primary,
-            custom_id=PUBLIC_MY_CARD_ID,
-            row=4,
-        )
-        my_card.callback = self.my_card
-        self.add_item(my_card)
-
-    async def my_card(self, interaction: discord.Interaction) -> None:
-        await self.cog.public_show_my_card(interaction)
 
 
 class BunkerPublicAbilityView(discord.ui.View):
@@ -3326,6 +3364,7 @@ class BunkerSettingsView(discord.ui.View):
         *,
         is_operator: bool = False,
         game_id: int | None = None,
+        screen: str = "settings",
     ) -> None:
         super().__init__(timeout=900)
         self.cog = cog
@@ -3334,22 +3373,35 @@ class BunkerSettingsView(discord.ui.View):
         self.settings = settings
         self.is_operator = is_operator
         self.game_id = game_id
-        self.add_item(BunkerRoomKindSelect(self, row=0))
-        self.add_item(BunkerModeSelect(self, row=1))
-        self.add_item(BunkerSlotsSelect(self, row=2))
-        self.add_item(BunkerRevealStatsPerTurnSelect(self, row=3))
-        content_button = discord.ui.Button(label="Контент", style=discord.ButtonStyle.secondary, row=4)
-        content_button.callback = self.open_content
-        self.add_item(content_button)
-        rules_button = discord.ui.Button(label="Как играть", style=discord.ButtonStyle.secondary, row=4)
-        rules_button.callback = self.open_rules
-        self.add_item(rules_button)
+        self.screen = "settings_rules" if screen == "settings_rules" else "settings"
+        self.add_item(BunkerSettingsSectionSelect(self, row=0))
+        if self.screen == "settings_rules":
+            self.add_item(BunkerRevealStatsPerTurnSelect(self, row=1))
+            self.add_item(BunkerTimerSelect(self, row=2))
+            self.add_item(BunkerMissingVotePolicySelect(self, row=3))
+            self.add_item(BunkerRoundsSelect(self, row=4))
+        else:
+            self.add_item(BunkerRoomKindSelect(self, row=1))
+            self.add_item(BunkerVisibilitySelect(self, row=2))
+            self.add_item(BunkerModeSelect(self, row=3))
+            self.add_item(BunkerSlotsSelect(self, row=4))
 
-    async def save(self, interaction: discord.Interaction, settings: BunkerSettings, *, screen: str = "settings") -> None:
+    async def save(self, interaction: discord.Interaction, settings: BunkerSettings, *, screen: str | None = None) -> None:
+        screen = screen or self.screen
         if self.game_id is not None:
             await self.cog.update_live_game_settings(interaction, self.game_id, self.user_id, settings, screen=screen)
         else:
             await self.cog.update_draft_settings(interaction, self.setup_id, self.user_id, settings, screen=screen)
+
+    async def open_settings_section(self, interaction: discord.Interaction, screen: str) -> None:
+        if self.game_id is not None:
+            game = await self.cog.repository.get_game(self.game_id)
+            if game is None:
+                await interaction.response.edit_message(embed=_status_embed("Партия не найдена."), view=None)
+                return
+            await self.cog.update_current_game_panel(interaction, game, screen=screen)
+        else:
+            await self.cog.open_setup_panel(interaction, screen=screen)
 
     async def open_rules(self, interaction: discord.Interaction) -> None:
         if self.game_id is not None:
@@ -3374,21 +3426,92 @@ class BunkerSettingsView(discord.ui.View):
     async def start_admin_game(self, interaction: discord.Interaction) -> None:
         await self.cog.build_admin_bunker(interaction)
 
-    @discord.ui.button(label="Публичный/приватный", style=discord.ButtonStyle.secondary, row=4)
-    async def toggle_visibility(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await self.save(interaction, replace(self.settings, is_public=not self.settings.is_public))
 
-    @discord.ui.button(label="Таймер", style=discord.ButtonStyle.secondary, row=4)
-    async def cycle_timer(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        values = [60, 90, 120, 180, 240, 300, 420]
-        current = self.settings.timer_seconds if self.settings.timer_seconds in values else 180
-        timer = values[(values.index(current) + 1) % len(values)]
-        await self.save(interaction, replace(self.settings, timer_seconds=timer))
+def _plural_ru(number: int, one: str, few: str, many: str) -> str:
+    number = abs(number)
+    if number % 100 in {11, 12, 13, 14}:
+        return many
+    if number % 10 == 1:
+        return one
+    if number % 10 in {2, 3, 4}:
+        return few
+    return many
 
-    @discord.ui.button(label="Пропущенный голос", style=discord.ButtonStyle.secondary, row=4)
-    async def toggle_vote_policy(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        next_policy = VotePolicy.RANDOM if self.settings.missing_vote_policy == VotePolicy.ABSTAIN else VotePolicy.ABSTAIN
-        await self.save(interaction, replace(self.settings, missing_vote_policy=next_policy))
+
+def _settings_section_label(screen: str) -> str:
+    return "Правила и таймеры" if screen == "settings_rules" else "Основные"
+
+
+def _mode_label(mode: GameMode) -> str:
+    return {
+        GameMode.CLASSIC: "Классика",
+        GameMode.MEME: "Мем",
+        GameMode.HARDCORE: "Хардкор",
+        GameMode.TURBO: "Турбо",
+        GameMode.TRAITOR: "Предатель",
+    }.get(mode, mode.value)
+
+
+def _mode_description(mode: GameMode) -> str:
+    return {
+        GameMode.CLASSIC: "Обычная партия без дополнительных перекосов.",
+        GameMode.MEME: "Больше хаоса в атмосфере и обсуждении.",
+        GameMode.HARDCORE: "Меньше ресурсов и выше риск катастрофы.",
+        GameMode.TURBO: "Быстрее таймеры и меньше раундов.",
+        GameMode.TRAITOR: "У одного игрока есть скрытая роль предателя.",
+    }.get(mode, "Настройка стиля партии.")
+
+
+def _vote_policy_label(policy: VotePolicy) -> str:
+    return {
+        VotePolicy.ABSTAIN: "воздержаться",
+        VotePolicy.RANDOM: "случайная цель",
+    }.get(policy, policy.value)
+
+
+class BunkerSettingsSectionSelect(discord.ui.Select):
+    def __init__(self, owner: BunkerSettingsView, *, row: int) -> None:
+        self.owner = owner
+        options = [
+            discord.SelectOption(
+                label="Основные",
+                value="settings",
+                description="Тип комнаты, доступ, режим и число игроков.",
+                default=owner.screen == "settings",
+            ),
+            discord.SelectOption(
+                label="Правила и таймеры",
+                value="settings_rules",
+                description="Reveal-ход, таймеры, раунды и пропущенный голос.",
+                default=owner.screen == "settings_rules",
+            ),
+            discord.SelectOption(
+                label="Контент-пак",
+                value="content",
+                description="Выбрать встроенный или пользовательский набор карточек.",
+            ),
+            discord.SelectOption(
+                label="Как играть",
+                value="rules",
+                description="Открыть краткие правила Бункера.",
+            ),
+        ]
+        super().__init__(
+            placeholder=f"Раздел настроек: {_settings_section_label(owner.screen)}",
+            min_values=1,
+            max_values=1,
+            options=options,
+            row=row,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        screen = self.values[0]
+        if screen in {"settings", "settings_rules"}:
+            await self.owner.open_settings_section(interaction, screen)
+        elif screen == "content":
+            await self.owner.open_content(interaction)
+        else:
+            await self.owner.open_rules(interaction)
 
 
 class BunkerRoomKindSelect(discord.ui.Select):
@@ -3412,7 +3535,7 @@ class BunkerRoomKindSelect(discord.ui.Select):
                 )
             )
         super().__init__(
-            placeholder="Тип комнаты",
+            placeholder=f"Тип комнаты: {_room_kind_label(owner.settings.room_kind)}",
             min_values=1,
             max_values=1,
             options=options,
@@ -3424,14 +3547,50 @@ class BunkerRoomKindSelect(discord.ui.Select):
         await self.owner.save(interaction, normalize_settings(replace(self.owner.settings, room_kind=room_kind)))
 
 
+class BunkerVisibilitySelect(discord.ui.Select):
+    def __init__(self, owner: BunkerSettingsView, *, row: int) -> None:
+        self.owner = owner
+        super().__init__(
+            placeholder=f"Доступ: {'публичная' if owner.settings.is_public else 'приватная'}",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label="Публичная комната",
+                    value="public",
+                    description="Игроки могут зайти сами, если видят лобби.",
+                    default=owner.settings.is_public,
+                ),
+                discord.SelectOption(
+                    label="Приватная комната",
+                    value="private",
+                    description="Вход только через приватный доступ комнаты.",
+                    default=not owner.settings.is_public,
+                ),
+            ],
+            row=row,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.owner.save(interaction, normalize_settings(replace(self.owner.settings, is_public=self.values[0] == "public")))
+
+
 class BunkerModeSelect(discord.ui.Select):
     def __init__(self, owner: BunkerSettingsView, *, row: int) -> None:
         self.owner = owner
         super().__init__(
-            placeholder=f"Режим: {owner.settings.mode.value}",
+            placeholder=f"Режим: {_mode_label(owner.settings.mode)}",
             min_values=1,
             max_values=1,
-            options=[discord.SelectOption(label=mode.value, value=mode.value, default=mode == owner.settings.mode) for mode in GameMode],
+            options=[
+                discord.SelectOption(
+                    label=_mode_label(mode),
+                    value=mode.value,
+                    description=_mode_description(mode),
+                    default=mode == owner.settings.mode,
+                )
+                for mode in GameMode
+            ],
             row=row,
         )
 
@@ -3445,11 +3604,16 @@ class BunkerSlotsSelect(discord.ui.Select):
     def __init__(self, owner: BunkerSettingsView, *, row: int) -> None:
         self.owner = owner
         super().__init__(
-            placeholder=f"Слоты: {owner.settings.slots}",
+            placeholder=f"Игроки: {owner.settings.slots} игроков",
             min_values=1,
             max_values=1,
             options=[
-                discord.SelectOption(label=str(slots), value=str(slots), default=slots == owner.settings.slots)
+                discord.SelectOption(
+                    label=f"{slots} игроков",
+                    value=str(slots),
+                    description=f"Рекомендуется {recommended_rounds(slots, owner.settings.mode)} раундов.",
+                    default=slots == owner.settings.slots,
+                )
                 for slots in range(6, 17)
             ],
             row=row,
@@ -3465,13 +3629,14 @@ class BunkerRevealStatsPerTurnSelect(discord.ui.Select):
     def __init__(self, owner: BunkerSettingsView, *, row: int) -> None:
         self.owner = owner
         values = (1, 2, 3)
+        current = owner.settings.reveal_stats_per_turn
         super().__init__(
-            placeholder=f"Характеристик за ход: {owner.settings.reveal_stats_per_turn}",
+            placeholder=f"Reveal-ход: {current} {_plural_ru(current, 'характеристика', 'характеристики', 'характеристик')}",
             min_values=1,
             max_values=1,
             options=[
                 discord.SelectOption(
-                    label=str(value),
+                    label=f"{value} {_plural_ru(value, 'характеристика', 'характеристики', 'характеристик')} за ход",
                     value=str(value),
                     description=f"Игрок выбирает до {value} любых скрытых характеристик за reveal-ход.",
                     default=value == owner.settings.reveal_stats_per_turn,
@@ -3490,11 +3655,16 @@ class BunkerTimerSelect(discord.ui.Select):
         self.owner = owner
         values = (60, 90, 120, 180, 240, 300, 420)
         super().__init__(
-            placeholder=f"Таймер: {owner.settings.timer_seconds} сек.",
+            placeholder=f"Таймер события: {owner.settings.timer_seconds} сек.",
             min_values=1,
             max_values=1,
             options=[
-                discord.SelectOption(label=f"{seconds} сек.", value=str(seconds), default=seconds == owner.settings.timer_seconds)
+                discord.SelectOption(
+                    label=f"{seconds} сек.",
+                    value=str(seconds),
+                    description="Reveal-ход не по таймеру; это базовый таймер событий.",
+                    default=seconds == owner.settings.timer_seconds,
+                )
                 for seconds in values
             ],
             row=row,
@@ -3504,16 +3674,50 @@ class BunkerTimerSelect(discord.ui.Select):
         await self.owner.save(interaction, replace(self.owner.settings, timer_seconds=int(self.values[0])))
 
 
+class BunkerMissingVotePolicySelect(discord.ui.Select):
+    def __init__(self, owner: BunkerSettingsView, *, row: int) -> None:
+        self.owner = owner
+        super().__init__(
+            placeholder=f"Пропущенный голос: {_vote_policy_label(owner.settings.missing_vote_policy)}",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label="Воздержаться",
+                    value=VotePolicy.ABSTAIN.value,
+                    description="Если игрок не голосует, его голос не идёт против цели.",
+                    default=owner.settings.missing_vote_policy == VotePolicy.ABSTAIN,
+                ),
+                discord.SelectOption(
+                    label="Случайная цель",
+                    value=VotePolicy.RANDOM.value,
+                    description="Если игрок не голосует, бот выбирает живую цель случайно.",
+                    default=owner.settings.missing_vote_policy == VotePolicy.RANDOM,
+                ),
+            ],
+            row=row,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        await self.owner.save(interaction, replace(self.owner.settings, missing_vote_policy=VotePolicy(self.values[0])))
+
+
 class BunkerRoundsSelect(discord.ui.Select):
     def __init__(self, owner: BunkerSettingsView, *, row: int) -> None:
         self.owner = owner
         values = (3, 4, 5, 6, 7)
+        current = owner.settings.rounds
         super().__init__(
-            placeholder=f"Раунды: {owner.settings.rounds}",
+            placeholder=f"Раунды: {current} {_plural_ru(current, 'раунд', 'раунда', 'раундов')}",
             min_values=1,
             max_values=1,
             options=[
-                discord.SelectOption(label=str(rounds), value=str(rounds), default=rounds == owner.settings.rounds)
+                discord.SelectOption(
+                    label=f"{rounds} {_plural_ru(rounds, 'раунд', 'раунда', 'раундов')}",
+                    value=str(rounds),
+                    description="После последнего раунда начинается финал.",
+                    default=rounds == owner.settings.rounds,
+                )
                 for rounds in values
             ],
             row=row,
@@ -3529,10 +3733,11 @@ class BunkerRevealView(discord.ui.View):
         turn_limit_reached = reveal_turn_remaining(player, game.settings, game.reveals_done_this_turn) <= 0
         for index, stat in enumerate(REVEALABLE_STATS):
             revealed = stat in player.revealed_stats
+            disabled = revealed or turn_limit_reached
             button = discord.ui.Button(
                 label=CARD_STAT_LABELS[stat],
-                style=discord.ButtonStyle.secondary,
-                disabled=revealed or turn_limit_reached,
+                style=discord.ButtonStyle.secondary if disabled else discord.ButtonStyle.danger,
+                disabled=disabled,
                 row=index // 3,
             )
 
@@ -3698,19 +3903,14 @@ def _public_personal_embed(game: BunkerGame, players: list[BunkerPlayer]) -> dis
     if player is None:
         embed.description = "Сейчас нет активного reveal-хода."
         return embed
-    show_private_data = _public_can_show_current_player_private_data(game, player)
-    privacy_hint = (
-        "Админ-игра: карточка тестового игрока показана полностью."
-        if show_private_data
-        else "Полная личная карточка доступна приватно по кнопке ниже."
-    )
+    privacy_hint = "Скрытые характеристики остаются закрыты до раскрытия."
     embed.description = (
         f"Ход: {format_player_name(player)}\n"
         f"{_reveal_choice_status(game, player)}\n"
         f"{privacy_hint}"
     )
     for stat in REVEALABLE_STATS:
-        if player.card is not None and (show_private_data or stat in player.revealed_stats):
+        if player.card is not None and stat in player.revealed_stats:
             value = str(getattr(player.card, stat))
         else:
             value = "?"
@@ -3808,8 +4008,6 @@ def _player_status_label(player: BunkerPlayer) -> str:
         return "вышел"
     if player.is_eliminated:
         return "выгнан"
-    if player.is_host:
-        return "host"
     return "жив"
 
 
@@ -4031,17 +4229,17 @@ def _settings_embed(settings: BunkerSettings) -> discord.Embed:
     embed = discord.Embed(title="Настройки Бункера", color=discord.Color.dark_teal())
     embed.add_field(name="Тип", value="публичный" if settings.is_public else "приватный", inline=True)
     embed.add_field(name="Комната", value=_room_kind_label(settings.room_kind), inline=True)
-    embed.add_field(name="Стиль", value=settings.mode.value, inline=True)
+    embed.add_field(name="Стиль", value=_mode_label(settings.mode), inline=True)
     embed.add_field(name="Слоты", value=str(settings.slots), inline=True)
     embed.add_field(name="Мин. игроков", value=str(settings.min_players), inline=True)
     embed.add_field(name="Мест в бункере", value=str(settings.bunker_seats or max(2, settings.slots // 2)), inline=True)
     embed.add_field(name="Раунды", value=str(settings.rounds), inline=True)
     embed.add_field(name="Характеристик за ход", value=str(settings.reveal_stats_per_turn), inline=True)
-    embed.add_field(name="Раскрытие", value=f"{settings.timer_seconds} сек.", inline=True)
+    embed.add_field(name="Таймер события", value=f"{settings.timer_seconds} сек.", inline=True)
     embed.add_field(name="Обсуждение", value=f"{settings.discussion_seconds} сек.", inline=True)
     embed.add_field(name="Голосование", value=f"{settings.voting_seconds} сек.", inline=True)
     embed.add_field(name="Подсказки", value="вкл" if settings.explain_for_newbies else "выкл", inline=True)
-    embed.add_field(name="Нет голоса", value=settings.missing_vote_policy.value, inline=True)
+    embed.add_field(name="Нет голоса", value=_vote_policy_label(settings.missing_vote_policy), inline=True)
     embed.add_field(name="Пак", value=f"custom #{settings.content_pack_id}" if settings.content_pack_id else "встроенный", inline=True)
     return embed
 

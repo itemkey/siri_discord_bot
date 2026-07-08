@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import unittest
 from dataclasses import replace
-from unittest.mock import AsyncMock
+from unittest.mock import ANY, AsyncMock
 
 import discord
 
@@ -17,6 +17,7 @@ from siri_bot.cogs.bunker import (
     BunkerPublicGameView,
     BunkerPublicRevealView,
     BunkerPublicSectionView,
+    BunkerRevealView,
     BunkerSettingsView,
     BunkerSetupIdleView,
     BunkerSetupNavView,
@@ -111,6 +112,67 @@ class FakeBunkerRepository:
 
     async def _get_setup_by_message(self, message_id: int) -> RoomSetup | None:
         return self.setup if message_id == self.setup.setup_message_id else None
+
+
+class FakeRevealRepository:
+    def __init__(self, game: BunkerGame, players: list[BunkerPlayer]) -> None:
+        self.game = game
+        self.players = players
+        self.get_game = AsyncMock(side_effect=self._get_game)
+        self.get_game_by_public_message = AsyncMock(side_effect=self._get_game_by_public_message)
+        self.list_players = AsyncMock(side_effect=self._list_players)
+        self.reveal_stat = AsyncMock(side_effect=self._reveal_stat)
+        self.add_event = AsyncMock()
+        self.set_reveal_progress = AsyncMock(side_effect=self._set_reveal_progress)
+        self.set_speech_index = AsyncMock(side_effect=self._set_speech_index)
+        self.set_game_state = AsyncMock(side_effect=self._set_game_state)
+
+    async def _get_game(self, game_id: int) -> BunkerGame | None:
+        return self.game if game_id == self.game.id else None
+
+    async def _get_game_by_public_message(self, message_id: int) -> tuple[BunkerGame, str]:
+        return self.game, "personal"
+
+    async def _list_players(self, game_id: int) -> list[BunkerPlayer]:
+        return list(self.players)
+
+    async def _reveal_stat(self, game_id: int, user_id: int, stat: str) -> None:
+        self.players = [
+            replace(player, revealed_stats=(*player.revealed_stats, stat))
+            if player.user_id == user_id and stat not in player.revealed_stats
+            else player
+            for player in self.players
+        ]
+
+    async def _set_reveal_progress(self, game_id: int, *, current_turn_index: int, reveals_done_this_turn: int) -> None:
+        self.game = replace(
+            self.game,
+            current_turn_index=current_turn_index,
+            reveals_done_this_turn=reveals_done_this_turn,
+        )
+
+    async def _set_speech_index(self, game_id: int, speech_index: int) -> None:
+        self.game = replace(self.game, speech_index=speech_index)
+
+    async def _set_game_state(
+        self,
+        game_id: int,
+        state: GameState,
+        *,
+        round_number: int,
+        phase_started_at,
+        phase_ends_at,
+        paused_at,
+    ) -> BunkerGame:
+        self.game = replace(
+            self.game,
+            state=state,
+            round_number=round_number,
+            phase_started_at=phase_started_at,
+            phase_ends_at=phase_ends_at,
+            paused_at=paused_at,
+        )
+        return self.game
 
 
 class BunkerCogTests(unittest.TestCase):
@@ -253,26 +315,48 @@ class BunkerCogTests(unittest.TestCase):
         interaction.followup.send.assert_not_called()
         saved.edit.assert_awaited_once()
 
-    def test_settings_view_has_compact_navigation_controls(self) -> None:
+    def test_settings_view_uses_select_only_main_page(self) -> None:
         view = BunkerSettingsView(cog=object(), setup_id=1, user_id=2, settings=BunkerSettings())
         labels = [child.label for child in view.children if isinstance(child, discord.ui.Button)]
         selects = [child for child in view.children if isinstance(child, discord.ui.Select)]
 
-        self.assertIn("Как играть", labels)
-        self.assertIn("Контент", labels)
+        self.assertEqual(labels, [])
+        self.assertEqual(len(selects), 5)
+        section_select = next(select for select in selects if str(select.placeholder).startswith("Раздел настроек"))
+        self.assertEqual([option.value for option in section_select.options], ["settings", "settings_rules", "content", "rules"])
         self.assertNotIn("Тип комнаты", labels)
-        room_kind_select = next(select for select in selects if select.placeholder == "Тип комнаты")
+        room_kind_select = next(select for select in selects if str(select.placeholder).startswith("Тип комнаты"))
         self.assertEqual([option.value for option in room_kind_select.options], [RoomKind.RANKED.value])
-        self.assertNotIn("Админ-режим", labels)
+        visibility_select = next(select for select in selects if str(select.placeholder).startswith("Доступ"))
+        self.assertEqual([option.value for option in visibility_select.options], ["public", "private"])
+        slots_select = next(select for select in selects if str(select.placeholder).startswith("Игроки"))
+        self.assertIn("8 игроков", [option.label for option in slots_select.options])
+        self.assertFalse(any(str(option.label).isdigit() for option in slots_select.options))
 
-        reveal_select = next(select for select in selects if str(select.placeholder).startswith("Характеристик за ход"))
+    def test_settings_rules_view_uses_descriptive_select_labels(self) -> None:
+        view = BunkerSettingsView(cog=object(), setup_id=1, user_id=2, settings=BunkerSettings(), screen="settings_rules")
+        labels = [child.label for child in view.children if isinstance(child, discord.ui.Button)]
+        selects = [child for child in view.children if isinstance(child, discord.ui.Select)]
+
+        self.assertEqual(labels, [])
+        self.assertEqual(len(selects), 5)
+        reveal_select = next(select for select in selects if str(select.placeholder).startswith("Reveal-ход"))
         self.assertEqual([option.value for option in reveal_select.options], ["1", "2", "3"])
+        self.assertIn("1 характеристика за ход", [option.label for option in reveal_select.options])
+        self.assertFalse(any(str(option.label).isdigit() for option in reveal_select.options))
+        timer_select = next(select for select in selects if str(select.placeholder).startswith("Таймер события"))
+        self.assertIn("180 сек.", [option.label for option in timer_select.options])
+        vote_select = next(select for select in selects if str(select.placeholder).startswith("Пропущенный голос"))
+        self.assertEqual([option.label for option in vote_select.options], ["Воздержаться", "Случайная цель"])
+        rounds_select = next(select for select in selects if str(select.placeholder).startswith("Раунды"))
+        self.assertIn("4 раунда", [option.label for option in rounds_select.options])
+        self.assertFalse(any(str(option.label).isdigit() for option in rounds_select.options))
 
     def test_operator_settings_room_kind_select_has_only_ranked_and_admin_game(self) -> None:
         view = BunkerSettingsView(cog=object(), setup_id=1, user_id=2, settings=BunkerSettings(), is_operator=True)
         selects = [child for child in view.children if isinstance(child, discord.ui.Select)]
 
-        room_kind_select = next(select for select in selects if select.placeholder == "Тип комнаты")
+        room_kind_select = next(select for select in selects if str(select.placeholder).startswith("Тип комнаты"))
 
         self.assertEqual([option.value for option in room_kind_select.options], [RoomKind.RANKED.value, RoomKind.ADMIN_TEST.value])
         self.assertNotIn("casual", [option.value for option in room_kind_select.options])
@@ -457,7 +541,8 @@ class BunkerCogTests(unittest.TestCase):
         labels = [child.label for child in view.children if isinstance(child, discord.ui.Button)]
         selects = [child for child in view.children if isinstance(child, discord.ui.Select)]
         self.assertNotIn("Тип комнаты", labels)
-        self.assertTrue(any(select.placeholder == "Тип комнаты" for select in selects))
+        self.assertTrue(any(str(select.placeholder).startswith("Тип комнаты") for select in selects))
+        self.assertTrue(any(str(select.placeholder).startswith("Раздел настроек") for select in selects))
 
     def test_ranked_active_panel_hides_debug_operator_controls(self) -> None:
         game = BunkerGame(
@@ -508,7 +593,7 @@ class BunkerCogTests(unittest.TestCase):
         self.assertNotIn("Следующая фаза", labels)
         self.assertNotIn("Правила", labels)
 
-    def test_public_reveal_view_has_round_stat_buttons_and_my_card(self) -> None:
+    def test_public_reveal_view_uses_red_hidden_and_gray_revealed_buttons(self) -> None:
         game = BunkerGame(
             id=55,
             guild_id=100,
@@ -547,13 +632,18 @@ class BunkerCogTests(unittest.TestCase):
 
         view = BunkerPublicRevealView(object(), game, player)
         buttons = [child for child in view.children if isinstance(child, discord.ui.Button)]
-        stat_buttons = [button for button in buttons if button.style == discord.ButtonStyle.secondary]
-        my_card_buttons = [button for button in buttons if button.style == discord.ButtonStyle.primary]
+        hidden_buttons = [button for button in buttons if button.style == discord.ButtonStyle.danger]
+        revealed_buttons = [
+            button
+            for button in buttons
+            if button.style == discord.ButtonStyle.secondary and button.disabled
+        ]
 
-        self.assertEqual(len(stat_buttons), 10)
-        self.assertEqual(len(my_card_buttons), 1)
-        self.assertTrue(any(button.disabled for button in stat_buttons))
-        self.assertTrue(any(not button.disabled for button in stat_buttons))
+        self.assertEqual(len(buttons), 10)
+        self.assertEqual(len(hidden_buttons), 9)
+        self.assertTrue(all(not button.disabled for button in hidden_buttons))
+        self.assertEqual(len(revealed_buttons), 1)
+        self.assertFalse(any(button.label == "Моя карточка" for button in buttons))
 
     def test_public_personal_embed_lists_round_stats_together(self) -> None:
         game = BunkerGame(
@@ -645,7 +735,58 @@ class BunkerCogTests(unittest.TestCase):
         self.assertEqual(len(stat_buttons), 10)
         self.assertTrue(all(button.disabled for button in stat_buttons))
 
-    def test_public_personal_embed_shows_admin_test_fake_card_values(self) -> None:
+    def test_private_reveal_view_uses_red_hidden_and_gray_revealed_buttons(self) -> None:
+        game = BunkerGame(
+            id=55,
+            guild_id=100,
+            setup_id=10,
+            setup_channel_id=300,
+            setup_message_id=500,
+            category_id=None,
+            game_text_channel_id=700,
+            voice_channel_id=800,
+            host_id=201,
+            state=GameState.REVEAL_PHASE,
+            settings=BunkerSettings(),
+            round_number=1,
+            phase_started_at=None,
+            phase_ends_at=None,
+            paused_at=None,
+            board_message_id=None,
+            profile=None,
+            turn_order=(201,),
+        )
+        player = BunkerPlayer(
+            game_id=55,
+            user_id=201,
+            display_name="Player",
+            is_host=True,
+            ready_at=None,
+            invited_at=None,
+            joined_at=None,
+            left_at=None,
+            is_eliminated=False,
+            card=generate_card(),
+            revealed_stats=("health",),
+            used_special_action=False,
+            immune_round=None,
+        )
+
+        view = BunkerRevealView(object(), game, player.user_id, player)
+        buttons = [child for child in view.children if isinstance(child, discord.ui.Button)]
+        hidden_buttons = [button for button in buttons if button.style == discord.ButtonStyle.danger]
+        revealed_buttons = [
+            button
+            for button in buttons
+            if button.style == discord.ButtonStyle.secondary and button.disabled
+        ]
+
+        self.assertEqual(len(buttons), 10)
+        self.assertEqual(len(hidden_buttons), 9)
+        self.assertTrue(all(not button.disabled for button in hidden_buttons))
+        self.assertEqual(len(revealed_buttons), 1)
+
+    def test_public_personal_embed_keeps_admin_test_fake_values_private(self) -> None:
         card = generate_card()
         game = BunkerGame(
             id=55,
@@ -689,10 +830,10 @@ class BunkerCogTests(unittest.TestCase):
         embed = _public_personal_embed(game, [player])
         values = "\n".join(str(field.value) for field in embed.fields)
 
-        self.assertIn(card.profession, values)
-        self.assertIn(card.health, values)
-        self.assertIn("Админ-игра", embed.description)
-        self.assertNotIn("видно", values)
+        self.assertNotIn(card.profession, values)
+        self.assertNotIn(card.health, values)
+        self.assertNotIn("Админ-игра", embed.description)
+        self.assertIn("?", values)
         self.assertIn("скрыто", values)
 
     def test_public_personal_embed_keeps_ranked_hidden_values_private(self) -> None:
@@ -738,6 +879,186 @@ class BunkerCogTests(unittest.TestCase):
 
         self.assertNotIn(card.profession, values)
         self.assertIn("?", values)
+
+    def test_public_reveal_does_not_allow_operator_to_reveal_for_fake_player(self) -> None:
+        game = BunkerGame(
+            id=55,
+            guild_id=100,
+            setup_id=10,
+            setup_channel_id=300,
+            setup_message_id=500,
+            category_id=None,
+            game_text_channel_id=700,
+            voice_channel_id=800,
+            host_id=200,
+            state=GameState.REVEAL_PHASE,
+            settings=BunkerSettings(room_kind=RoomKind.ADMIN_TEST, is_ranked=False, min_players=1),
+            round_number=1,
+            phase_started_at=None,
+            phase_ends_at=None,
+            paused_at=None,
+            board_message_id=None,
+            profile=None,
+            turn_order=(-1001,),
+            is_admin_game=True,
+            room_kind=RoomKind.ADMIN_TEST,
+        )
+        fake = BunkerPlayer(
+            game_id=55,
+            user_id=-1001,
+            display_name="Test survivor",
+            is_host=False,
+            ready_at=None,
+            invited_at=None,
+            joined_at=None,
+            left_at=None,
+            is_eliminated=False,
+            card=generate_card(),
+            revealed_stats=(),
+            used_special_action=False,
+            immune_round=None,
+            is_fake=True,
+        )
+        repository = FakeRevealRepository(game, [fake])
+        cog = Bunker.__new__(Bunker)
+        cog.repository = repository
+        interaction = FakeInteraction(message=FakeMessage(900))
+
+        asyncio.run(cog.public_reveal_selected_stat(interaction, "profession"))
+
+        repository.reveal_stat.assert_not_awaited()
+        interaction.followup.send.assert_awaited_once()
+
+    def test_auto_reveal_fake_player_opens_random_stat_and_advances_to_real_player(self) -> None:
+        game = BunkerGame(
+            id=55,
+            guild_id=100,
+            setup_id=10,
+            setup_channel_id=300,
+            setup_message_id=500,
+            category_id=None,
+            game_text_channel_id=700,
+            voice_channel_id=800,
+            host_id=200,
+            state=GameState.REVEAL_PHASE,
+            settings=BunkerSettings(room_kind=RoomKind.ADMIN_TEST, is_ranked=False, min_players=1),
+            round_number=1,
+            phase_started_at=None,
+            phase_ends_at=None,
+            paused_at=None,
+            board_message_id=None,
+            profile=None,
+            turn_order=(-1001, 200),
+            is_admin_game=True,
+            room_kind=RoomKind.ADMIN_TEST,
+        )
+        fake = BunkerPlayer(
+            game_id=55,
+            user_id=-1001,
+            display_name="Test survivor",
+            is_host=False,
+            ready_at=None,
+            invited_at=None,
+            joined_at=None,
+            left_at=None,
+            is_eliminated=False,
+            card=generate_card(),
+            revealed_stats=(),
+            used_special_action=False,
+            immune_round=None,
+            is_fake=True,
+        )
+        real = BunkerPlayer(
+            game_id=55,
+            user_id=200,
+            display_name="Player",
+            is_host=True,
+            ready_at=None,
+            invited_at=None,
+            joined_at=None,
+            left_at=None,
+            is_eliminated=False,
+            card=generate_card(),
+            revealed_stats=(),
+            used_special_action=False,
+            immune_round=None,
+        )
+        repository = FakeRevealRepository(game, [fake, real])
+        cog = Bunker.__new__(Bunker)
+        cog.repository = repository
+
+        asyncio.run(cog._auto_reveal_fake_turns(game.id))
+
+        repository.reveal_stat.assert_awaited_once_with(55, -1001, ANY)
+        repository.add_event.assert_awaited_once()
+        self.assertEqual(repository.game.current_turn_index, 1)
+        self.assertEqual(repository.game.reveals_done_this_turn, 0)
+        self.assertEqual(len(repository.players[0].revealed_stats), 1)
+
+    def test_auto_reveal_fake_player_respects_reveal_stats_per_turn(self) -> None:
+        game = BunkerGame(
+            id=55,
+            guild_id=100,
+            setup_id=10,
+            setup_channel_id=300,
+            setup_message_id=500,
+            category_id=None,
+            game_text_channel_id=700,
+            voice_channel_id=800,
+            host_id=200,
+            state=GameState.REVEAL_PHASE,
+            settings=BunkerSettings(room_kind=RoomKind.ADMIN_TEST, is_ranked=False, min_players=1, reveal_stats_per_turn=2),
+            round_number=1,
+            phase_started_at=None,
+            phase_ends_at=None,
+            paused_at=None,
+            board_message_id=None,
+            profile=None,
+            turn_order=(-1001, 200),
+            is_admin_game=True,
+            room_kind=RoomKind.ADMIN_TEST,
+        )
+        fake = BunkerPlayer(
+            game_id=55,
+            user_id=-1001,
+            display_name="Test survivor",
+            is_host=False,
+            ready_at=None,
+            invited_at=None,
+            joined_at=None,
+            left_at=None,
+            is_eliminated=False,
+            card=generate_card(),
+            revealed_stats=(),
+            used_special_action=False,
+            immune_round=None,
+            is_fake=True,
+        )
+        real = BunkerPlayer(
+            game_id=55,
+            user_id=200,
+            display_name="Player",
+            is_host=True,
+            ready_at=None,
+            invited_at=None,
+            joined_at=None,
+            left_at=None,
+            is_eliminated=False,
+            card=generate_card(),
+            revealed_stats=(),
+            used_special_action=False,
+            immune_round=None,
+        )
+        repository = FakeRevealRepository(game, [fake, real])
+        cog = Bunker.__new__(Bunker)
+        cog.repository = repository
+
+        asyncio.run(cog._auto_reveal_fake_turns(game.id))
+
+        self.assertEqual(repository.reveal_stat.await_count, 2)
+        self.assertEqual(repository.add_event.await_count, 2)
+        self.assertEqual(repository.game.current_turn_index, 1)
+        self.assertEqual(len(repository.players[0].revealed_stats), 2)
 
     def test_public_specials_embed_shows_admin_test_fake_abilities(self) -> None:
         card = generate_card()
@@ -944,6 +1265,8 @@ class BunkerCogTests(unittest.TestCase):
         self.assertNotIn("```text", embed.description or "")
         self.assertEqual(len(embed.fields), 8)
         self.assertTrue(all("\n" in field.value for field in embed.fields))
+        self.assertIn("1. Player 1 · жив", embed.fields[0].name)
+        self.assertNotIn("host", embed.fields[0].name)
 
     def test_admin_test_lobby_shows_test_controls_only_to_operator(self) -> None:
         game = BunkerGame(
