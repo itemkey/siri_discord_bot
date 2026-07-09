@@ -422,10 +422,17 @@ class LevelingRepository:
     ) -> list[PendingLevelupAnnouncement]:
         rows = await self.pool.fetch(
             """
-            SELECT guild_id, user_id, total_xp, last_levelup_announced_level
-            FROM leveling_member_xp
-            WHERE guild_id = $1 AND total_xp > 0
-            ORDER BY updated_at ASC, user_id ASC
+            SELECT xp.guild_id,
+                   xp.user_id,
+                   xp.total_xp,
+                   xp.last_levelup_announced_level,
+                   rewards.level AS announcement_level
+            FROM leveling_member_xp AS xp
+            JOIN leveling_role_rewards AS rewards ON rewards.guild_id = xp.guild_id
+            WHERE xp.guild_id = $1
+              AND xp.total_xp > 0
+              AND rewards.level > xp.last_levelup_announced_level
+            ORDER BY xp.updated_at ASC, xp.user_id ASC, rewards.level ASC
             """,
             guild_id,
         )
@@ -434,8 +441,9 @@ class LevelingRepository:
         for row in rows:
             total_xp = int(row["total_xp"])
             current_level = level_for_total_xp(total_xp, config)
+            announcement_level = int(row["announcement_level"])
             announced_level = int(row["last_levelup_announced_level"])
-            if current_level <= 0 or announced_level >= current_level:
+            if current_level <= 0 or announcement_level > current_level:
                 continue
             pending.append(
                 PendingLevelupAnnouncement(
@@ -443,10 +451,28 @@ class LevelingRepository:
                     user_id=int(row["user_id"]),
                     total_xp=total_xp,
                     current_level=current_level,
+                    announcement_level=announcement_level,
                     last_levelup_announced_level=announced_level,
                 )
             )
         return pending
+
+    async def get_reward_levels_between(self, guild_id: int, old_level: int, new_level: int) -> list[int]:
+        if new_level <= old_level:
+            return []
+
+        rows = await self.pool.fetch(
+            """
+            SELECT level
+            FROM leveling_role_rewards
+            WHERE guild_id = $1 AND level > $2 AND level <= $3
+            ORDER BY level ASC
+            """,
+            guild_id,
+            max(0, old_level),
+            new_level,
+        )
+        return [int(row["level"]) for row in rows]
 
     async def mark_levelup_announced(self, guild_id: int, user_id: int, level: int) -> None:
         await self.pool.execute(

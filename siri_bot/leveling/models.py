@@ -60,6 +60,7 @@ class PendingLevelupAnnouncement:
     user_id: int
     total_xp: int
     current_level: int
+    announcement_level: int
     last_levelup_announced_level: int
 
 

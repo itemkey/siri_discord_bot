@@ -4,15 +4,20 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
+import asyncpg
 import discord
 
 from siri_bot.cogs.leveling import (
+    RANK_PANEL_DATABASE_ERROR_MESSAGE,
+    RANK_PANEL_DISCORD_ERROR_MESSAGE,
+    RANK_PANEL_LEVEL_CUSTOM_ID,
     RANK_PANEL_MODE_LEADERBOARD,
     RANK_PANEL_MODE_RANK,
     Leveling,
     RankPanelLegacyRefreshDynamicButton,
     RankPanelRefreshDynamicButton,
     RankPanelResultView,
+    RankPanelView,
     _rank_panel_refresh_custom_id,
 )
 from siri_bot.leveling.models import LevelingSettings, PendingLevelupAnnouncement, XpChange
@@ -61,9 +66,16 @@ class FakeBot:
 
 class FakeResponse:
     def __init__(self) -> None:
-        self.defer = AsyncMock()
-        self.send_message = AsyncMock()
-        self.edit_message = AsyncMock()
+        self._done = False
+        self.defer = AsyncMock(side_effect=self._mark_done)
+        self.send_message = AsyncMock(side_effect=self._mark_done)
+        self.edit_message = AsyncMock(side_effect=self._mark_done)
+
+    def _mark_done(self, *args: object, **kwargs: object) -> None:
+        self._done = True
+
+    def is_done(self) -> bool:
+        return self._done
 
 
 class FakeMessage:
@@ -144,6 +156,50 @@ def _settings(*, channel_id: int | None = 300, enabled: bool = True) -> Leveling
 
 
 class LevelingPanelTests(unittest.TestCase):
+    def test_public_rank_panel_button_defers_and_edits_private_rank(self) -> None:
+        cog = Leveling.__new__(Leveling)
+        embed = discord.Embed(title="Rank")
+        cog._build_rank_embed = AsyncMock(return_value=embed)
+        interaction = FakeInteraction()
+        view = RankPanelView(cog)
+
+        asyncio.run(_button(view, RANK_PANEL_LEVEL_CUSTOM_ID).callback(interaction))
+
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+        interaction.response.send_message.assert_not_called()
+        interaction.edit_original_response.assert_awaited_once()
+        kwargs = interaction.edit_original_response.await_args.kwargs
+        self.assertIsNone(kwargs["content"])
+        self.assertIs(kwargs["embed"], embed)
+        self.assertIsInstance(kwargs["view"], RankPanelResultView)
+        self.assertEqual(kwargs["view"].mode, RANK_PANEL_MODE_RANK)
+
+    def test_public_rank_panel_button_reports_database_error(self) -> None:
+        cog = Leveling.__new__(Leveling)
+        cog._build_rank_embed = AsyncMock(side_effect=asyncpg.PostgresError("db down"))
+        interaction = FakeInteraction()
+        view = RankPanelView(cog)
+
+        asyncio.run(_button(view, RANK_PANEL_LEVEL_CUSTOM_ID).callback(interaction))
+
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+        interaction.edit_original_response.assert_not_called()
+        interaction.followup.send.assert_awaited_once_with(RANK_PANEL_DATABASE_ERROR_MESSAGE, ephemeral=True)
+
+    def test_public_rank_panel_button_reports_discord_response_error(self) -> None:
+        cog = Leveling.__new__(Leveling)
+        embed = discord.Embed(title="Rank")
+        cog._build_rank_embed = AsyncMock(return_value=embed)
+        interaction = FakeInteraction()
+        interaction.edit_original_response.side_effect = discord.HTTPException(FakeNotFoundResponse(), "missing")
+        view = RankPanelView(cog)
+
+        asyncio.run(_button(view, RANK_PANEL_LEVEL_CUSTOM_ID).callback(interaction))
+
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+        interaction.edit_original_response.assert_awaited_once()
+        interaction.followup.send.assert_awaited_once_with(RANK_PANEL_DISCORD_ERROR_MESSAGE, ephemeral=True)
+
     def test_public_rank_button_sends_private_result_menu_and_remembers_it(self) -> None:
         cog = Leveling.__new__(Leveling)
         embed = discord.Embed(title="Rank")
@@ -301,7 +357,7 @@ class LevelingPanelTests(unittest.TestCase):
         self.assertIs(kwargs["embed"], embed)
         self.assertEqual(kwargs["view"].mode, RANK_PANEL_MODE_LEADERBOARD)
 
-    def test_levelup_backfill_sends_pending_current_level_and_marks_it(self) -> None:
+    def test_levelup_backfill_sends_pending_reward_level_and_marks_it(self) -> None:
         channel = FakeChannel()
         guild = FakeGuild(channel)
         cog = Leveling.__new__(Leveling)
@@ -316,8 +372,9 @@ class LevelingPanelTests(unittest.TestCase):
                         PendingLevelupAnnouncement(
                             guild_id=100,
                             user_id=200,
-                            total_xp=1200,
-                            current_level=5,
+                            total_xp=2300,
+                            current_level=7,
+                            announcement_level=5,
                             last_levelup_announced_level=0,
                         )
                     ]
@@ -329,7 +386,7 @@ class LevelingPanelTests(unittest.TestCase):
         with patch("siri_bot.cogs.leveling.LEVELUP_BACKFILL_SEND_DELAY_SECONDS", 0):
             asyncio.run(Leveling._run_levelup_backfill(cog, 100))
 
-        channel.send.assert_awaited_once_with("<@200> reached level 5 with 1200 XP in Guild.")
+        channel.send.assert_awaited_once_with("<@200> reached level 5 with 2300 XP in Guild.")
         cog.repository.mark_levelup_announced.assert_awaited_once_with(100, 200, 5)
 
     def test_levelup_backfill_skips_when_no_pending_announcements(self) -> None:
@@ -370,6 +427,7 @@ class LevelingPanelTests(unittest.TestCase):
                             user_id=200,
                             total_xp=1200,
                             current_level=5,
+                            announcement_level=5,
                             last_levelup_announced_level=0,
                         )
                     ]
@@ -383,34 +441,78 @@ class LevelingPanelTests(unittest.TestCase):
         channel.send.assert_awaited_once()
         cog.repository.mark_levelup_announced.assert_not_called()
 
-    def test_send_levelup_marks_only_after_successful_send(self) -> None:
+    def test_send_levelup_marks_only_after_successful_reward_send(self) -> None:
         channel = FakeChannel()
         guild = FakeGuild(channel)
         member = FakeMember(guild)
         cog = Leveling.__new__(Leveling)
         cog.bot = FakeBot(guild)
-        cog.repository = type("Repo", (), {"mark_levelup_announced": AsyncMock()})()
+        cog.repository = type(
+            "Repo",
+            (),
+            {
+                "get_reward_levels_between": AsyncMock(return_value=[5]),
+                "mark_levelup_announced": AsyncMock(),
+            },
+        )()
         change = XpChange(
             guild_id=100,
             user_id=200,
-            old_total_xp=99,
-            new_total_xp=120,
-            old_level=0,
-            new_level=1,
-            amount=21,
+            old_total_xp=1000,
+            new_total_xp=1200,
+            old_level=4,
+            new_level=5,
+            amount=200,
         )
 
         asyncio.run(Leveling._send_levelup(cog, member, _settings(), change))
 
-        channel.send.assert_awaited_once_with("<@200> reached level 1 with 120 XP in Guild.")
-        cog.repository.mark_levelup_announced.assert_awaited_once_with(100, 200, 1)
+        cog.repository.get_reward_levels_between.assert_awaited_once_with(100, 4, 5)
+        channel.send.assert_awaited_once_with("<@200> reached level 5 with 1200 XP in Guild.")
+        cog.repository.mark_levelup_announced.assert_awaited_once_with(100, 200, 5)
+
+    def test_send_levelup_skips_non_reward_level(self) -> None:
+        channel = FakeChannel()
+        guild = FakeGuild(channel)
+        member = FakeMember(guild)
+        cog = Leveling.__new__(Leveling)
+        cog.bot = FakeBot(guild)
+        cog.repository = type(
+            "Repo",
+            (),
+            {
+                "get_reward_levels_between": AsyncMock(return_value=[]),
+                "mark_levelup_announced": AsyncMock(),
+            },
+        )()
+        change = XpChange(
+            guild_id=100,
+            user_id=200,
+            old_total_xp=1200,
+            new_total_xp=1500,
+            old_level=5,
+            new_level=6,
+            amount=300,
+        )
+
+        asyncio.run(Leveling._send_levelup(cog, member, _settings(), change))
+
+        channel.send.assert_not_called()
+        cog.repository.mark_levelup_announced.assert_not_called()
 
     def test_send_levelup_without_channel_leaves_announcement_pending(self) -> None:
         guild = FakeGuild()
         member = FakeMember(guild)
         cog = Leveling.__new__(Leveling)
         cog.bot = FakeBot(guild)
-        cog.repository = type("Repo", (), {"mark_levelup_announced": AsyncMock()})()
+        cog.repository = type(
+            "Repo",
+            (),
+            {
+                "get_reward_levels_between": AsyncMock(return_value=[1]),
+                "mark_levelup_announced": AsyncMock(),
+            },
+        )()
         change = XpChange(
             guild_id=100,
             user_id=200,

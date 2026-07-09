@@ -40,6 +40,8 @@ DURATION_PATTERN = re.compile(r"^(?P<amount>\d+)(?P<unit>s|m|h|d)$", re.IGNORECA
 LEADERBOARD_PAGE_SIZE = 10
 LEVELUP_BACKFILL_INTERVAL_MINUTES = 10.0
 LEVELUP_BACKFILL_SEND_DELAY_SECONDS = 0.5
+RANK_PANEL_DATABASE_ERROR_MESSAGE = "Не смог прочитать XP-таблицу. Проверь PostgreSQL и leveling-схему."
+RANK_PANEL_DISCORD_ERROR_MESSAGE = "Discord не принял ответ XP-панели. Открой панель заново и попробуй еще раз."
 RANK_PANEL_LEVEL_CUSTOM_ID = "siri:leveling:panel:rank"
 RANK_PANEL_LEADERBOARD_CUSTOM_ID = "siri:leveling:panel:leaderboard"
 RANK_PANEL_REFRESH_CUSTOM_ID = "siri:leveling:panel:refresh"
@@ -76,6 +78,27 @@ async def _complete_deferred_rank_notice(interaction: discord.Interaction) -> No
         await interaction.edit_original_response(content="XP-панель обновлена.", embed=None, view=None)
     except discord.HTTPException:
         LOGGER.info("Could not complete deferred leveling panel notice.", exc_info=True)
+
+
+async def _send_rank_panel_handled_error(
+    interaction: discord.Interaction,
+    mode: str,
+    *,
+    log_message: str,
+    user_message: str,
+) -> None:
+    guild = getattr(interaction, "guild", None)
+    channel = getattr(interaction, "channel", None)
+    user = getattr(interaction, "user", None)
+    LOGGER.exception(
+        "%s guild_id=%s channel_id=%s user_id=%s mode=%s",
+        log_message,
+        getattr(guild, "id", None),
+        getattr(channel, "id", None),
+        getattr(user, "id", None),
+        mode,
+    )
+    await send_safe_interaction_message(interaction, user_message)
 
 
 @dataclass
@@ -1054,6 +1077,14 @@ class Leveling(commands.Cog):
             LOGGER.exception("Failed to remove first place role %s from user %s", role_id, user_id)
 
     async def _send_levelup(self, member: discord.Member, settings: LevelingSettings, change: XpChange) -> None:
+        reward_levels = await self.repository.get_reward_levels_between(
+            member.guild.id,
+            change.old_level,
+            change.new_level,
+        )
+        if not reward_levels:
+            return
+
         if settings.levelup_channel_id is None:
             return
 
@@ -1061,17 +1092,18 @@ class Leveling(commands.Cog):
         if channel is None:
             return
 
-        text = _format_levelup_message(member, settings, change)
-        try:
-            await channel.send(text)
-        except discord.HTTPException:
-            LOGGER.exception("Failed to send levelup message in channel %s", settings.levelup_channel_id)
-            return
+        for reward_level in reward_levels:
+            text = _format_levelup_message(member, settings, change, level=reward_level)
+            try:
+                await channel.send(text)
+            except discord.HTTPException:
+                LOGGER.exception("Failed to send levelup message in channel %s", settings.levelup_channel_id)
+                return
 
-        try:
-            await self.repository.mark_levelup_announced(member.guild.id, member.id, change.new_level)
-        except asyncpg.PostgresError:
-            LOGGER.exception("Failed to mark level-up announcement for user %s", member.id)
+            try:
+                await self.repository.mark_levelup_announced(member.guild.id, member.id, reward_level)
+            except asyncpg.PostgresError:
+                LOGGER.exception("Failed to mark level-up announcement for user %s", member.id)
 
     def _schedule_levelup_backfill(self, guild_id: int) -> None:
         active_guild_ids = self._levelup_backfill_active_guild_ids()
@@ -1108,7 +1140,7 @@ class Leveling(commands.Cog):
                     return
 
                 try:
-                    await self.repository.mark_levelup_announced(guild.id, announcement.user_id, announcement.current_level)
+                    await self.repository.mark_levelup_announced(guild.id, announcement.user_id, announcement.announcement_level)
                 except asyncpg.PostgresError:
                     LOGGER.exception("Failed to mark backfilled level-up announcement for user %s", announcement.user_id)
 
@@ -1287,9 +1319,7 @@ class RankPanelView(SafeView):
         custom_id=RANK_PANEL_LEVEL_CUSTOM_ID,
     )
     async def show_rank(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        setattr(interaction, "_siri_complete_deferred_rank_notice", True)
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        await self.cog._send_rank_panel_response(interaction)
+        await self._handle_panel_button(interaction, RANK_PANEL_MODE_RANK)
 
     @discord.ui.button(
         label="Топ сервера",
@@ -1297,9 +1327,31 @@ class RankPanelView(SafeView):
         custom_id=RANK_PANEL_LEADERBOARD_CUSTOM_ID,
     )
     async def show_leaderboard(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._handle_panel_button(interaction, RANK_PANEL_MODE_LEADERBOARD)
+
+    async def _handle_panel_button(self, interaction: discord.Interaction, mode: str) -> None:
         setattr(interaction, "_siri_complete_deferred_rank_notice", True)
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        await self.cog._send_leaderboard_panel_response(interaction)
+        try:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            if mode == RANK_PANEL_MODE_LEADERBOARD:
+                await self.cog._send_leaderboard_panel_response(interaction)
+                return
+
+            await self.cog._send_rank_panel_response(interaction)
+        except asyncpg.PostgresError:
+            await _send_rank_panel_handled_error(
+                interaction,
+                mode,
+                log_message="Could not load XP panel data.",
+                user_message=RANK_PANEL_DATABASE_ERROR_MESSAGE,
+            )
+        except discord.HTTPException:
+            await _send_rank_panel_handled_error(
+                interaction,
+                mode,
+                log_message="Could not complete XP panel interaction response.",
+                user_message=RANK_PANEL_DISCORD_ERROR_MESSAGE,
+            )
 
 
 class RankPanelResultView(SafeView):
@@ -1401,12 +1453,12 @@ def _format_levelup_text(
     return text
 
 
-def _format_levelup_message(member: discord.Member, settings: LevelingSettings, change: XpChange) -> str:
+def _format_levelup_message(member: discord.Member, settings: LevelingSettings, change: XpChange, *, level: int) -> str:
     return _format_levelup_text(
         user_mention=member.mention,
         guild_name=member.guild.name,
         settings=settings,
-        level=change.new_level,
+        level=level,
         total_xp=change.new_total_xp,
     )
 
@@ -1420,7 +1472,7 @@ def _format_pending_levelup_message(
         user_mention=f"<@{announcement.user_id}>",
         guild_name=guild.name,
         settings=settings,
-        level=announcement.current_level,
+        level=announcement.announcement_level,
         total_xp=announcement.total_xp,
     )
 

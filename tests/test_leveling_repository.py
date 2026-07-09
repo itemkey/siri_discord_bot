@@ -76,6 +76,8 @@ class LevelingRepositoryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_pending_levelup_announcements_are_marked(self) -> None:
         config = FormulaConfig()
+        await self.repository.upsert_role_reward(100, 5, 500)
+        await self.repository.upsert_role_reward(100, 10, 1000)
         await self.repository.add_xp(100, 1, 1200, config)
         await self.repository.add_xp(100, 2, 99, config)
 
@@ -94,14 +96,18 @@ class LevelingRepositoryTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([announcement.user_id for announcement in pending], [1])
         self.assertEqual(pending[0].current_level, 5)
+        self.assertEqual(pending[0].announcement_level, 5)
         self.assertEqual(pending[0].last_levelup_announced_level, 0)
+        self.assertEqual(await self.repository.get_reward_levels_between(100, 4, 10), [5, 10])
+        self.assertEqual(await self.repository.get_reward_levels_between(100, 5, 9), [])
 
-        await self.repository.mark_levelup_announced(100, 1, pending[0].current_level)
+        await self.repository.mark_levelup_announced(100, 1, pending[0].announcement_level)
         self.assertEqual(await self.repository.get_pending_levelup_announcements(100, config), [])
 
         await self.repository.set_levelup_announced_level(100, 1, 2)
         pending_after_silent_lowering = await self.repository.get_pending_levelup_announcements(100, config)
         self.assertEqual([announcement.user_id for announcement in pending_after_silent_lowering], [1])
+        self.assertEqual(pending_after_silent_lowering[0].announcement_level, 5)
         self.assertEqual(pending_after_silent_lowering[0].last_levelup_announced_level, 2)
 
 
