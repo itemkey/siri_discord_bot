@@ -4080,18 +4080,30 @@ def _bunker_profile_embed(game: BunkerGame) -> discord.Embed:
     water_months = _resource_duration_months(resources.water, min_months=6, max_months=54)
     electricity_months = _resource_duration_months(resources.electricity, min_months=24, max_months=120)
     stay_months = min(food_months, water_months, electricity_months)
-    lines = [
-        f"Планировка: {game.profile.layout}",
-        f"Дефект: {game.profile.defect}",
-        f"Мест: {seats}",
-        f"Можно находиться: около {_format_duration_months(stay_months)}",
-        f"Еда: запас примерно на {_format_duration_months(food_months)}",
-        f"Вода: запас примерно на {_format_duration_months(water_months)}",
-        f"Электричество: автономность около {_format_duration_months(electricity_months)}",
-        f"Мораль: {_morale_level(resources.morale)}",
-        f"Радиация: {_radiation_level(resources.radiation)}",
+    sections = [
+        (
+            "**Срок выживания**\n"
+            f"Нужно находиться: **{_format_duration_months(stay_months)}**\n"
+            f"Мест в бункере: **{seats}**"
+        ),
+        (
+            "**Устройство**\n"
+            f"Планировка: {game.profile.layout}\n"
+            f"Дефект: {game.profile.defect}"
+        ),
+        (
+            "**Запасы**\n"
+            f"Еда: хватит на **{_format_duration_months(food_months)}**\n"
+            f"Вода: хватит на **{_format_duration_months(water_months)}**\n"
+            f"Электричество: автономность **{_format_duration_months(electricity_months)}**"
+        ),
+        (
+            "**Состояние**\n"
+            f"Мораль: {_morale_level(resources.morale)}\n"
+            f"Радиация: {_radiation_level(resources.radiation)}"
+        ),
     ]
-    embed.description = "\n----\n".join(lines)[:4096]
+    embed.description = "\n\n".join(sections)[:4096]
     return embed
 
 
