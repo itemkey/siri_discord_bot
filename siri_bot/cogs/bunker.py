@@ -4076,18 +4076,57 @@ def _bunker_profile_embed(game: BunkerGame) -> discord.Embed:
 
     resources = game.profile.resources
     seats = game.settings.bunker_seats or max(2, game.settings.slots // 2)
-    table = [
-        ("Планировка", game.profile.layout),
-        ("Дефект", game.profile.defect),
-        ("Мест", str(seats)),
-        ("Еда", f"{resources.food}%"),
-        ("Вода", f"{resources.water}%"),
-        ("Электричество", f"{resources.electricity}%"),
-        ("Мораль", f"{resources.morale}%"),
-        ("Радиация", f"{resources.radiation}%"),
+    food_months = _resource_duration_months(resources.food, min_months=12, max_months=72)
+    water_months = _resource_duration_months(resources.water, min_months=6, max_months=54)
+    electricity_months = _resource_duration_months(resources.electricity, min_months=24, max_months=120)
+    stay_months = min(food_months, water_months, electricity_months)
+    lines = [
+        f"Планировка: {game.profile.layout}",
+        f"Дефект: {game.profile.defect}",
+        f"Мест: {seats}",
+        f"Можно находиться: около {_format_duration_months(stay_months)}",
+        f"Еда: запас примерно на {_format_duration_months(food_months)}",
+        f"Вода: запас примерно на {_format_duration_months(water_months)}",
+        f"Электричество: автономность около {_format_duration_months(electricity_months)}",
+        f"Мораль: {_morale_level(resources.morale)}",
+        f"Радиация: {_radiation_level(resources.radiation)}",
     ]
-    embed.description = _two_column_table(table)
+    embed.description = "\n----\n".join(lines)[:4096]
     return embed
+
+
+def _resource_duration_months(value: int, *, min_months: int, max_months: int) -> int:
+    clamped = max(0, min(100, value))
+    return round(min_months + (max_months - min_months) * clamped / 100)
+
+
+def _format_duration_months(months: int) -> str:
+    months = max(1, months)
+    if months < 12:
+        return f"{months} {_plural_ru(months, 'месяц', 'месяца', 'месяцев')}"
+
+    years = months // 12
+    remaining_months = months % 12
+    year_text = f"{years} {_plural_ru(years, 'год', 'года', 'лет')}"
+    if remaining_months == 0:
+        return year_text
+    return f"{year_text} {remaining_months} {_plural_ru(remaining_months, 'месяц', 'месяца', 'месяцев')}"
+
+
+def _morale_level(value: int) -> str:
+    if value >= 75:
+        return "высокая"
+    if value >= 45:
+        return "средняя"
+    return "низкая"
+
+
+def _radiation_level(value: int) -> str:
+    if value <= 20:
+        return "низкая"
+    if value <= 50:
+        return "повышенная"
+    return "опасная"
 
 
 def _reveal_choice_status(game: BunkerGame, player: BunkerPlayer) -> str:
@@ -4386,10 +4425,10 @@ def _personal_card_embed(player: BunkerPlayer, *, status: str | None = None) -> 
         return embed
     rows = []
     for stat in REVEALABLE_STATS:
-        marker = "раскрыто" if stat in player.revealed_stats else "скрыта"
-        rows.append((CARD_STAT_LABELS[stat], f"{getattr(player.card, stat)} ({marker})"))
-    table = _two_column_table(rows)
-    embed.description = f"{status}\n\n{table}" if status else table
+        marker = "раскрыта" if stat in player.revealed_stats else "скрыта"
+        rows.append(f"{CARD_STAT_LABELS[stat]}: {getattr(player.card, stat)} ({marker})")
+    card_text = "\n----------------------------------\n".join(rows)
+    embed.description = f"{status}\n\n{card_text}" if status else card_text
     return embed
 
 

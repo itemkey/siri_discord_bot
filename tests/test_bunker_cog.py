@@ -25,6 +25,7 @@ from siri_bot.cogs.bunker import (
     BunkerSettingsView,
     BunkerSetupIdleView,
     BunkerSetupNavView,
+    _bunker_profile_embed,
     _game_embed,
     _leader_view_for_game,
     format_player_name,
@@ -38,7 +39,7 @@ from siri_bot.cogs.bunker import (
     _setup_embed,
 )
 from siri_bot.bunker.models import BunkerPlayer, BunkerSettings, RoomKind, RoomSetup
-from siri_bot.bunker.models import BunkerGame, GameState
+from siri_bot.bunker.models import BunkerGame, BunkerProfile, BunkerResources, GameState
 from siri_bot.bunker.engine import generate_card
 
 
@@ -413,6 +414,47 @@ class BunkerCogTests(unittest.TestCase):
         )
         self.assertNotIn("personal", game.public_message_ids)
         self.assertNotIn("specials", game.public_message_ids)
+
+    def test_bunker_profile_embed_describes_resources_without_percent_table(self) -> None:
+        game = BunkerGame(
+            id=55,
+            guild_id=100,
+            setup_id=10,
+            setup_channel_id=300,
+            setup_message_id=500,
+            category_id=None,
+            game_text_channel_id=700,
+            voice_channel_id=800,
+            host_id=201,
+            state=GameState.REVEAL_PHASE,
+            settings=BunkerSettings(slots=8, bunker_seats=4),
+            round_number=1,
+            phase_started_at=None,
+            phase_ends_at=None,
+            paused_at=None,
+            board_message_id=None,
+            profile=BunkerProfile(
+                apocalypse="Затяжная зима",
+                layout="три жилых отсека и мастерская",
+                defect="один жилой отсек поврежден и требует ремонта",
+                resources=BunkerResources(food=66, water=72, electricity=58, morale=84, radiation=14),
+            ),
+        )
+
+        embed = _bunker_profile_embed(game)
+        description = embed.description or ""
+
+        self.assertNotIn("%", description)
+        self.assertNotIn("```", description)
+        self.assertNotIn(" : ", description)
+        self.assertIn("Дефект: один жилой отсек поврежден и требует ремонта", description)
+        self.assertIn("\n----\n", description)
+        self.assertIn("Можно находиться: около ", description)
+        self.assertIn("Еда: запас примерно на ", description)
+        self.assertIn("Вода: запас примерно на ", description)
+        self.assertIn("Электричество: автономность около ", description)
+        self.assertIn("Мораль: высокая", description)
+        self.assertIn("Радиация: низкая", description)
 
     def test_setup_embed_is_factory_not_busy_state(self) -> None:
         embed = _setup_embed("build-a-bunker")
@@ -1374,10 +1416,11 @@ class BunkerCogTests(unittest.TestCase):
 
         embed = _personal_card_embed(player)
 
-        self.assertIn(card.profession, embed.description)
-        self.assertIn(card.health, embed.description)
-        self.assertIn("скрыта", embed.description)
-        self.assertIn("раскрыто", embed.description)
+        description = embed.description or ""
+        self.assertIn(f"Профессия: {card.profession} (скрыта)", description)
+        self.assertIn(f"Здоровье: {card.health} (раскрыта)", description)
+        self.assertIn("\n----------------------------------\nВозраст:", description)
+        self.assertNotIn("Профессия                    :", description)
         self.assertNotIn("?", embed.description)
 
     def test_private_abilities_show_owner_values_and_red_hidden_buttons(self) -> None:
