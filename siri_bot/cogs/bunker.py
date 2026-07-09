@@ -102,6 +102,8 @@ GAME_RULES_ID = "siri:bunker:game:rules"
 GAME_CHAOS_ID = "siri:bunker:game:chaos"
 
 SPEECH_HANDOFF_SECONDS = 15
+# Ephemeral Discord views with timeout=None are forced to 15 minutes by discord.py.
+PRIVATE_VIEW_TIMEOUT_SECONDS = 30 * 24 * 60 * 60
 
 
 class Bunker(commands.Cog):
@@ -620,7 +622,7 @@ class Bunker(commands.Cog):
             await interaction.response.send_message("Эта панель работает в игровом text-канале бункера.", ephemeral=True)
             return
 
-        await self.send_or_edit_private_panel(interaction, game, screen=screen, status=status, force_current_response=True)
+        await self.send_or_edit_private_panel(interaction, game, screen=screen, status=status)
 
     async def send_or_edit_private_panel(
         self,
@@ -1743,7 +1745,6 @@ class Bunker(commands.Cog):
             self._setup_panel_key(interaction, setup),
             embed=embed,
             view=view,
-            force_current_response=_message_has_setup_panel_embed(getattr(interaction, "message", None)),
         )
 
     async def show_setup_rules(self, interaction: discord.Interaction) -> None:
@@ -2884,7 +2885,7 @@ class BunkerPrivatePlayerPanelView(discord.ui.View):
         can_close: bool = False,
         players: list[BunkerPlayer] | None = None,
     ) -> None:
-        super().__init__(timeout=900)
+        super().__init__(timeout=PRIVATE_VIEW_TIMEOUT_SECONDS)
         self.cog = cog
         self.game = game
         self.player = player
@@ -3007,7 +3008,7 @@ class BunkerPrivatePlayerPanelView(discord.ui.View):
 
 class BunkerPanelBackView(discord.ui.View):
     def __init__(self, cog: Bunker, game_id: int) -> None:
-        super().__init__(timeout=900)
+        super().__init__(timeout=PRIVATE_VIEW_TIMEOUT_SECONDS)
         self.cog = cog
         self.game_id = game_id
 
@@ -3023,7 +3024,7 @@ class BunkerPanelBackView(discord.ui.View):
 
 class BunkerCloseConfirmView(discord.ui.View):
     def __init__(self, cog: Bunker, game_id: int) -> None:
-        super().__init__(timeout=900)
+        super().__init__(timeout=PRIVATE_VIEW_TIMEOUT_SECONDS)
         self.cog = cog
         self.game_id = game_id
 
@@ -3051,7 +3052,7 @@ class BunkerSetupHostConflictView(discord.ui.View):
         *,
         is_operator: bool,
     ) -> None:
-        super().__init__(timeout=900)
+        super().__init__(timeout=PRIVATE_VIEW_TIMEOUT_SECONDS)
         self.cog = cog
         self.setup_id = setup_id
         self.user_id = user_id
@@ -3321,7 +3322,7 @@ class BunkerSetupNavView(discord.ui.View):
         is_operator: bool = False,
         voice_url: str | None = None,
     ) -> None:
-        super().__init__(timeout=900)
+        super().__init__(timeout=PRIVATE_VIEW_TIMEOUT_SECONDS)
         self.cog = cog
         self.setup_id = setup_id
         self.user_id = user_id
@@ -3374,7 +3375,7 @@ class BunkerSetupContentView(discord.ui.View):
         is_operator: bool,
         game_id: int | None = None,
     ) -> None:
-        super().__init__(timeout=900)
+        super().__init__(timeout=PRIVATE_VIEW_TIMEOUT_SECONDS)
         self.cog = cog
         self.setup_id = setup_id
         self.user_id = user_id
@@ -3487,7 +3488,7 @@ class BunkerSettingsView(discord.ui.View):
         game_id: int | None = None,
         screen: str = "settings",
     ) -> None:
-        super().__init__(timeout=900)
+        super().__init__(timeout=PRIVATE_VIEW_TIMEOUT_SECONDS)
         self.cog = cog
         self.setup_id = setup_id
         self.user_id = user_id
@@ -3878,7 +3879,7 @@ class BunkerRoundsSelect(discord.ui.Select):
 
 class BunkerRevealView(discord.ui.View):
     def __init__(self, cog: Bunker, game: BunkerGame, user_id: int, player: BunkerPlayer) -> None:
-        super().__init__(timeout=900)
+        super().__init__(timeout=PRIVATE_VIEW_TIMEOUT_SECONDS)
         self.cog = cog
         self.game_id = game.id
         turn_limit_reached = reveal_turn_remaining(player, game.settings, game.reveals_done_this_turn) <= 0
@@ -3919,7 +3920,7 @@ class BunkerVoteView(discord.ui.View):
         voter_id: int,
         existing_vote: Vote | None = None,
     ) -> None:
-        super().__init__(timeout=900)
+        super().__init__(timeout=PRIVATE_VIEW_TIMEOUT_SECONDS)
         locked = existing_vote is not None
         selected_id = existing_vote.target_user_id if existing_vote is not None else None
         for index, player in enumerate(players[:20]):
@@ -3939,7 +3940,7 @@ class BunkerVoteView(discord.ui.View):
 
 class BunkerEliminatedView(discord.ui.View):
     def __init__(self, cog: Bunker, game_id: int, user_id: int, *, disabled: bool = False) -> None:
-        super().__init__(timeout=900)
+        super().__init__(timeout=PRIVATE_VIEW_TIMEOUT_SECONDS)
         self.cog = cog
         self.game_id = game_id
         self.user_id = user_id
@@ -3963,7 +3964,7 @@ class BunkerEliminatedView(discord.ui.View):
 
 class BunkerActionView(discord.ui.View):
     def __init__(self, cog: Bunker, game_id: int, player: BunkerPlayer) -> None:
-        super().__init__(timeout=900)
+        super().__init__(timeout=PRIVATE_VIEW_TIMEOUT_SECONDS)
         self.cog = cog
         self.game_id = game_id
         self.user_id = player.user_id
@@ -4017,7 +4018,7 @@ class BunkerAbilityTargetView(discord.ui.View):
         ability_index: int,
         targets: list[BunkerPlayer],
     ) -> None:
-        super().__init__(timeout=900)
+        super().__init__(timeout=PRIVATE_VIEW_TIMEOUT_SECONDS)
         for index, target in enumerate(targets[:20]):
             button = discord.ui.Button(label=target.display_name[:80], style=discord.ButtonStyle.secondary, row=index // 4)
 
@@ -4154,18 +4155,20 @@ def _players_table_embed(game: BunkerGame, players: list[BunkerPlayer]) -> disco
     left_count = sum(1 for player in players if player.left_at is not None)
     embed = discord.Embed(
         title="Желающие попасть в бункер",
-        description="Участники разделены на отдельные карточки, чтобы состав было проще читать.",
+        description=(
+            "**Сводка партии**\n"
+            f"Мест в бункере: `{seats}`\n"
+            f"Живые: `{alive_count}`\n"
+            f"Выбыли: `{eliminated_count + left_count}`"
+        ),
         color=discord.Color.blurple(),
     )
-    embed.add_field(name="Мест в бункере", value=str(seats), inline=True)
-    embed.add_field(name="Живые", value=str(alive_count), inline=True)
-    embed.add_field(name="Выбыли", value=str(eliminated_count + left_count), inline=True)
 
     for index, player in enumerate(visible_players, start=1):
         embed.add_field(
             name=f"{index}. {_compact_player_name(player)}",
             value=_player_roster_card_value(player),
-            inline=True,
+            inline=False,
         )
     if len(players) > 16:
         embed.add_field(name="Еще игроки", value=f"Не показано: {len(players) - 16}", inline=False)
@@ -4173,16 +4176,20 @@ def _players_table_embed(game: BunkerGame, players: list[BunkerPlayer]) -> disco
     return embed
 
 
+_PLAYER_ROSTER_SEPARATOR = "━━━━━━━━━━━━━━━━━━━━━━━━"
+
+
 def _player_roster_card_value(player: BunkerPlayer) -> str:
     revealed = [stat for stat in REVEALABLE_STATS if stat in player.revealed_stats]
     hidden_count = len(REVEALABLE_STATS) - len(revealed)
     lines = [
+        _PLAYER_ROSTER_SEPARATOR,
         f"Статус: `{_player_status_label(player)}`",
         f"Открыто: `{len(revealed)}` · скрыто: `{hidden_count}`",
     ]
     if player.card is None or not revealed:
         lines.append("Пока нет открытых характеристик.")
-        return "\n".join(lines)
+        return _limit_embed_value("\n".join(lines), 1024)
 
     lines.append("Открытые данные:")
     for stat in revealed[:3]:

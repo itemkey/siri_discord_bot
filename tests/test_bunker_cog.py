@@ -264,7 +264,7 @@ class BunkerCogTests(unittest.TestCase):
         self.assertIn(GAME_FINISH_SPEECH_ID, speech_ids)
         self.assertNotIn(GAME_FINISH_SPEECH_ID, pause_ids)
 
-    def test_public_panel_button_reopens_current_response_instead_of_hidden_saved_panel(self) -> None:
+    def test_public_panel_button_reuses_saved_private_panel_without_duplicate(self) -> None:
         game = BunkerGame(
             id=55,
             guild_id=100,
@@ -316,10 +316,12 @@ class BunkerCogTests(unittest.TestCase):
 
         asyncio.run(cog.open_game_panel(interaction))
 
-        hidden.edit.assert_not_called()
-        interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
-        interaction.edit_original_response.assert_awaited_once()
-        self.assertIs(cog._game_private_panels[(55, 300, 200)], interaction.original_message)
+        hidden.edit.assert_awaited_once()
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+        interaction.response.edit_message.assert_not_called()
+        interaction.edit_original_response.assert_not_awaited()
+        interaction.followup.send.assert_not_awaited()
+        self.assertIs(cog._game_private_panels[(55, 300, 200)], hidden)
 
     def test_public_section_view_uses_persistent_custom_ids(self) -> None:
         view = BunkerPublicSectionView(cog=object(), game_id=55, key="players", collapsed=False)
@@ -474,7 +476,7 @@ class BunkerCogTests(unittest.TestCase):
         self.assertEqual(kwargs["embed"].title, "Встроенный контент-пак")
         self.assertIsInstance(kwargs["view"], BunkerSetupNavView)
 
-    def test_public_setup_button_opens_private_panel_without_editing_public_message(self) -> None:
+    def test_public_setup_button_reuses_saved_private_panel_without_duplicate(self) -> None:
         setup = RoomSetup(
             id=10,
             guild_id=100,
@@ -493,11 +495,44 @@ class BunkerCogTests(unittest.TestCase):
 
         asyncio.run(cog.open_setup_panel(interaction, screen="settings"))
 
-        hidden.edit.assert_not_called()
+        hidden.edit.assert_awaited_once()
         interaction.response.edit_message.assert_not_called()
-        interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
-        interaction.edit_original_response.assert_awaited_once()
-        self.assertIs(cog._setup_private_panels[(10, 300, 200)], interaction.original_message)
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+        interaction.edit_original_response.assert_not_awaited()
+        interaction.followup.send.assert_not_awaited()
+        self.assertIs(cog._setup_private_panels[(10, 300, 200)], hidden)
+
+    def test_public_setup_button_replaces_expired_private_panel_without_editing_public_message(self) -> None:
+        setup = RoomSetup(
+            id=10,
+            guild_id=100,
+            setup_channel_id=300,
+            category_id=None,
+            setup_message_id=500,
+            room_name="build-a-bunker",
+            active_game_id=None,
+        )
+        expired = FakeMessage(700)
+        replacement = FakeMessage(901)
+        response = type("Response", (), {"status": 404, "reason": "not found"})()
+        expired.edit.side_effect = discord.HTTPException(response, "expired")
+        cog = Bunker.__new__(Bunker)
+        cog.repository = FakeBunkerRepository(setup)
+        cog._setup_private_panels = {(10, 300, 200): expired}
+        public_message = FakeMessage(500, embeds=[_setup_embed("build-a-bunker")])
+        interaction = FakeInteraction(message=public_message, original_message=FakeMessage(900), followup_message=replacement)
+
+        asyncio.run(cog.open_setup_panel(interaction, screen="settings"))
+
+        expired.edit.assert_awaited_once()
+        interaction.response.edit_message.assert_not_called()
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True)
+        interaction.edit_original_response.assert_not_awaited()
+        interaction.followup.send.assert_awaited_once()
+        kwargs = interaction.followup.send.await_args.kwargs
+        self.assertTrue(kwargs["ephemeral"])
+        self.assertTrue(kwargs["wait"])
+        self.assertIs(cog._setup_private_panels[(10, 300, 200)], replacement)
 
     def test_private_panel_uses_deferred_original_response_without_new_message(self) -> None:
         cog = Bunker.__new__(Bunker)
@@ -2108,15 +2143,21 @@ class BunkerCogTests(unittest.TestCase):
 
         embed = _players_table_embed(game, players)
 
-        self.assertNotIn("```text", embed.description or "")
-        self.assertEqual(len(embed.fields), 11)
-        self.assertTrue(all("\n" in field.value for field in embed.fields[3:]))
-        self.assertEqual(embed.fields[0].name, "Мест в бункере")
-        player_fields = embed.fields[3:]
+        description = embed.description or ""
+        self.assertNotIn("```text", description)
+        self.assertIn("Мест в бункере: `4`", description)
+        self.assertIn("Живые: `8`", description)
+        self.assertIn("Выбыли: `0`", description)
+        self.assertEqual(len(embed.fields), 8)
+        player_fields = embed.fields
         self.assertEqual(len(player_fields), 8)
+        self.assertTrue(all(not field.inline for field in player_fields))
+        self.assertTrue(all("\n" in field.value for field in player_fields))
         self.assertEqual(player_fields[0].name, "1. Player 1")
+        self.assertIn("━━━━━━━━", player_fields[0].value)
         self.assertIn("Статус:", player_fields[0].value)
         self.assertIn("Открыто:", player_fields[0].value)
+        self.assertNotIn("```text", player_fields[0].value)
         self.assertNotIn("host", player_fields[0].name)
 
     def test_admin_test_lobby_shows_test_controls_only_to_operator(self) -> None:
