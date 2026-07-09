@@ -74,6 +74,36 @@ class LevelingRepositoryTests(unittest.IsolatedAsyncioTestCase):
         await self.repository.reset_guild_progress(100)
         self.assertEqual(await self.repository.get_leaderboard(100, limit=10, offset=0), [])
 
+    async def test_pending_levelup_announcements_are_marked(self) -> None:
+        config = FormulaConfig()
+        await self.repository.add_xp(100, 1, 1200, config)
+        await self.repository.add_xp(100, 2, 99, config)
+
+        row = await self.pool.fetchrow(
+            """
+            SELECT last_levelup_announced_level
+            FROM leveling_member_xp
+            WHERE guild_id = $1 AND user_id = $2
+            """,
+            100,
+            1,
+        )
+        self.assertEqual(row["last_levelup_announced_level"], 0)
+
+        pending = await self.repository.get_pending_levelup_announcements(100, config)
+
+        self.assertEqual([announcement.user_id for announcement in pending], [1])
+        self.assertEqual(pending[0].current_level, 5)
+        self.assertEqual(pending[0].last_levelup_announced_level, 0)
+
+        await self.repository.mark_levelup_announced(100, 1, pending[0].current_level)
+        self.assertEqual(await self.repository.get_pending_levelup_announcements(100, config), [])
+
+        await self.repository.set_levelup_announced_level(100, 1, 2)
+        pending_after_silent_lowering = await self.repository.get_pending_levelup_announcements(100, config)
+        self.assertEqual([announcement.user_id for announcement in pending_after_silent_lowering], [1])
+        self.assertEqual(pending_after_silent_lowering[0].last_levelup_announced_level, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

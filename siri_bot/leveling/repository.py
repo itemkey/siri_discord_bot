@@ -6,7 +6,14 @@ from typing import Any, Sequence
 import asyncpg
 
 from siri_bot.leveling.formula import FormulaConfig, level_for_total_xp, resolve_booster_multiplier
-from siri_bot.leveling.models import Booster, LeaderboardEntry, LevelingSettings, VoiceSession, XpChange
+from siri_bot.leveling.models import (
+    Booster,
+    LeaderboardEntry,
+    LevelingSettings,
+    PendingLevelupAnnouncement,
+    VoiceSession,
+    XpChange,
+)
 
 
 DEFAULT_LEVELUP_MESSAGE = "{user} достиг(ла) уровня {level}."
@@ -46,6 +53,7 @@ class LevelingRepository:
                     guild_id BIGINT NOT NULL,
                     user_id BIGINT NOT NULL,
                     total_xp BIGINT NOT NULL DEFAULT 0,
+                    last_levelup_announced_level INTEGER NOT NULL DEFAULT 0,
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     PRIMARY KEY (guild_id, user_id)
                 );
@@ -98,6 +106,12 @@ class LevelingRepository:
                     ON leveling_member_xp (guild_id, total_xp DESC, updated_at ASC);
                 CREATE INDEX IF NOT EXISTS idx_leveling_boosters_active
                     ON leveling_xp_boosters (guild_id, scope, target_id, expires_at);
+                """
+            )
+            await connection.execute(
+                """
+                ALTER TABLE leveling_member_xp
+                    ADD COLUMN IF NOT EXISTS last_levelup_announced_level INTEGER NOT NULL DEFAULT 0
                 """
             )
 
@@ -400,6 +414,63 @@ class LevelingRepository:
     async def get_leader(self, guild_id: int) -> LeaderboardEntry | None:
         rows = await self.get_leaderboard(guild_id, limit=1, offset=0)
         return rows[0] if rows else None
+
+    async def get_pending_levelup_announcements(
+        self,
+        guild_id: int,
+        config: FormulaConfig,
+    ) -> list[PendingLevelupAnnouncement]:
+        rows = await self.pool.fetch(
+            """
+            SELECT guild_id, user_id, total_xp, last_levelup_announced_level
+            FROM leveling_member_xp
+            WHERE guild_id = $1 AND total_xp > 0
+            ORDER BY updated_at ASC, user_id ASC
+            """,
+            guild_id,
+        )
+
+        pending: list[PendingLevelupAnnouncement] = []
+        for row in rows:
+            total_xp = int(row["total_xp"])
+            current_level = level_for_total_xp(total_xp, config)
+            announced_level = int(row["last_levelup_announced_level"])
+            if current_level <= 0 or announced_level >= current_level:
+                continue
+            pending.append(
+                PendingLevelupAnnouncement(
+                    guild_id=int(row["guild_id"]),
+                    user_id=int(row["user_id"]),
+                    total_xp=total_xp,
+                    current_level=current_level,
+                    last_levelup_announced_level=announced_level,
+                )
+            )
+        return pending
+
+    async def mark_levelup_announced(self, guild_id: int, user_id: int, level: int) -> None:
+        await self.pool.execute(
+            """
+            UPDATE leveling_member_xp
+            SET last_levelup_announced_level = GREATEST(last_levelup_announced_level, $3)
+            WHERE guild_id = $1 AND user_id = $2
+            """,
+            guild_id,
+            user_id,
+            max(0, level),
+        )
+
+    async def set_levelup_announced_level(self, guild_id: int, user_id: int, level: int) -> None:
+        await self.pool.execute(
+            """
+            UPDATE leveling_member_xp
+            SET last_levelup_announced_level = $3
+            WHERE guild_id = $1 AND user_id = $2
+            """,
+            guild_id,
+            user_id,
+            max(0, level),
+        )
 
     async def upsert_role_reward(self, guild_id: int, level: int, role_id: int) -> None:
         await self.pool.execute(

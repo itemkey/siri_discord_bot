@@ -24,7 +24,7 @@ from siri_bot.leveling.formula import (
     progress_for_total_xp,
     reward_roles_for_level,
 )
-from siri_bot.leveling.models import LevelingSettings, XpChange
+from siri_bot.leveling.models import LevelingSettings, PendingLevelupAnnouncement, XpChange
 from siri_bot.leveling.repository import LevelingRepository
 from siri_bot.ui_safety import (
     SafeView,
@@ -38,6 +38,8 @@ from siri_bot.ui_safety import (
 LOGGER = logging.getLogger(__name__)
 DURATION_PATTERN = re.compile(r"^(?P<amount>\d+)(?P<unit>s|m|h|d)$", re.IGNORECASE)
 LEADERBOARD_PAGE_SIZE = 10
+LEVELUP_BACKFILL_INTERVAL_MINUTES = 10.0
+LEVELUP_BACKFILL_SEND_DELAY_SECONDS = 0.5
 RANK_PANEL_LEVEL_CUSTOM_ID = "siri:leveling:panel:rank"
 RANK_PANEL_LEADERBOARD_CUSTOM_ID = "siri:leveling:panel:leaderboard"
 RANK_PANEL_REFRESH_CUSTOM_ID = "siri:leveling:panel:refresh"
@@ -95,12 +97,18 @@ class Leveling(commands.Cog):
         self.pool = pool
         self._voice_synced_once = False
         self._rank_panel_results: dict[RankPanelResultKey, RankPanelActiveResult] = {}
+        self._levelup_backfill_guild_ids: set[int] = set()
+        self._levelup_backfill_tasks: set[asyncio.Task[None]] = set()
         self.bot.add_view(RankPanelView(self))
         self.bot.add_dynamic_items(RankPanelRefreshDynamicButton, RankPanelLegacyRefreshDynamicButton)
         self.voice_xp_tick.start()
+        self.levelup_backfill_tick.start()
 
     def cog_unload(self) -> None:
         self.voice_xp_tick.cancel()
+        self.levelup_backfill_tick.cancel()
+        for task in list(self._levelup_backfill_tasks):
+            task.cancel()
         asyncio.create_task(self.pool.close())
 
     @commands.Cog.listener()
@@ -111,6 +119,7 @@ class Leveling(commands.Cog):
         self._voice_synced_once = True
         for guild in self.bot.guilds:
             await self._sync_guild_voice_sessions(guild)
+            self._schedule_levelup_backfill(guild.id)
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -243,6 +252,15 @@ class Leveling(commands.Cog):
 
     @voice_xp_tick.before_loop
     async def before_voice_xp_tick(self) -> None:
+        await self.bot.wait_until_ready()
+
+    @tasks.loop(minutes=LEVELUP_BACKFILL_INTERVAL_MINUTES)
+    async def levelup_backfill_tick(self) -> None:
+        for guild in self.bot.guilds:
+            self._schedule_levelup_backfill(guild.id)
+
+    @levelup_backfill_tick.before_loop
+    async def before_levelup_backfill_tick(self) -> None:
         await self.bot.wait_until_ready()
 
     @app_commands.command(name="rank", description="Показать уровень и XP участника.")
@@ -551,7 +569,11 @@ class Leveling(commands.Cog):
             return
 
         await self.repository.update_levelup_channel(guild.id, channel.id)
-        await interaction.response.send_message(f"Level-up channel: {channel.mention}.", ephemeral=True)
+        self._schedule_levelup_backfill(guild.id)
+        await interaction.response.send_message(
+            f"Level-up channel: {channel.mention}. Pending level-up announcements queued.",
+            ephemeral=True,
+        )
 
     @levelup_group.command(name="message", description="Настроить шаблон level-up сообщения.")
     @app_commands.describe(message="Можно использовать {user}, {level}, {xp}, {guild}.")
@@ -686,6 +708,7 @@ class Leveling(commands.Cog):
         settings = await self.repository.get_settings(guild.id)
         change = await self.repository.add_xp(guild.id, member.id, amount, settings.formula)
         await self._apply_member_level_side_effects(member, settings, change, send_levelup=False)
+        await self.repository.set_levelup_announced_level(guild.id, member.id, change.new_level)
         await interaction.response.send_message(
             f"{member.mention}: {change.old_total_xp} -> {change.new_total_xp} XP.",
             ephemeral=True,
@@ -707,6 +730,7 @@ class Leveling(commands.Cog):
         settings = await self.repository.get_settings(guild.id)
         change = await self.repository.set_xp(guild.id, member.id, total_xp, settings.formula)
         await self._apply_member_level_side_effects(member, settings, change, send_levelup=False)
+        await self.repository.set_levelup_announced_level(guild.id, member.id, change.new_level)
         await interaction.response.send_message(
             f"{member.mention}: level {change.old_level} -> {change.new_level}, {change.new_total_xp} XP.",
             ephemeral=True,
@@ -1033,8 +1057,8 @@ class Leveling(commands.Cog):
         if settings.levelup_channel_id is None:
             return
 
-        channel = member.guild.get_channel(settings.levelup_channel_id)
-        if not isinstance(channel, discord.abc.Messageable):
+        channel = await self._levelup_message_channel(member.guild, settings)
+        if channel is None:
             return
 
         text = _format_levelup_message(member, settings, change)
@@ -1042,6 +1066,85 @@ class Leveling(commands.Cog):
             await channel.send(text)
         except discord.HTTPException:
             LOGGER.exception("Failed to send levelup message in channel %s", settings.levelup_channel_id)
+            return
+
+        try:
+            await self.repository.mark_levelup_announced(member.guild.id, member.id, change.new_level)
+        except asyncpg.PostgresError:
+            LOGGER.exception("Failed to mark level-up announcement for user %s", member.id)
+
+    def _schedule_levelup_backfill(self, guild_id: int) -> None:
+        active_guild_ids = self._levelup_backfill_active_guild_ids()
+        if guild_id in active_guild_ids:
+            return
+
+        active_guild_ids.add(guild_id)
+        task = asyncio.create_task(self._run_levelup_backfill(guild_id))
+        tasks_registry = self._levelup_backfill_tasks_registry()
+        tasks_registry.add(task)
+        task.add_done_callback(tasks_registry.discard)
+
+    async def _run_levelup_backfill(self, guild_id: int) -> None:
+        try:
+            guild = self.bot.get_guild(guild_id)
+            if guild is None:
+                return
+
+            settings = await self.repository.get_settings(guild.id)
+            if not settings.enabled or settings.levelup_channel_id is None:
+                return
+
+            channel = await self._levelup_message_channel(guild, settings)
+            if channel is None:
+                return
+
+            pending = await self.repository.get_pending_levelup_announcements(guild.id, settings.formula)
+            for announcement in pending:
+                text = _format_pending_levelup_message(guild, settings, announcement)
+                try:
+                    await channel.send(text)
+                except discord.HTTPException:
+                    LOGGER.exception("Failed to backfill level-up announcements in channel %s", settings.levelup_channel_id)
+                    return
+
+                try:
+                    await self.repository.mark_levelup_announced(guild.id, announcement.user_id, announcement.current_level)
+                except asyncpg.PostgresError:
+                    LOGGER.exception("Failed to mark backfilled level-up announcement for user %s", announcement.user_id)
+
+                await asyncio.sleep(LEVELUP_BACKFILL_SEND_DELAY_SECONDS)
+        except asyncpg.PostgresError:
+            LOGGER.exception("Failed to query pending level-up announcements for guild %s", guild_id)
+        except Exception:
+            LOGGER.exception("Unexpected level-up backfill failure for guild %s", guild_id)
+        finally:
+            self._levelup_backfill_active_guild_ids().discard(guild_id)
+
+    async def _levelup_message_channel(self, guild: discord.Guild, settings: LevelingSettings) -> Any | None:
+        if settings.levelup_channel_id is None:
+            return None
+
+        get_channel = getattr(guild, "get_channel", None)
+        channel = get_channel(settings.levelup_channel_id) if callable(get_channel) else None
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(settings.levelup_channel_id)
+            except discord.HTTPException:
+                LOGGER.info("Could not fetch level-up channel %s.", settings.levelup_channel_id, exc_info=True)
+                return None
+
+        send = getattr(channel, "send", None)
+        return channel if callable(send) else None
+
+    def _levelup_backfill_active_guild_ids(self) -> set[int]:
+        if not hasattr(self, "_levelup_backfill_guild_ids"):
+            self._levelup_backfill_guild_ids = set()
+        return self._levelup_backfill_guild_ids
+
+    def _levelup_backfill_tasks_registry(self) -> set[asyncio.Task[None]]:
+        if not hasattr(self, "_levelup_backfill_tasks"):
+            self._levelup_backfill_tasks = set()
+        return self._levelup_backfill_tasks
 
     async def _fetch_reaction_message(self, payload: discord.RawReactionActionEvent) -> discord.Message | None:
         channel = self.bot.get_channel(payload.channel_id)
@@ -1276,12 +1379,19 @@ def _parse_duration(raw: str | None) -> datetime | None:
     return datetime.now(UTC) + timedelta(seconds=amount * multipliers[unit])
 
 
-def _format_levelup_message(member: discord.Member, settings: LevelingSettings, change: XpChange) -> str:
+def _format_levelup_text(
+    *,
+    user_mention: str,
+    guild_name: str,
+    settings: LevelingSettings,
+    level: int,
+    total_xp: int,
+) -> str:
     values = {
-        "user": member.mention,
-        "level": str(change.new_level),
-        "xp": str(change.new_total_xp),
-        "guild": member.guild.name,
+        "user": user_mention,
+        "level": str(level),
+        "xp": str(total_xp),
+        "guild": guild_name,
     }
 
     text = settings.levelup_message
@@ -1289,6 +1399,30 @@ def _format_levelup_message(member: discord.Member, settings: LevelingSettings, 
         text = text.replace("{" + key + "}", value)
 
     return text
+
+
+def _format_levelup_message(member: discord.Member, settings: LevelingSettings, change: XpChange) -> str:
+    return _format_levelup_text(
+        user_mention=member.mention,
+        guild_name=member.guild.name,
+        settings=settings,
+        level=change.new_level,
+        total_xp=change.new_total_xp,
+    )
+
+
+def _format_pending_levelup_message(
+    guild: discord.Guild,
+    settings: LevelingSettings,
+    announcement: PendingLevelupAnnouncement,
+) -> str:
+    return _format_levelup_text(
+        user_mention=f"<@{announcement.user_id}>",
+        guild_name=guild.name,
+        settings=settings,
+        level=announcement.current_level,
+        total_xp=announcement.total_xp,
+    )
 
 
 def _channel_text(channel_id: int | None) -> str:

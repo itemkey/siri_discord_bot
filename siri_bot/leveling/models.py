@@ -55,6 +55,15 @@ class LeaderboardEntry:
 
 
 @dataclass(frozen=True)
+class PendingLevelupAnnouncement:
+    guild_id: int
+    user_id: int
+    total_xp: int
+    current_level: int
+    last_levelup_announced_level: int
+
+
+@dataclass(frozen=True)
 class Booster:
     id: int
     scope: str
