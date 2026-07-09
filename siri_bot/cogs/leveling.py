@@ -26,6 +26,13 @@ from siri_bot.leveling.formula import (
 )
 from siri_bot.leveling.models import LevelingSettings, XpChange
 from siri_bot.leveling.repository import LevelingRepository
+from siri_bot.ui_safety import (
+    SafeView,
+    interaction_response_done,
+    live_view_has_item,
+    send_safe_interaction_error,
+    send_safe_interaction_message,
+)
 
 
 LOGGER = logging.getLogger(__name__)
@@ -34,9 +41,39 @@ LEADERBOARD_PAGE_SIZE = 10
 RANK_PANEL_LEVEL_CUSTOM_ID = "siri:leveling:panel:rank"
 RANK_PANEL_LEADERBOARD_CUSTOM_ID = "siri:leveling:panel:leaderboard"
 RANK_PANEL_REFRESH_CUSTOM_ID = "siri:leveling:panel:refresh"
+RANK_PANEL_REFRESH_DYNAMIC_TEMPLATE = rf"{re.escape(RANK_PANEL_REFRESH_CUSTOM_ID)}:(?P<mode>rank|leaderboard)"
+RANK_PANEL_LEGACY_REFRESH_DYNAMIC_TEMPLATE = re.escape(RANK_PANEL_REFRESH_CUSTOM_ID)
 RANK_PANEL_MODE_RANK = "rank"
 RANK_PANEL_MODE_LEADERBOARD = "leaderboard"
 RankPanelResultKey = tuple[int, int, int]
+
+
+def _rank_panel_refresh_custom_id(mode: str) -> str:
+    return f"{RANK_PANEL_REFRESH_CUSTOM_ID}:{mode}"
+
+
+def _rank_panel_mode_from_message(interaction: discord.Interaction) -> str:
+    message = getattr(interaction, "message", None)
+    content = getattr(message, "content", None)
+    if isinstance(content, str) and "лидер" in content.lower():
+        return RANK_PANEL_MODE_LEADERBOARD
+
+    for embed in getattr(message, "embeds", ()) or ():
+        title = getattr(embed, "title", None)
+        if isinstance(title, str) and "leaderboard" in title.lower():
+            return RANK_PANEL_MODE_LEADERBOARD
+
+    return RANK_PANEL_MODE_RANK
+
+
+async def _complete_deferred_rank_notice(interaction: discord.Interaction) -> None:
+    if not getattr(interaction, "_siri_complete_deferred_rank_notice", False):
+        return
+    setattr(interaction, "_siri_complete_deferred_rank_notice", False)
+    try:
+        await interaction.edit_original_response(content="XP-панель обновлена.", embed=None, view=None)
+    except discord.HTTPException:
+        LOGGER.info("Could not complete deferred leveling panel notice.", exc_info=True)
 
 
 @dataclass
@@ -59,6 +96,7 @@ class Leveling(commands.Cog):
         self._voice_synced_once = False
         self._rank_panel_results: dict[RankPanelResultKey, RankPanelActiveResult] = {}
         self.bot.add_view(RankPanelView(self))
+        self.bot.add_dynamic_items(RankPanelRefreshDynamicButton, RankPanelLegacyRefreshDynamicButton)
         self.voice_xp_tick.start()
 
     def cog_unload(self) -> None:
@@ -744,7 +782,7 @@ class Leveling(commands.Cog):
     async def _send_rank_panel_response(self, interaction: discord.Interaction) -> None:
         guild = interaction.guild
         if guild is None:
-            await interaction.response.send_message("Эта кнопка работает только на сервере.", ephemeral=True)
+            await send_safe_interaction_message(interaction, "Эта кнопка работает только на сервере.")
             return
 
         await self._send_or_update_private_rank_panel_result(interaction, RANK_PANEL_MODE_RANK)
@@ -752,7 +790,7 @@ class Leveling(commands.Cog):
     async def _send_leaderboard_panel_response(self, interaction: discord.Interaction) -> None:
         guild = interaction.guild
         if guild is None:
-            await interaction.response.send_message("Эта кнопка работает только на сервере.", ephemeral=True)
+            await send_safe_interaction_message(interaction, "Эта кнопка работает только на сервере.")
             return
 
         await self._send_or_update_private_rank_panel_result(interaction, RANK_PANEL_MODE_LEADERBOARD)
@@ -760,12 +798,20 @@ class Leveling(commands.Cog):
     async def _send_or_update_private_rank_panel_result(self, interaction: discord.Interaction, mode: str) -> None:
         key = self._rank_panel_result_key(interaction)
         active = self._rank_panel_results_registry().get(key) if key is not None else None
-        if active is not None:
+        response_done = interaction_response_done(interaction)
+        if active is not None and not response_done:
             await interaction.response.defer()
+            response_done = True
 
         content, embed, view = await self._build_rank_panel_result_response(interaction, mode)
 
         if active is None:
+            if response_done:
+                message = await interaction.edit_original_response(content=content, embed=embed, view=view)
+                if key is not None:
+                    self._rank_panel_results_registry()[key] = RankPanelActiveResult(message=message, mode=mode)
+                return
+
             await interaction.response.send_message(content=content, embed=embed, view=view, ephemeral=True)
             if key is not None:
                 await self._remember_rank_panel_result(interaction, key, mode)
@@ -773,6 +819,7 @@ class Leveling(commands.Cog):
 
         try:
             await active.message.edit(content=content, embed=embed, view=view)
+            await _complete_deferred_rank_notice(interaction)
         except discord.HTTPException:
             LOGGER.info("Stored private leveling panel result is unavailable; sending a new one.", exc_info=True)
             message = await interaction.followup.send(
@@ -783,6 +830,7 @@ class Leveling(commands.Cog):
                 wait=True,
             )
             self._rank_panel_results_registry()[key] = RankPanelActiveResult(message=message, mode=mode)
+            await _complete_deferred_rank_notice(interaction)
             return
 
         active.mode = mode
@@ -1053,7 +1101,79 @@ class Leveling(commands.Cog):
         return bool(me and me.guild_permissions.manage_roles and role < me.top_role and not role.managed)
 
 
-class RankPanelView(discord.ui.View):
+class RankPanelRefreshDynamicButton(discord.ui.DynamicItem[discord.ui.Button], template=RANK_PANEL_REFRESH_DYNAMIC_TEMPLATE):
+    def __init__(self, mode: str, *, label: str = "Обновить") -> None:
+        self.mode = mode
+        super().__init__(
+            discord.ui.Button(
+                label=label,
+                style=discord.ButtonStyle.success,
+                custom_id=_rank_panel_refresh_custom_id(mode),
+            )
+        )
+
+    @classmethod
+    async def from_custom_id(
+        cls,
+        interaction: discord.Interaction,
+        item: discord.ui.Item,
+        match: re.Match[str],
+        /,
+    ) -> RankPanelRefreshDynamicButton:
+        label = getattr(item, "label", None) or "Обновить"
+        return cls(match["mode"], label=label)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if live_view_has_item(interaction, self.custom_id):
+            return
+
+        cog = interaction.client.get_cog("Leveling") if interaction.client is not None else None
+        if not isinstance(cog, Leveling):
+            await send_safe_interaction_message(interaction, "Бот еще загружает XP-панель. Попробуй через пару секунд.")
+            return
+
+        try:
+            if self.mode == RANK_PANEL_MODE_LEADERBOARD:
+                await cog._refresh_leaderboard_panel_response(interaction)
+                return
+            await cog._refresh_rank_panel_response(interaction)
+        except Exception as exc:
+            await send_safe_interaction_error(interaction, exc, item=self)
+
+
+class RankPanelLegacyRefreshDynamicButton(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=RANK_PANEL_LEGACY_REFRESH_DYNAMIC_TEMPLATE,
+):
+    def __init__(self, *, label: str = "Обновить") -> None:
+        super().__init__(
+            discord.ui.Button(
+                label=label,
+                style=discord.ButtonStyle.success,
+                custom_id=RANK_PANEL_REFRESH_CUSTOM_ID,
+            )
+        )
+
+    @classmethod
+    async def from_custom_id(
+        cls,
+        interaction: discord.Interaction,
+        item: discord.ui.Item,
+        match: re.Match[str],
+        /,
+    ) -> RankPanelLegacyRefreshDynamicButton:
+        label = getattr(item, "label", None) or "Обновить"
+        return cls(label=label)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if live_view_has_item(interaction, self.custom_id):
+            return
+
+        mode = _rank_panel_mode_from_message(interaction)
+        await RankPanelRefreshDynamicButton(mode).callback(interaction)
+
+
+class RankPanelView(SafeView):
     def __init__(self, cog: Leveling) -> None:
         super().__init__(timeout=None)
         self.cog = cog
@@ -1064,6 +1184,8 @@ class RankPanelView(discord.ui.View):
         custom_id=RANK_PANEL_LEVEL_CUSTOM_ID,
     )
     async def show_rank(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        setattr(interaction, "_siri_complete_deferred_rank_notice", True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
         await self.cog._send_rank_panel_response(interaction)
 
     @discord.ui.button(
@@ -1072,14 +1194,19 @@ class RankPanelView(discord.ui.View):
         custom_id=RANK_PANEL_LEADERBOARD_CUSTOM_ID,
     )
     async def show_leaderboard(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        setattr(interaction, "_siri_complete_deferred_rank_notice", True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
         await self.cog._send_leaderboard_panel_response(interaction)
 
 
-class RankPanelResultView(discord.ui.View):
+class RankPanelResultView(SafeView):
     def __init__(self, cog: Leveling, mode: str) -> None:
         super().__init__(timeout=900)
         self.cog = cog
         self.mode = mode
+        for child in self.children:
+            if isinstance(child, discord.ui.Button) and child.custom_id == RANK_PANEL_REFRESH_CUSTOM_ID:
+                child.custom_id = _rank_panel_refresh_custom_id(mode)
 
     @discord.ui.button(
         label="Обновить",

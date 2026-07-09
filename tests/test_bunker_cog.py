@@ -25,6 +25,7 @@ from siri_bot.cogs.bunker import (
     BunkerSettingsView,
     BunkerSetupIdleView,
     BunkerSetupNavView,
+    STALE_PANEL_REFRESH_STATUS,
     _bunker_profile_embed,
     _game_embed,
     _leader_view_for_game,
@@ -125,6 +126,28 @@ class FakeBunkerRepository:
 
     async def _get_setup_by_message(self, message_id: int) -> RoomSetup | None:
         return self.setup if message_id == self.setup.setup_message_id else None
+
+
+def _test_game(*, state: GameState = GameState.LOBBY) -> BunkerGame:
+    return BunkerGame(
+        id=55,
+        guild_id=100,
+        setup_id=10,
+        setup_channel_id=300,
+        setup_message_id=500,
+        category_id=None,
+        game_text_channel_id=300,
+        voice_channel_id=800,
+        host_id=200,
+        state=state,
+        settings=BunkerSettings(),
+        round_number=0,
+        phase_started_at=None,
+        phase_ends_at=None,
+        paused_at=None,
+        board_message_id=None,
+        profile=None,
+    )
 
 
 class FakeRevealRepository:
@@ -323,6 +346,83 @@ class BunkerCogTests(unittest.TestCase):
         interaction.edit_original_response.assert_not_awaited()
         interaction.followup.send.assert_not_awaited()
         self.assertIs(cog._game_private_panels[(55, 300, 200)], hidden)
+
+    def test_stale_game_navigation_button_opens_fresh_panel(self) -> None:
+        game = _test_game()
+        cog = Bunker.__new__(Bunker)
+        cog.repository = type("Repo", (), {"get_game": AsyncMock(return_value=game)})()
+        cog.send_or_edit_private_panel = AsyncMock()
+        interaction = FakeInteraction()
+
+        asyncio.run(
+            cog.handle_dynamic_button(
+                interaction,
+                scope="g",
+                owner_id=200,
+                target_id=game.id,
+                action="settings",
+            )
+        )
+
+        cog.send_or_edit_private_panel.assert_awaited_once_with(interaction, game, screen="settings")
+
+    def test_stale_dangerous_game_button_only_refreshes_panel(self) -> None:
+        game = _test_game()
+        cog = Bunker.__new__(Bunker)
+        cog.repository = type("Repo", (), {"get_game": AsyncMock(return_value=game)})()
+        cog.send_or_edit_private_panel = AsyncMock()
+        interaction = FakeInteraction()
+
+        asyncio.run(
+            cog.handle_dynamic_button(
+                interaction,
+                scope="g",
+                owner_id=200,
+                target_id=game.id,
+                action="start",
+            )
+        )
+
+        cog.send_or_edit_private_panel.assert_awaited_once_with(
+            interaction,
+            game,
+            status=STALE_PANEL_REFRESH_STATUS,
+        )
+
+    def test_stale_private_button_rejects_wrong_owner(self) -> None:
+        cog = Bunker.__new__(Bunker)
+        cog.repository = type("Repo", (), {"get_game": AsyncMock()})()
+        interaction = FakeInteraction(user_id=201)
+
+        asyncio.run(
+            cog.handle_dynamic_button(
+                interaction,
+                scope="g",
+                owner_id=200,
+                target_id=55,
+                action="settings",
+            )
+        )
+
+        interaction.response.send_message.assert_awaited_once()
+        cog.repository.get_game.assert_not_awaited()
+
+    def test_stale_setup_navigation_button_opens_fresh_setup_panel(self) -> None:
+        cog = Bunker.__new__(Bunker)
+        cog.open_setup_panel = AsyncMock()
+        interaction = FakeInteraction()
+
+        asyncio.run(
+            cog.handle_dynamic_button(
+                interaction,
+                scope="s",
+                owner_id=200,
+                target_id=10,
+                action="rules",
+            )
+        )
+
+        cog.open_setup_panel.assert_awaited_once_with(interaction, screen="rules")
 
     def test_public_section_view_uses_persistent_custom_ids(self) -> None:
         view = BunkerPublicSectionView(cog=object(), game_id=55, key="players", collapsed=False)

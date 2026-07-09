@@ -68,6 +68,7 @@ from siri_bot.bunker.permissions import (
 from siri_bot.bunker.repository import ActiveBunkerGameError, BunkerRepository
 from siri_bot.checks import admin_only
 from siri_bot.leveling.repository import LevelingRepository
+from siri_bot.ui_safety import SafeModal, SafeView, live_view_has_item, send_safe_interaction_error, send_safe_interaction_message
 
 
 LOGGER = logging.getLogger(__name__)
@@ -104,6 +105,32 @@ GAME_CHAOS_ID = "siri:bunker:game:chaos"
 SPEECH_HANDOFF_SECONDS = 15
 # Ephemeral Discord views with timeout=None are forced to 15 minutes by discord.py.
 PRIVATE_VIEW_TIMEOUT_SECONDS = 30 * 24 * 60 * 60
+BUNKER_DYNAMIC_BUTTON_TEMPLATE = r"siri:b:v1:(?P<scope>[ags]):(?P<owner_id>\d+):(?P<target_id>\d+):(?P<action>[a-z0-9_]+)"
+STALE_PANEL_REFRESH_STATUS = "Панель обновлена. Нажми нужное действие еще раз."
+
+
+def _bunker_button_id(scope: str, owner_id: int | None, target_id: int | None, action: str) -> str:
+    return f"siri:b:v1:{scope}:{owner_id or 0}:{target_id or 0}:{action}"
+
+
+def _set_button_custom_id(view: discord.ui.View, callback_name: str, custom_id: str) -> None:
+    for child in view.children:
+        if not isinstance(child, discord.ui.Button):
+            continue
+        callback = getattr(child, "callback", None)
+        if getattr(callback, "__name__", None) == callback_name:
+            child.custom_id = custom_id
+            return
+
+
+async def _complete_deferred_panel_notice(interaction: discord.Interaction) -> None:
+    if not getattr(interaction, "_siri_complete_deferred_panel_notice", False):
+        return
+    setattr(interaction, "_siri_complete_deferred_panel_notice", False)
+    try:
+        await interaction.edit_original_response(content="Панель обновлена.", embed=None, view=None)
+    except discord.HTTPException:
+        LOGGER.info("Could not complete deferred bunker panel notice.", exc_info=True)
 
 
 class Bunker(commands.Cog):
@@ -129,6 +156,7 @@ class Bunker(commands.Cog):
         self.bot.add_view(BunkerPublicSectionView(self))
         self.bot.add_view(BunkerPublicRevealView(self))
         self.bot.add_view(BunkerPublicAbilityView(self))
+        self.bot.add_dynamic_items(BunkerDynamicButton)
         self.phase_tick.start()
 
     def cog_unload(self) -> None:
@@ -619,7 +647,7 @@ class Bunker(commands.Cog):
     async def open_game_panel(self, interaction: discord.Interaction, *, screen: str = "main", status: str | None = None) -> None:
         game = await self._game_from_interaction_channel(interaction)
         if game is None:
-            await interaction.response.send_message("Эта панель работает в игровом text-канале бункера.", ephemeral=True)
+            await send_safe_interaction_message(interaction, "Эта панель работает в игровом text-канале бункера.")
             return
 
         await self.send_or_edit_private_panel(interaction, game, screen=screen, status=status)
@@ -768,6 +796,7 @@ class Bunker(commands.Cog):
             is_operator=is_operator,
             can_close=can_close,
             players=players,
+            owner_id=interaction.user.id,
         )
 
     async def _send_or_edit_private_message(
@@ -808,6 +837,7 @@ class Bunker(commands.Cog):
                     response_done = True
                 try:
                     await active_message.edit(content=None, embed=embed, view=view)
+                    await _complete_deferred_panel_notice(interaction)
                     return
                 except discord.HTTPException:
                     LOGGER.info("Could not edit saved bunker private panel.", exc_info=True)
@@ -850,9 +880,11 @@ class Bunker(commands.Cog):
             await interaction.response.defer(ephemeral=True)
         try:
             await active_message.edit(content=None, embed=embed, view=view)
+            await _complete_deferred_panel_notice(interaction)
         except discord.HTTPException:
             message = await interaction.followup.send(embed=embed, view=view, ephemeral=True, wait=True)
             registry[key] = message
+            await _complete_deferred_panel_notice(interaction)
 
     async def panel_join_game(self, interaction: discord.Interaction, game_id: int) -> None:
         game = await self.repository.get_game(game_id)
@@ -968,11 +1000,11 @@ class Bunker(commands.Cog):
     async def public_finish_speech(self, interaction: discord.Interaction) -> None:
         game = await self._game_from_interaction_channel(interaction)
         if game is None:
-            await interaction.response.send_message("Эта кнопка работает в игровом text-канале бункера.", ephemeral=True)
+            await send_safe_interaction_message(interaction, "Эта кнопка работает в игровом text-канале бункера.")
             return
 
         ok, message = await self._finish_speech_turn_for_user(game, interaction.user.id)
-        await interaction.response.send_message(message, ephemeral=True)
+        await send_safe_interaction_message(interaction, message)
 
     async def _finish_speech_turn_for_user(self, game: BunkerGame, user_id: int) -> tuple[bool, str]:
         if game.state != GameState.SPEECH_PHASE:
@@ -1119,7 +1151,10 @@ class Bunker(commands.Cog):
     async def build_bunker(self, interaction: discord.Interaction, *, is_admin_game: bool = False) -> None:
         setup = await self._setup_from_interaction_message(interaction)
         if setup is None:
-            await interaction.response.send_message("Не нашел setup этой комнаты. Создай панель через /createbunker заново.", ephemeral=True)
+            await send_safe_interaction_message(
+                interaction,
+                "Не нашел setup этой комнаты. Создай панель через /createbunker заново.",
+            )
             return
 
         async def build_status(message: str, *, voice_channel: discord.VoiceChannel | None = None) -> None:
@@ -1248,7 +1283,7 @@ class Bunker(commands.Cog):
     async def join_from_setup(self, interaction: discord.Interaction) -> None:
         setup = await self._setup_from_interaction_message(interaction)
         if setup is None:
-            await interaction.response.send_message("Эта панель не привязана к комнате.", ephemeral=True)
+            await send_safe_interaction_message(interaction, "Эта панель не привязана к комнате.")
             return
 
         game = await self._live_active_game_for_setup(setup)
@@ -2608,6 +2643,96 @@ class Bunker(commands.Cog):
         channel_id = interaction.channel.id if interaction.channel is not None else 0
         return (guild_id, channel_id, interaction.user.id)
 
+    async def handle_dynamic_button(
+        self,
+        interaction: discord.Interaction,
+        *,
+        scope: str,
+        owner_id: int,
+        target_id: int,
+        action: str,
+    ) -> None:
+        if owner_id and interaction.user.id != owner_id:
+            await send_safe_interaction_message(interaction, "Эта приватная панель открыта другим пользователем.")
+            return
+
+        if scope == "g":
+            await self._handle_dynamic_game_button(interaction, target_id, action)
+            return
+        if scope == "s":
+            await self._handle_dynamic_setup_button(interaction, action)
+            return
+        if scope == "a":
+            await self._handle_dynamic_admin_button(interaction)
+            return
+
+        await send_safe_interaction_message(interaction)
+
+    async def _handle_dynamic_game_button(self, interaction: discord.Interaction, game_id: int, action: str) -> None:
+        game = await self.repository.get_game(game_id)
+        if game is None:
+            await send_safe_interaction_message(interaction, "Партия не найдена. Открой актуальную панель.")
+            return
+
+        screen_by_action = {
+            "panel": "main",
+            "back": "main",
+            "cancel": "main",
+            "settings": "settings",
+            "settings_rules": "settings_rules",
+            "main_settings": "settings",
+            "rules_settings": "settings_rules",
+            "content": "content",
+            "open_content": "content",
+            "rules": "rules",
+            "open_rules": "rules",
+            "packs": "packs",
+            "card": "card",
+            "reveal": "reveal",
+            "action": "action",
+            "vote": "vote",
+            "eliminated": "eliminated",
+        }
+        screen = screen_by_action.get(action)
+        if screen is not None:
+            await self.send_or_edit_private_panel(interaction, game, screen=screen)
+            return
+        if action == "admin":
+            await self.open_bunker_admin_panel(interaction)
+            return
+
+        await self.send_or_edit_private_panel(interaction, game, status=STALE_PANEL_REFRESH_STATUS)
+
+    async def _handle_dynamic_setup_button(self, interaction: discord.Interaction, action: str) -> None:
+        screen_by_action = {
+            "settings": "settings",
+            "settings_rules": "settings_rules",
+            "main_settings": "settings",
+            "rules_settings": "settings_rules",
+            "rules": "rules",
+            "open_rules": "rules",
+            "content": "content",
+            "open_content": "content",
+        }
+        screen = screen_by_action.get(action)
+        if screen is not None:
+            await self.open_setup_panel(interaction, screen=screen)
+            return
+        if action == "admin":
+            await self.open_bunker_admin_panel(interaction)
+            return
+        if action == "close":
+            await interaction.response.edit_message(
+                embed=_status_embed("Панель закрыта. Чтобы открыть ее снова, нажми кнопку на публичной панели."),
+                view=None,
+            )
+            return
+
+        await self.open_setup_panel(interaction, status=STALE_PANEL_REFRESH_STATUS)
+
+    async def _handle_dynamic_admin_button(self, interaction: discord.Interaction) -> None:
+        await self.open_bunker_admin_panel(interaction, status=STALE_PANEL_REFRESH_STATUS)
+
     async def _delete_duplicate_setup_panels(self, channel: discord.TextChannel, *, keep_message_id: int) -> None:
         if self.bot.user is None:
             return
@@ -2715,29 +2840,99 @@ class Bunker(commands.Cog):
                 LOGGER.info("Could not update bunker voice mute for member %s.", member.id, exc_info=True)
 
 
-class BunkerSetupIdleView(discord.ui.View):
+class BunkerDynamicButton(discord.ui.DynamicItem[discord.ui.Button], template=BUNKER_DYNAMIC_BUTTON_TEMPLATE):
+    def __init__(
+        self,
+        *,
+        scope: str,
+        owner_id: int,
+        target_id: int,
+        action: str,
+        label: str = "Обновить панель",
+        style: discord.ButtonStyle = discord.ButtonStyle.secondary,
+    ) -> None:
+        self.scope = scope
+        self.owner_id = owner_id
+        self.target_id = target_id
+        self.action = action
+        super().__init__(
+            discord.ui.Button(
+                label=label,
+                style=style,
+                custom_id=_bunker_button_id(scope, owner_id, target_id, action),
+            )
+        )
+
+    @classmethod
+    async def from_custom_id(
+        cls,
+        interaction: discord.Interaction,
+        item: discord.ui.Item,
+        match: re.Match[str],
+        /,
+    ) -> BunkerDynamicButton:
+        label = getattr(item, "label", None) or "Обновить панель"
+        style = getattr(item, "style", discord.ButtonStyle.secondary)
+        return cls(
+            scope=match["scope"],
+            owner_id=int(match["owner_id"]),
+            target_id=int(match["target_id"]),
+            action=match["action"],
+            label=label,
+            style=style,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if live_view_has_item(interaction, self.custom_id):
+            return
+
+        cog = interaction.client.get_cog("Bunker") if interaction.client is not None else None
+        if not isinstance(cog, Bunker):
+            await send_safe_interaction_message(interaction, "Бот еще загружает панель. Попробуй через пару секунд.")
+            return
+
+        try:
+            await cog.handle_dynamic_button(
+                interaction,
+                scope=self.scope,
+                owner_id=self.owner_id,
+                target_id=self.target_id,
+                action=self.action,
+            )
+        except Exception as exc:
+            await send_safe_interaction_error(interaction, exc, item=self)
+
+
+class BunkerSetupIdleView(SafeView):
     def __init__(self, cog: Bunker) -> None:
         super().__init__(timeout=None)
         self.cog = cog
 
     @discord.ui.button(label="Построить бункер", style=discord.ButtonStyle.primary, custom_id=SETUP_BUILD_ID)
     async def build(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
         await self.cog.build_bunker(interaction)
 
     @discord.ui.button(label="Настроить бункер", style=discord.ButtonStyle.secondary, custom_id=SETUP_SETTINGS_ID)
     async def settings(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        setattr(interaction, "_siri_complete_deferred_panel_notice", True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
         await self.cog.show_setup_settings(interaction)
 
     @discord.ui.button(label="Как играть", style=discord.ButtonStyle.secondary, custom_id=SETUP_RULES_ID)
     async def rules(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        setattr(interaction, "_siri_complete_deferred_panel_notice", True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
         await self.cog.show_setup_rules(interaction)
 
     @discord.ui.button(label="Паки/контент", style=discord.ButtonStyle.secondary, custom_id=SETUP_PACKS_ID)
     async def packs(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        setattr(interaction, "_siri_complete_deferred_panel_notice", True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
         await self.cog.show_setup_packs(interaction)
 
 
-class BunkerPublicGameView(discord.ui.View):
+class BunkerPublicGameView(SafeView):
     def __init__(self, cog: Bunker, *, show_finish_speech: bool = False) -> None:
         super().__init__(timeout=None)
         self.cog = cog
@@ -2752,13 +2947,16 @@ class BunkerPublicGameView(discord.ui.View):
 
     @discord.ui.button(label="Панель", style=discord.ButtonStyle.primary, custom_id=GAME_PANEL_ID)
     async def panel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        setattr(interaction, "_siri_complete_deferred_panel_notice", True)
+        await interaction.response.defer(ephemeral=True, thinking=True)
         await self.cog.open_game_panel(interaction)
 
     async def finish_speech(self, interaction: discord.Interaction) -> None:
+        await interaction.response.defer(ephemeral=True, thinking=True)
         await self.cog.public_finish_speech(interaction)
 
 
-class BunkerPublicSectionView(discord.ui.View):
+class BunkerPublicSectionView(SafeView):
     def __init__(self, cog: Bunker, game_id: int | None = None, key: str | None = None, *, collapsed: bool = False) -> None:
         super().__init__(timeout=None)
         self.cog = cog
@@ -2787,7 +2985,7 @@ class BunkerPublicSectionView(discord.ui.View):
         await self.cog.refresh_public_section(interaction, self.game_id, self.key)
 
 
-class BunkerPublicRevealView(discord.ui.View):
+class BunkerPublicRevealView(SafeView):
     def __init__(
         self,
         cog: Bunker,
@@ -2834,7 +3032,7 @@ class BunkerPublicRevealView(discord.ui.View):
         await self.cog.public_show_current_reveal_card(interaction)
 
 
-class BunkerPublicAbilityView(discord.ui.View):
+class BunkerPublicAbilityView(SafeView):
     def __init__(
         self,
         cog: Bunker,
@@ -2874,7 +3072,7 @@ class BunkerPublicAbilityView(discord.ui.View):
             self.add_item(button)
 
 
-class BunkerPrivatePlayerPanelView(discord.ui.View):
+class BunkerPrivatePlayerPanelView(SafeView):
     def __init__(
         self,
         cog: Bunker,
@@ -2884,6 +3082,7 @@ class BunkerPrivatePlayerPanelView(discord.ui.View):
         is_operator: bool,
         can_close: bool = False,
         players: list[BunkerPlayer] | None = None,
+        owner_id: int | None = None,
     ) -> None:
         super().__init__(timeout=PRIVATE_VIEW_TIMEOUT_SECONDS)
         self.cog = cog
@@ -2892,6 +3091,7 @@ class BunkerPrivatePlayerPanelView(discord.ui.View):
         self.is_operator = is_operator
         self.can_close = can_close
         self.players = players or []
+        self.owner_id = owner_id or (player.user_id if player is not None else 0)
         self._build()
 
     def _build(self) -> None:
@@ -2950,7 +3150,13 @@ class BunkerPrivatePlayerPanelView(discord.ui.View):
         return ok
 
     def _add_button(self, label: str, style: discord.ButtonStyle, callback, *, row: int) -> None:
-        button = discord.ui.Button(label=label, style=style, row=row)
+        action = getattr(callback, "__name__", "button").lstrip("_")
+        button = discord.ui.Button(
+            label=label,
+            style=style,
+            row=row,
+            custom_id=_bunker_button_id("g", self.owner_id, self.game.id, action),
+        )
         button.callback = callback
         self.add_item(button)
 
@@ -3006,11 +3212,12 @@ class BunkerPrivatePlayerPanelView(discord.ui.View):
         await self.cog.panel_close_channels(interaction, self.game.id)
 
 
-class BunkerPanelBackView(discord.ui.View):
+class BunkerPanelBackView(SafeView):
     def __init__(self, cog: Bunker, game_id: int) -> None:
         super().__init__(timeout=PRIVATE_VIEW_TIMEOUT_SECONDS)
         self.cog = cog
         self.game_id = game_id
+        _set_button_custom_id(self, "back", _bunker_button_id("g", 0, game_id, "back"))
 
     @discord.ui.button(label="Назад к панели", style=discord.ButtonStyle.primary)
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -3022,11 +3229,13 @@ class BunkerPanelBackView(discord.ui.View):
         await self.cog.update_current_game_panel(interaction, game)
 
 
-class BunkerCloseConfirmView(discord.ui.View):
+class BunkerCloseConfirmView(SafeView):
     def __init__(self, cog: Bunker, game_id: int) -> None:
         super().__init__(timeout=PRIVATE_VIEW_TIMEOUT_SECONDS)
         self.cog = cog
         self.game_id = game_id
+        _set_button_custom_id(self, "confirm", _bunker_button_id("g", 0, game_id, "confirm_close"))
+        _set_button_custom_id(self, "cancel", _bunker_button_id("g", 0, game_id, "cancel"))
 
     @discord.ui.button(label="Да, закрыть", style=discord.ButtonStyle.danger)
     async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -3041,7 +3250,7 @@ class BunkerCloseConfirmView(discord.ui.View):
         await self.cog.update_current_game_panel(interaction, game)
 
 
-class BunkerSetupHostConflictView(discord.ui.View):
+class BunkerSetupHostConflictView(SafeView):
     def __init__(
         self,
         cog: Bunker,
@@ -3072,7 +3281,13 @@ class BunkerSetupHostConflictView(discord.ui.View):
         self._add_button("Настройки", discord.ButtonStyle.secondary, self._settings, row=1)
 
     def _add_button(self, label: str, style: discord.ButtonStyle, callback, *, row: int) -> None:
-        button = discord.ui.Button(label=label, style=style, row=row)
+        action = getattr(callback, "__name__", "button").lstrip("_")
+        button = discord.ui.Button(
+            label=label,
+            style=style,
+            row=row,
+            custom_id=_bunker_button_id("s", self.user_id, self.setup_id, action),
+        )
         button.callback = callback
         self.add_item(button)
 
@@ -3095,13 +3310,16 @@ class BunkerSetupHostConflictView(discord.ui.View):
             await self.cog.open_setup_panel(interaction, screen="settings")
 
 
-class BunkerAdminListView(discord.ui.View):
+class BunkerAdminListView(SafeView):
     def __init__(self, cog: Bunker, packs: list[BunkerContentPack]) -> None:
         super().__init__(timeout=900)
         self.cog = cog
         self.packs = packs
         if packs:
             self.add_item(BunkerAdminPackSelect(cog, packs))
+        _set_button_custom_id(self, "create", _bunker_button_id("a", 0, 0, "create"))
+        _set_button_custom_id(self, "refresh", _bunker_button_id("a", 0, 0, "refresh"))
+        _set_button_custom_id(self, "access", _bunker_button_id("a", 0, 0, "access"))
 
     @discord.ui.button(label="Создать пак", style=discord.ButtonStyle.success, row=1)
     async def create(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -3116,12 +3334,15 @@ class BunkerAdminListView(discord.ui.View):
         await self.cog.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_ACCESS)
 
 
-class BunkerAdminAccessView(discord.ui.View):
+class BunkerAdminAccessView(SafeView):
     def __init__(self, cog: Bunker, settings: Any) -> None:
         super().__init__(timeout=900)
         self.cog = cog
         self.settings = settings
         self.add_item(BunkerInterestRoleSelect(cog))
+        target_id = getattr(settings, "guild_id", 0)
+        _set_button_custom_id(self, "clear_interest", _bunker_button_id("a", 0, target_id, "clear_interest"))
+        _set_button_custom_id(self, "back", _bunker_button_id("a", 0, target_id, "back"))
 
     @discord.ui.button(label="Очистить роль интереса", style=discord.ButtonStyle.secondary, row=1)
     async def clear_interest(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -3159,12 +3380,18 @@ class BunkerAdminPackSelect(discord.ui.Select):
         await self.cog.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_PACK, pack_id=int(self.values[0]))
 
 
-class BunkerAdminPackView(discord.ui.View):
+class BunkerAdminPackView(SafeView):
     def __init__(self, cog: Bunker, pack: BunkerContentPack) -> None:
         super().__init__(timeout=900)
         self.cog = cog
         self.pack = pack
         self.add_item(BunkerAdminCategorySelect(cog, pack))
+        _set_button_custom_id(self, "rename", _bunker_button_id("a", 0, pack.id, "rename"))
+        _set_button_custom_id(self, "import_json", _bunker_button_id("a", 0, pack.id, "import_json"))
+        _set_button_custom_id(self, "export_json", _bunker_button_id("a", 0, pack.id, "export_json"))
+        _set_button_custom_id(self, "toggle", _bunker_button_id("a", 0, pack.id, "toggle"))
+        _set_button_custom_id(self, "delete", _bunker_button_id("a", 0, pack.id, "delete"))
+        _set_button_custom_id(self, "back", _bunker_button_id("a", 0, pack.id, "back"))
 
     @discord.ui.button(label="Переименовать", style=discord.ButtonStyle.secondary, row=1)
     async def rename(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -3191,11 +3418,12 @@ class BunkerAdminPackView(discord.ui.View):
         await self.cog.open_bunker_admin_panel(interaction)
 
 
-class BunkerAdminExportView(discord.ui.View):
+class BunkerAdminExportView(SafeView):
     def __init__(self, cog: Bunker, pack_id: int) -> None:
         super().__init__(timeout=900)
         self.cog = cog
         self.pack_id = pack_id
+        _set_button_custom_id(self, "back", _bunker_button_id("a", 0, pack_id, "back"))
 
     @discord.ui.button(label="Назад к паку", style=discord.ButtonStyle.primary)
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -3225,7 +3453,7 @@ class BunkerAdminCategorySelect(discord.ui.Select):
         )
 
 
-class BunkerAdminCategoryView(discord.ui.View):
+class BunkerAdminCategoryView(SafeView):
     def __init__(self, cog: Bunker, pack: BunkerContentPack, field: str) -> None:
         super().__init__(timeout=900)
         self.cog = cog
@@ -3234,6 +3462,8 @@ class BunkerAdminCategoryView(discord.ui.View):
         values = list(pack.content.get(field, ()))
         if values:
             self.add_item(BunkerAdminRemoveValueSelect(cog, pack, field, values[:25]))
+        _set_button_custom_id(self, "add_value", _bunker_button_id("a", 0, pack.id, "add_value"))
+        _set_button_custom_id(self, "back", _bunker_button_id("a", 0, pack.id, "back"))
 
     @discord.ui.button(label="Добавить строку", style=discord.ButtonStyle.success, row=1)
     async def add_value(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -3257,7 +3487,7 @@ class BunkerAdminRemoveValueSelect(discord.ui.Select):
         await self.cog.remove_admin_pack_value(interaction, self.pack.id, self.field, self.values_by_index[int(self.values[0])])
 
 
-class BunkerPackCreateModal(discord.ui.Modal, title="Создать пак Бункера"):
+class BunkerPackCreateModal(SafeModal, title="Создать пак Бункера"):
     name = discord.ui.TextInput(label="Название", max_length=80)
     description = discord.ui.TextInput(label="Описание", style=discord.TextStyle.paragraph, required=False, max_length=500)
 
@@ -3269,7 +3499,7 @@ class BunkerPackCreateModal(discord.ui.Modal, title="Создать пак Бу�
         await self.cog.create_admin_pack(interaction, name=str(self.name.value), description=str(self.description.value))
 
 
-class BunkerPackRenameModal(discord.ui.Modal, title="Настройки пака"):
+class BunkerPackRenameModal(SafeModal, title="Настройки пака"):
     name = discord.ui.TextInput(label="Название", max_length=80)
     description = discord.ui.TextInput(label="Описание", style=discord.TextStyle.paragraph, required=False, max_length=500)
 
@@ -3284,7 +3514,7 @@ class BunkerPackRenameModal(discord.ui.Modal, title="Настройки пака
         await self.cog.rename_admin_pack(interaction, self.pack_id, name=str(self.name.value), description=str(self.description.value))
 
 
-class BunkerPackImportModal(discord.ui.Modal, title="Импорт JSON пака"):
+class BunkerPackImportModal(SafeModal, title="Импорт JSON пака"):
     raw_json = discord.ui.TextInput(label="JSON", style=discord.TextStyle.paragraph, max_length=4000)
 
     def __init__(self, cog: Bunker, pack: BunkerContentPack) -> None:
@@ -3297,7 +3527,7 @@ class BunkerPackImportModal(discord.ui.Modal, title="Импорт JSON пака"
         await self.cog.import_admin_pack_json(interaction, self.pack_id, str(self.raw_json.value))
 
 
-class BunkerPackValueModal(discord.ui.Modal, title="Добавить строку"):
+class BunkerPackValueModal(SafeModal, title="Добавить строку"):
     value = discord.ui.TextInput(label="Текст", style=discord.TextStyle.paragraph, max_length=300)
 
     def __init__(self, cog: Bunker, pack_id: int, field: str) -> None:
@@ -3310,7 +3540,7 @@ class BunkerPackValueModal(discord.ui.Modal, title="Добавить строк�
         await self.cog.add_admin_pack_value(interaction, self.pack_id, self.field, str(self.value.value))
 
 
-class BunkerSetupNavView(discord.ui.View):
+class BunkerSetupNavView(SafeView):
     def __init__(
         self,
         cog: Bunker,
@@ -3341,7 +3571,13 @@ class BunkerSetupNavView(discord.ui.View):
             self.add_item(discord.ui.Button(label="Перейти в голосовой", style=discord.ButtonStyle.link, url=self.voice_url, row=1))
 
     def _add_button(self, label: str, style: discord.ButtonStyle, callback, *, row: int) -> None:
-        button = discord.ui.Button(label=label, style=style, row=row)
+        action = getattr(callback, "__name__", "button").lstrip("_")
+        button = discord.ui.Button(
+            label=label,
+            style=style,
+            row=row,
+            custom_id=_bunker_button_id("s", self.user_id, self.setup_id, action),
+        )
         button.callback = callback
         self.add_item(button)
 
@@ -3363,7 +3599,7 @@ class BunkerSetupNavView(discord.ui.View):
         if await self._ensure_owner(interaction):
             await self.cog.open_setup_panel(interaction, screen="content")
 
-class BunkerSetupContentView(discord.ui.View):
+class BunkerSetupContentView(SafeView):
     def __init__(
         self,
         cog: Bunker,
@@ -3390,7 +3626,15 @@ class BunkerSetupContentView(discord.ui.View):
             self._add_button("Админка паков", discord.ButtonStyle.primary, self._admin_panel, row=1)
 
     def _add_button(self, label: str, style: discord.ButtonStyle, callback, *, row: int) -> None:
-        button = discord.ui.Button(label=label, style=style, row=row)
+        action = getattr(callback, "__name__", "button").lstrip("_")
+        scope = "g" if self.game_id is not None else "s"
+        target_id = self.game_id if self.game_id is not None else self.setup_id
+        button = discord.ui.Button(
+            label=label,
+            style=style,
+            row=row,
+            custom_id=_bunker_button_id(scope, self.user_id, target_id, action),
+        )
         button.callback = callback
         self.add_item(button)
 
@@ -3476,7 +3720,7 @@ class BunkerSetupPackSelect(discord.ui.Select):
             )
 
 
-class BunkerSettingsView(discord.ui.View):
+class BunkerSettingsView(SafeView):
     def __init__(
         self,
         cog: Bunker,
@@ -3513,7 +3757,17 @@ class BunkerSettingsView(discord.ui.View):
         self._add_button("Назад к панели", discord.ButtonStyle.primary, self.back, row=4)
 
     def _add_button(self, label: str, style: discord.ButtonStyle, callback, *, row: int) -> None:
-        button = discord.ui.Button(label=label, style=style, row=row)
+        action = getattr(callback, "__name__", "button").lstrip("_")
+        if action == "back":
+            action = "panel" if self.game_id is not None else "close"
+        scope = "g" if self.game_id is not None else "s"
+        target_id = self.game_id if self.game_id is not None else self.setup_id
+        button = discord.ui.Button(
+            label=label,
+            style=style,
+            row=row,
+            custom_id=_bunker_button_id(scope, self.user_id, target_id, action),
+        )
         button.callback = callback
         self.add_item(button)
 
@@ -3877,7 +4131,7 @@ class BunkerRoundsSelect(discord.ui.Select):
         await self.owner.save(interaction, replace(self.owner.settings, rounds=int(self.values[0])))
 
 
-class BunkerRevealView(discord.ui.View):
+class BunkerRevealView(SafeView):
     def __init__(self, cog: Bunker, game: BunkerGame, user_id: int, player: BunkerPlayer) -> None:
         super().__init__(timeout=PRIVATE_VIEW_TIMEOUT_SECONDS)
         self.cog = cog
@@ -3890,6 +4144,7 @@ class BunkerRevealView(discord.ui.View):
                 label=CARD_STAT_LABELS[stat],
                 style=discord.ButtonStyle.secondary if disabled else discord.ButtonStyle.danger,
                 disabled=disabled,
+                custom_id=_bunker_button_id("g", user_id, game.id, f"rev_{stat}"),
                 row=index // 3,
             )
 
@@ -3899,7 +4154,12 @@ class BunkerRevealView(discord.ui.View):
             button.callback = callback
             self.add_item(button)
 
-        back = discord.ui.Button(label="Назад к панели", style=discord.ButtonStyle.secondary, row=4)
+        back = discord.ui.Button(
+            label="Назад к панели",
+            style=discord.ButtonStyle.secondary,
+            custom_id=_bunker_button_id("g", user_id, game.id, "back"),
+            row=4,
+        )
         back.callback = self.back
         self.add_item(back)
 
@@ -3911,7 +4171,7 @@ class BunkerRevealView(discord.ui.View):
         await self.cog.update_current_game_panel(interaction, game)
 
 
-class BunkerVoteView(discord.ui.View):
+class BunkerVoteView(SafeView):
     def __init__(
         self,
         cog: Bunker,
@@ -3928,6 +4188,7 @@ class BunkerVoteView(discord.ui.View):
                 label=player.display_name[:80],
                 style=discord.ButtonStyle.danger if selected_id == player.user_id else discord.ButtonStyle.secondary,
                 disabled=locked,
+                custom_id=_bunker_button_id("g", voter_id, game.id, f"vote_{player.user_id}"),
                 row=index // 4,
             )
 
@@ -3938,16 +4199,26 @@ class BunkerVoteView(discord.ui.View):
             self.add_item(button)
 
 
-class BunkerEliminatedView(discord.ui.View):
+class BunkerEliminatedView(SafeView):
     def __init__(self, cog: Bunker, game_id: int, user_id: int, *, disabled: bool = False) -> None:
         super().__init__(timeout=PRIVATE_VIEW_TIMEOUT_SECONDS)
         self.cog = cog
         self.game_id = game_id
         self.user_id = user_id
-        button = discord.ui.Button(label="Раскрыть все характеристики", style=discord.ButtonStyle.danger, disabled=disabled)
+        button = discord.ui.Button(
+            label="Раскрыть все характеристики",
+            style=discord.ButtonStyle.danger,
+            disabled=disabled,
+            custom_id=_bunker_button_id("g", user_id, game_id, "reveal_all"),
+        )
         button.callback = self.reveal_all
         self.add_item(button)
-        back = discord.ui.Button(label="Назад к панели", style=discord.ButtonStyle.secondary, row=1)
+        back = discord.ui.Button(
+            label="Назад к панели",
+            style=discord.ButtonStyle.secondary,
+            custom_id=_bunker_button_id("g", user_id, game_id, "back"),
+            row=1,
+        )
         back.callback = self.back
         self.add_item(back)
 
@@ -3962,7 +4233,7 @@ class BunkerEliminatedView(discord.ui.View):
         await self.cog.update_current_game_panel(interaction, game)
 
 
-class BunkerActionView(discord.ui.View):
+class BunkerActionView(SafeView):
     def __init__(self, cog: Bunker, game_id: int, player: BunkerPlayer) -> None:
         super().__init__(timeout=PRIVATE_VIEW_TIMEOUT_SECONDS)
         self.cog = cog
@@ -3988,6 +4259,7 @@ class BunkerActionView(discord.ui.View):
                 label=label,
                 style=style,
                 disabled=disabled,
+                custom_id=_bunker_button_id("g", self.user_id, self.game_id, f"ability_{index}"),
                 row=index,
             )
 
@@ -3997,7 +4269,12 @@ class BunkerActionView(discord.ui.View):
             button.callback = callback
             self.add_item(button)
 
-        back = discord.ui.Button(label="Назад к панели", style=discord.ButtonStyle.secondary, row=2)
+        back = discord.ui.Button(
+            label="Назад к панели",
+            style=discord.ButtonStyle.secondary,
+            custom_id=_bunker_button_id("g", self.user_id, self.game_id, "back"),
+            row=2,
+        )
         back.callback = self.back
         self.add_item(back)
 
@@ -4009,7 +4286,7 @@ class BunkerActionView(discord.ui.View):
         await self.cog.update_current_game_panel(interaction, game)
 
 
-class BunkerAbilityTargetView(discord.ui.View):
+class BunkerAbilityTargetView(SafeView):
     def __init__(
         self,
         cog: Bunker,
@@ -4020,7 +4297,12 @@ class BunkerAbilityTargetView(discord.ui.View):
     ) -> None:
         super().__init__(timeout=PRIVATE_VIEW_TIMEOUT_SECONDS)
         for index, target in enumerate(targets[:20]):
-            button = discord.ui.Button(label=target.display_name[:80], style=discord.ButtonStyle.secondary, row=index // 4)
+            button = discord.ui.Button(
+                label=target.display_name[:80],
+                style=discord.ButtonStyle.secondary,
+                custom_id=_bunker_button_id("g", user_id, game_id, f"target_{target.user_id}"),
+                row=index // 4,
+            )
 
             async def callback(interaction: discord.Interaction, selected_id: int = target.user_id) -> None:
                 await cog.use_special_action(interaction, game_id, user_id, ability_index, selected_id)
