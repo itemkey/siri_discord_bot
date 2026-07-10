@@ -828,21 +828,30 @@ class Bunker(commands.Cog):
         prefer_current_response: bool = False,
         force_current_response: bool = False,
         complete_deferred_notice: bool = False,
-        replace_existing_private: bool = False,
+        prefer_existing_private: bool = False,
     ) -> None:
         active_message = registry.get(key)
         response_done = _interaction_response_done(interaction)
-        if (
-            replace_existing_private
-            and active_message is not None
-            and not _same_discord_message(active_message, getattr(interaction, "message", None))
-        ):
+        if prefer_existing_private and active_message is not None:
+            if not response_done and _same_discord_message(active_message, getattr(interaction, "message", None)):
+                try:
+                    await interaction.response.edit_message(content=None, embed=embed, view=view)
+                    return
+                except discord.HTTPException:
+                    LOGGER.info("Could not edit current bunker private panel.", exc_info=True)
+                    response_done = _interaction_response_done(interaction)
+            if not response_done:
+                await interaction.response.defer()
+                response_done = True
             try:
-                await active_message.delete()
+                await active_message.edit(content=None, embed=embed, view=view)
+                return
             except discord.HTTPException:
-                LOGGER.info("Could not delete previous bunker private panel.", exc_info=True)
-            registry.pop(key, None)
-            active_message = None
+                LOGGER.info("Could not edit saved bunker private panel.", exc_info=True)
+                registry.pop(key, None)
+                message = await interaction.followup.send(embed=embed, view=view, ephemeral=True, wait=True)
+                registry[key] = message
+                return
 
         if force_current_response:
             if not response_done:
@@ -1198,12 +1207,7 @@ class Bunker(commands.Cog):
             )
             return
 
-        first_build_status = True
-
         async def build_status(message: str, *, voice_channel: discord.VoiceChannel | None = None) -> None:
-            nonlocal first_build_status
-            replace_existing_private = first_build_status
-            first_build_status = False
             await self.send_or_edit_setup_status(
                 interaction,
                 setup,
@@ -1211,13 +1215,11 @@ class Bunker(commands.Cog):
                 voice_channel=voice_channel,
                 prefer_current_response=True,
                 force_current_response=True,
-                replace_existing_private=replace_existing_private,
+                prefer_existing_private=True,
             )
 
-        await build_status("Строю бункер... Создаю text/voice каналы и права доступа.")
-
         guild = interaction.guild
-        if guild is None or not isinstance(interaction.user, discord.Member):
+        if guild is None:
             await build_status("Бункер можно строить только на сервере.")
             return
 
@@ -1229,7 +1231,14 @@ class Bunker(commands.Cog):
                 active_host_game,
                 prefer_current_response=True,
                 force_current_response=True,
+                prefer_existing_private=True,
             )
+            return
+
+        await build_status("Строю бункер... Создаю text/voice каналы и права доступа.")
+
+        if not isinstance(interaction.user, discord.Member):
+            await build_status("Бункер можно строить только на сервере.")
             return
 
         setup_channel = guild.get_channel(setup.setup_channel_id)
@@ -1308,6 +1317,7 @@ class Bunker(commands.Cog):
                     live_conflict,
                     prefer_current_response=True,
                     force_current_response=True,
+                    prefer_existing_private=True,
                 )
             else:
                 await build_status("Старый бункер был очищен. Нажми 'Построить бункер' еще раз.")
@@ -1795,7 +1805,7 @@ class Bunker(commands.Cog):
         screen: str = "settings",
         status: str | None = None,
         complete_deferred_notice: bool = False,
-        replace_existing_private: bool = False,
+        prefer_existing_private: bool = False,
     ) -> None:
         setup = await self._setup_from_interaction_message(interaction)
         if setup is None:
@@ -1836,7 +1846,7 @@ class Bunker(commands.Cog):
             embed=embed,
             view=view,
             complete_deferred_notice=complete_deferred_notice,
-            replace_existing_private=replace_existing_private,
+            prefer_existing_private=prefer_existing_private,
         )
 
     async def show_setup_rules(self, interaction: discord.Interaction) -> None:
@@ -1857,7 +1867,7 @@ class Bunker(commands.Cog):
         voice_channel: discord.VoiceChannel | None = None,
         prefer_current_response: bool = False,
         force_current_response: bool = False,
-        replace_existing_private: bool = False,
+        prefer_existing_private: bool = False,
     ) -> None:
         settings = normalize_settings(await self.repository.get_draft(setup.id, interaction.user.id))
         is_operator = await self._is_bunker_operator(interaction)
@@ -1877,7 +1887,7 @@ class Bunker(commands.Cog):
             ),
             prefer_current_response=prefer_current_response,
             force_current_response=force_current_response,
-            replace_existing_private=replace_existing_private,
+            prefer_existing_private=prefer_existing_private,
         )
 
     async def send_host_conflict_status(
@@ -1888,6 +1898,7 @@ class Bunker(commands.Cog):
         *,
         prefer_current_response: bool = False,
         force_current_response: bool = False,
+        prefer_existing_private: bool = False,
     ) -> None:
         settings = normalize_settings(await self.repository.get_draft(setup.id, interaction.user.id))
         is_operator = await self._is_bunker_operator(interaction)
@@ -1910,6 +1921,7 @@ class Bunker(commands.Cog):
             ),
             prefer_current_response=prefer_current_response,
             force_current_response=force_current_response,
+            prefer_existing_private=prefer_existing_private,
         )
 
     async def update_draft_settings(
@@ -2969,34 +2981,30 @@ class BunkerSetupIdleView(SafeView):
 
     @discord.ui.button(label="Построить бункер", style=discord.ButtonStyle.primary, custom_id=SETUP_BUILD_ID)
     async def build(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
         await self.cog.build_bunker(interaction)
 
     @discord.ui.button(label="Настроить бункер", style=discord.ButtonStyle.secondary, custom_id=SETUP_SETTINGS_ID)
     async def settings(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
         await self.cog.open_setup_panel(
             interaction,
             screen="settings",
-            replace_existing_private=True,
+            prefer_existing_private=True,
         )
 
     @discord.ui.button(label="Как играть", style=discord.ButtonStyle.secondary, custom_id=SETUP_RULES_ID)
     async def rules(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
         await self.cog.open_setup_panel(
             interaction,
             screen="rules",
-            replace_existing_private=True,
+            prefer_existing_private=True,
         )
 
     @discord.ui.button(label="Паки/контент", style=discord.ButtonStyle.secondary, custom_id=SETUP_PACKS_ID)
     async def packs(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.defer(ephemeral=True, thinking=True)
         await self.cog.open_setup_panel(
             interaction,
             screen="content",
-            replace_existing_private=True,
+            prefer_existing_private=True,
         )
 
 
