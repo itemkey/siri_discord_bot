@@ -195,6 +195,7 @@ class LevelingPanelTests(unittest.TestCase):
         self.assertEqual(notice_kwargs["content"], RANK_PANEL_UPDATE_NOTICE)
         self.assertTrue(notice_kwargs["ephemeral"])
         self.assertTrue(notice_kwargs["wait"])
+        self.assertNotIn("view", notice_kwargs)
         self.assertIs(cog._rank_panel_update_notices[(100, 300, 200)], notice_message)
 
     def test_public_rank_panel_button_reports_database_error(self) -> None:
@@ -296,6 +297,7 @@ class LevelingPanelTests(unittest.TestCase):
         self.assertEqual(notice_kwargs["content"], RANK_PANEL_UPDATE_NOTICE)
         self.assertTrue(notice_kwargs["ephemeral"])
         self.assertTrue(notice_kwargs["wait"])
+        self.assertNotIn("view", notice_kwargs)
         self.assertEqual(cog._rank_panel_results[(100, 300, 200)].mode, RANK_PANEL_MODE_RANK)
         self.assertIs(cog._rank_panel_update_notices[(100, 300, 200)], notice_message)
 
@@ -346,6 +348,7 @@ class LevelingPanelTests(unittest.TestCase):
         self.assertEqual(notice_kwargs["content"], RANK_PANEL_UPDATE_NOTICE)
         self.assertTrue(notice_kwargs["ephemeral"])
         self.assertTrue(notice_kwargs["wait"])
+        self.assertNotIn("view", notice_kwargs)
         self.assertIs(cog._rank_panel_update_notices[(100, 300, 200)], replacement_notice)
 
     def test_public_rank_button_edits_remembered_private_result_back(self) -> None:

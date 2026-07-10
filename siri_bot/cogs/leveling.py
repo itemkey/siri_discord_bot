@@ -976,8 +976,6 @@ class Leveling(commands.Cog):
             if interaction_response_done(interaction):
                 message = await interaction.followup.send(
                     content=RANK_PANEL_UPDATE_NOTICE,
-                    embed=None,
-                    view=None,
                     ephemeral=True,
                     wait=True,
                 )
