@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import io
 import logging
 import random
 import re
@@ -20,7 +20,6 @@ from siri_bot.bunker.content import (
     PACK_FIELDS,
     ContentPack,
     merge_content_packs,
-    normalize_pack_content,
 )
 from siri_bot.bunker.engine import (
     assign_cards,
@@ -64,6 +63,13 @@ from siri_bot.bunker.permissions import (
     build_private_text_overwrites,
     build_private_voice_overwrites,
     grant_member_access,
+)
+from siri_bot.bunker.pack_format import (
+    PACK_FILE_EXTENSION,
+    PACK_FILE_MAX_BYTES,
+    ParsedPackFile,
+    dump_pack_file,
+    parse_pack_file,
 )
 from siri_bot.bunker.repository import ActiveBunkerGameError, BunkerRepository
 from siri_bot.checks import admin_only
@@ -367,6 +373,91 @@ class Bunker(commands.Cog):
             ephemeral=True,
         )
 
+    @bunker_group.command(name="pack-import", description="Импортировать .bunker-pack.json из вложения.")
+    @app_commands.describe(
+        file="UTF-8 JSON файл пака из внешнего редактора",
+        pack_id="ID существующего пака для полной замены; пусто = создать новый пак",
+    )
+    async def pack_import_command(
+        self,
+        interaction: discord.Interaction,
+        file: discord.Attachment,
+        pack_id: int | None = None,
+    ) -> None:
+        if not await self._is_bunker_admin_or_operator(interaction):
+            await interaction.response.send_message("Импорт паков доступен только админу или operator-role Бункера.", ephemeral=True)
+            return
+        if interaction.guild is None:
+            await interaction.response.send_message("Паки Бункера импортируются только на сервере.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        parsed = await self._parse_pack_attachment(interaction, file)
+        if parsed is None:
+            return
+
+        if pack_id is None:
+            pack = await self.repository.create_content_pack(
+                guild_id=interaction.guild.id,
+                name=parsed.name or _pack_name_from_attachment(file.filename),
+                description=parsed.description or "",
+                content=parsed.content,
+                created_by=interaction.user.id,
+            )
+            await interaction.followup.send(embed=_pack_file_result_embed(pack, "Пак создан из файла."), ephemeral=True)
+            return
+
+        pack = await self.repository.update_content_pack(
+            pack_id,
+            guild_id=interaction.guild.id,
+            updated_by=interaction.user.id,
+            name=parsed.name,
+            description=parsed.description,
+            content=parsed.content,
+        )
+        if pack is None:
+            await interaction.followup.send("Пак не найден.", ephemeral=True)
+            return
+        await interaction.followup.send(embed=_pack_file_result_embed(pack, "Пак полностью заменен из файла."), ephemeral=True)
+
+    @bunker_group.command(name="pack-export", description="Экспортировать кастомный пак в файл для редактора.")
+    @app_commands.describe(pack_id="ID кастомного пака из /bunkeradminpanel")
+    async def pack_export_command(self, interaction: discord.Interaction, pack_id: int) -> None:
+        if not await self._is_bunker_admin_or_operator(interaction):
+            await interaction.response.send_message("Экспорт паков доступен только админу или operator-role Бункера.", ephemeral=True)
+            return
+        if interaction.guild is None:
+            await interaction.response.send_message("Паки Бункера экспортируются только на сервере.", ephemeral=True)
+            return
+
+        pack = await self.repository.get_content_pack(pack_id, guild_id=interaction.guild.id)
+        if pack is None:
+            await interaction.response.send_message("Пак не найден.", ephemeral=True)
+            return
+
+        raw = dump_pack_file(name=pack.name, description=pack.description, content=pack.content).encode("utf-8")
+        await interaction.response.send_message(
+            "Файл готов для внешнего редактора. После изменений загрузи его через `/bunker pack-import`.",
+            file=discord.File(io.BytesIO(raw), filename=_pack_export_filename(pack)),
+            ephemeral=True,
+        )
+
+    @bunker_group.command(name="pack-file-check", description="Проверить файл пака без сохранения.")
+    @app_commands.describe(file="UTF-8 JSON файл пака из внешнего редактора")
+    async def pack_file_check_command(self, interaction: discord.Interaction, file: discord.Attachment) -> None:
+        if not await self._is_bunker_admin_or_operator(interaction):
+            await interaction.response.send_message("Проверка файлов паков доступна только админу или operator-role Бункера.", ephemeral=True)
+            return
+        if interaction.guild is None:
+            await interaction.response.send_message("Паки Бункера проверяются только на сервере.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        parsed = await self._parse_pack_attachment(interaction, file)
+        if parsed is None:
+            return
+        await interaction.followup.send(embed=_pack_file_check_embed(parsed), ephemeral=True)
+
     async def add_test_bots_command(self, interaction: discord.Interaction) -> None:
         if not await self._is_bunker_operator(interaction):
             await interaction.response.send_message("Тест-боты доступны только operator-role Бункера.", ephemeral=True)
@@ -581,16 +672,8 @@ class Bunker(commands.Cog):
             await interaction.response.send_message("Админ-панель Бункера работает только на сервере.", ephemeral=True)
             return
         try:
-            raw = json.loads(raw_json)
-            if not isinstance(raw, dict):
-                raise ValueError("JSON должен быть объектом.")
-            content_source = raw.get("content", raw)
-            if not isinstance(content_source, dict):
-                raise ValueError("Поле content должно быть объектом.")
-            content = normalize_pack_content(content_source)
-            name = str(raw["name"]) if isinstance(raw.get("name"), str) else None
-            description = str(raw["description"]) if isinstance(raw.get("description"), str) else None
-        except (json.JSONDecodeError, ValueError) as exc:
+            parsed = parse_pack_file(raw_json)
+        except ValueError as exc:
             await self.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_PACK, pack_id=pack_id, status=f"Импорт не принят: {exc}")
             return
 
@@ -598,11 +681,27 @@ class Bunker(commands.Cog):
             pack_id,
             guild_id=guild.id,
             updated_by=interaction.user.id,
-            name=name,
-            description=description,
-            content=content,
+            name=parsed.name,
+            description=parsed.description,
+            content=parsed.content,
         )
         await self.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_PACK, pack_id=pack_id, status="JSON импортирован.")
+
+    async def _parse_pack_attachment(self, interaction: discord.Interaction, attachment: discord.Attachment) -> ParsedPackFile | None:
+        attachment_size = getattr(attachment, "size", 0) or 0
+        if attachment_size > PACK_FILE_MAX_BYTES:
+            await interaction.followup.send(f"Файл слишком большой: максимум {PACK_FILE_MAX_BYTES // 1024} КБ.", ephemeral=True)
+            return None
+        try:
+            raw = await attachment.read()
+            return parse_pack_file(raw)
+        except discord.HTTPException:
+            LOGGER.exception("Could not read bunker pack attachment %s", getattr(attachment, "filename", "<unknown>"))
+            await interaction.followup.send("Не смог прочитать вложение из Discord. Попробуй загрузить файл еще раз.", ephemeral=True)
+            return None
+        except ValueError as exc:
+            await interaction.followup.send(f"Файл пака не принят: {exc}", ephemeral=True)
+            return None
 
     async def add_admin_pack_value(self, interaction: discord.Interaction, pack_id: int, field: str, value: str) -> None:
         guild = interaction.guild
@@ -4950,7 +5049,12 @@ def _packs_embed() -> discord.Embed:
 
 def _admin_packs_embed(packs: list[BunkerContentPack], *, status: str | None = None) -> discord.Embed:
     embed = discord.Embed(title="Админ-панель Бункера", color=discord.Color.dark_teal())
-    embed.description = status or "Создавай кастомные паки и наполняй их строками через категории или JSON."
+    embed.description = status or "Создавай кастомные паки вручную или через файл редактора."
+    embed.add_field(
+        name="Редактор паков",
+        value="Экспорт: `/bunker pack-export`. Проверка: `/bunker pack-file-check`. Импорт: `/bunker pack-import`.",
+        inline=False,
+    )
     if packs:
         lines = [
             f"{pack.id}. {'вкл' if pack.is_enabled else 'выкл'} · {pack.name} · {_pack_total(pack)} строк"
@@ -4992,6 +5096,11 @@ def _admin_pack_embed(pack: BunkerContentPack, *, status: str | None = None) -> 
     embed.add_field(name="Всего строк", value=str(_pack_total(pack)), inline=True)
     counts = [f"{PACK_FIELD_LABELS[field]}: {len(pack.content.get(field, ()))}" for field in PACK_FIELDS]
     embed.add_field(name="Категории", value="\n".join(counts)[:1024], inline=False)
+    embed.add_field(
+        name="Файл для редактора",
+        value=f"Экспортируй `/bunker pack-export pack_id:{pack.id}`, отредактируй файл и импортируй `/bunker pack-import pack_id:{pack.id}`.",
+        inline=False,
+    )
     return embed
 
 
@@ -5019,12 +5128,51 @@ def _pack_export_embed(pack: BunkerContentPack) -> discord.Embed:
 
 
 def _pack_json_dump(pack: BunkerContentPack) -> str:
-    payload = {
-        "name": pack.name,
-        "description": pack.description,
-        "content": {field: list(pack.content.get(field, ())) for field in PACK_FIELDS},
-    }
-    return json.dumps(payload, ensure_ascii=False, indent=2)
+    return dump_pack_file(name=pack.name, description=pack.description, content=pack.content)
+
+
+def _pack_file_result_embed(pack: BunkerContentPack, status: str) -> discord.Embed:
+    embed = discord.Embed(title=f"Пак: {pack.name}", description=status, color=discord.Color.green())
+    embed.add_field(name="ID", value=str(pack.id), inline=True)
+    embed.add_field(name="Всего строк", value=str(_pack_total(pack)), inline=True)
+    embed.add_field(name="Категории", value="\n".join(_pack_count_lines(pack.content))[:1024], inline=False)
+    return embed
+
+
+def _pack_file_check_embed(parsed: ParsedPackFile) -> discord.Embed:
+    counts = {field: len(parsed.content.get(field, ())) for field in PACK_FIELDS}
+    missing = [PACK_FIELD_LABELS[field] for field, count in counts.items() if count <= 0]
+    status = "Файл можно импортировать." if not missing else "Файл валиден, но пустые категории будут добираться из встроенного пака."
+    embed = discord.Embed(
+        title=f"Проверка файла: {parsed.name or 'без названия'}",
+        description=status,
+        color=discord.Color.green() if not missing else discord.Color.gold(),
+    )
+    if parsed.description:
+        embed.add_field(name="Описание", value=parsed.description[:1024], inline=False)
+    embed.add_field(name="Категории", value="\n".join(_pack_count_lines(parsed.content))[:1800], inline=False)
+    return embed
+
+
+def _pack_count_lines(content: dict[str, tuple[str, ...]]) -> list[str]:
+    return [f"{PACK_FIELD_LABELS[field]}: {len(content.get(field, ()))}" for field in PACK_FIELDS]
+
+
+def _pack_export_filename(pack: BunkerContentPack) -> str:
+    base = re.sub(r"\s+", "_", pack.name.strip())
+    base = re.sub(r"[^\w.-]+", "_", base, flags=re.UNICODE).strip("._-")
+    return f"{(base or 'bunker_pack')[:48]}-{pack.id}{PACK_FILE_EXTENSION}"
+
+
+def _pack_name_from_attachment(filename: str) -> str:
+    name = filename.strip()
+    lower_name = name.lower()
+    if lower_name.endswith(PACK_FILE_EXTENSION):
+        name = name[: -len(PACK_FILE_EXTENSION)]
+    elif lower_name.endswith(".json"):
+        name = name[:-5]
+    name = name.replace("_", " ").replace("-", " ").strip()
+    return name[:80] or "Новый пак"
 
 
 def _pack_total(pack: BunkerContentPack) -> int:

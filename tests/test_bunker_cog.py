@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import unittest
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -39,7 +40,7 @@ from siri_bot.cogs.bunker import (
     _public_specials_embed,
     _setup_embed,
 )
-from siri_bot.bunker.models import BunkerPlayer, BunkerSettings, RoomKind, RoomSetup
+from siri_bot.bunker.models import BunkerContentPack, BunkerPlayer, BunkerSettings, RoomKind, RoomSetup
 from siri_bot.bunker.models import BunkerGame, BunkerProfile, BunkerResources, GameState
 from siri_bot.bunker.engine import generate_card
 
@@ -84,6 +85,13 @@ class FakeFollowup:
     def __init__(self, message: FakeMessage | None = None) -> None:
         self.message = message or FakeMessage(901)
         self.send = AsyncMock(return_value=self.message)
+
+
+class FakeAttachment:
+    def __init__(self, payload: bytes, *, filename: str = "pack.bunker-pack.json") -> None:
+        self.filename = filename
+        self.size = len(payload)
+        self.read = AsyncMock(return_value=payload)
 
 
 class FakeInteraction:
@@ -140,6 +148,74 @@ class FakeBunkerRepository:
 
     async def _get_setup_by_message(self, message_id: int) -> RoomSetup | None:
         return self.setup if message_id == self.setup.setup_message_id else None
+
+
+class FakePackRepository:
+    def __init__(self, pack: BunkerContentPack | None = None) -> None:
+        self.pack = pack or BunkerContentPack(
+            id=7,
+            guild_id=100,
+            name="Существующий пак",
+            description="old",
+            content={"professions": ("Старый инженер",)},
+            is_enabled=True,
+            created_by=200,
+            updated_by=200,
+        )
+        self.create_content_pack = AsyncMock(side_effect=self._create_content_pack)
+        self.update_content_pack = AsyncMock(side_effect=self._update_content_pack)
+        self.get_content_pack = AsyncMock(side_effect=self._get_content_pack)
+
+    async def _create_content_pack(
+        self,
+        *,
+        guild_id: int,
+        name: str,
+        created_by: int,
+        description: str = "",
+        content: dict[str, tuple[str, ...]] | None = None,
+    ) -> BunkerContentPack:
+        self.pack = BunkerContentPack(
+            id=8,
+            guild_id=guild_id,
+            name=name,
+            description=description,
+            content=content or {},
+            is_enabled=True,
+            created_by=created_by,
+            updated_by=created_by,
+        )
+        return self.pack
+
+    async def _update_content_pack(
+        self,
+        pack_id: int,
+        *,
+        guild_id: int,
+        updated_by: int,
+        name: str | None = None,
+        description: str | None = None,
+        content: dict[str, tuple[str, ...]] | None = None,
+        is_enabled: bool | None = None,
+    ) -> BunkerContentPack | None:
+        if pack_id != self.pack.id or guild_id != self.pack.guild_id:
+            return None
+        self.pack = replace(
+            self.pack,
+            name=name if name is not None else self.pack.name,
+            description=description if description is not None else self.pack.description,
+            content=content if content is not None else self.pack.content,
+            is_enabled=is_enabled if is_enabled is not None else self.pack.is_enabled,
+            updated_by=updated_by,
+        )
+        return self.pack
+
+    async def _get_content_pack(self, pack_id: int, *, guild_id: int | None = None) -> BunkerContentPack | None:
+        if pack_id != self.pack.id:
+            return None
+        if guild_id is not None and guild_id != self.pack.guild_id:
+            return None
+        return self.pack
 
 
 def _test_game(*, state: GameState = GameState.LOBBY) -> BunkerGame:
@@ -243,6 +319,112 @@ class FakeRevealRepository:
 
 
 class BunkerCogTests(unittest.TestCase):
+    def test_pack_import_without_pack_id_creates_new_pack_from_attachment(self) -> None:
+        repository = FakePackRepository()
+        cog = Bunker.__new__(Bunker)
+        cog.repository = repository
+        cog._is_bunker_admin_or_operator = AsyncMock(return_value=True)
+        interaction = FakeInteraction()
+        attachment = FakeAttachment(
+            json.dumps(
+                {
+                    "format": "siri-bunker-pack",
+                    "version": 1,
+                    "name": "Новый файл",
+                    "description": "from editor",
+                    "content": {"professions": ["Инженер"], "items": ["Фильтр"]},
+                },
+                ensure_ascii=False,
+            ).encode("utf-8")
+        )
+
+        asyncio.run(Bunker.pack_import_command.callback(cog, interaction, attachment, None))
+
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+        repository.create_content_pack.assert_awaited_once()
+        kwargs = repository.create_content_pack.await_args.kwargs
+        self.assertEqual(kwargs["guild_id"], 100)
+        self.assertEqual(kwargs["name"], "Новый файл")
+        self.assertEqual(kwargs["description"], "from editor")
+        self.assertEqual(kwargs["content"]["professions"], ("Инженер",))
+        repository.update_content_pack.assert_not_awaited()
+        interaction.followup.send.assert_awaited_once()
+
+    def test_pack_import_with_pack_id_replaces_existing_pack_from_attachment(self) -> None:
+        repository = FakePackRepository()
+        cog = Bunker.__new__(Bunker)
+        cog.repository = repository
+        cog._is_bunker_admin_or_operator = AsyncMock(return_value=True)
+        interaction = FakeInteraction()
+        attachment = FakeAttachment(
+            json.dumps(
+                {
+                    "format": "siri-bunker-pack",
+                    "version": 1,
+                    "name": "Обновленный пак",
+                    "description": "new",
+                    "content": {"professions": ["Врач"], "items": ["Аптечка"]},
+                },
+                ensure_ascii=False,
+            ).encode("utf-8")
+        )
+
+        asyncio.run(Bunker.pack_import_command.callback(cog, interaction, attachment, 7))
+
+        repository.update_content_pack.assert_awaited_once()
+        args = repository.update_content_pack.await_args.args
+        kwargs = repository.update_content_pack.await_args.kwargs
+        self.assertEqual(args[0], 7)
+        self.assertEqual(kwargs["name"], "Обновленный пак")
+        self.assertEqual(kwargs["description"], "new")
+        self.assertEqual(kwargs["content"]["items"], ("Аптечка",))
+        repository.create_content_pack.assert_not_awaited()
+
+    def test_pack_import_rejects_invalid_file_without_repository_write(self) -> None:
+        repository = FakePackRepository()
+        cog = Bunker.__new__(Bunker)
+        cog.repository = repository
+        cog._is_bunker_admin_or_operator = AsyncMock(return_value=True)
+        interaction = FakeInteraction()
+        attachment = FakeAttachment(b'{"unknown": ["value"]}')
+
+        asyncio.run(Bunker.pack_import_command.callback(cog, interaction, attachment, None))
+
+        repository.create_content_pack.assert_not_awaited()
+        repository.update_content_pack.assert_not_awaited()
+        interaction.followup.send.assert_awaited_once()
+        self.assertIn("не принят", interaction.followup.send.await_args.args[0])
+
+    def test_pack_export_sends_v1_json_file(self) -> None:
+        repository = FakePackRepository(
+            BunkerContentPack(
+                id=7,
+                guild_id=100,
+                name="Экспорт",
+                description="desc",
+                content={"professions": ("Инженер",), "items": ("Фильтр",)},
+                is_enabled=True,
+                created_by=200,
+                updated_by=200,
+            )
+        )
+        cog = Bunker.__new__(Bunker)
+        cog.repository = repository
+        cog._is_bunker_admin_or_operator = AsyncMock(return_value=True)
+        interaction = FakeInteraction()
+
+        asyncio.run(Bunker.pack_export_command.callback(cog, interaction, 7))
+
+        interaction.response.send_message.assert_awaited_once()
+        kwargs = interaction.response.send_message.await_args.kwargs
+        sent_file = kwargs["file"]
+        self.assertTrue(sent_file.filename.endswith(".bunker-pack.json"))
+        payload = json.loads(sent_file.fp.getvalue().decode("utf-8"))
+        self.assertEqual(payload["format"], "siri-bunker-pack")
+        self.assertEqual(payload["version"], 1)
+        self.assertEqual(payload["name"], "Экспорт")
+        self.assertEqual(payload["content"]["professions"], ["Инженер"])
+
     def test_missing_setup_permissions_lists_human_readable_names(self) -> None:
         permissions = discord.Permissions.none()
         permissions.view_channel = True
