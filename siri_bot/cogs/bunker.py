@@ -828,9 +828,22 @@ class Bunker(commands.Cog):
         prefer_current_response: bool = False,
         force_current_response: bool = False,
         complete_deferred_notice: bool = False,
+        replace_existing_private: bool = False,
     ) -> None:
         active_message = registry.get(key)
         response_done = _interaction_response_done(interaction)
+        if (
+            replace_existing_private
+            and active_message is not None
+            and not _same_discord_message(active_message, getattr(interaction, "message", None))
+        ):
+            try:
+                await active_message.delete()
+            except discord.HTTPException:
+                LOGGER.info("Could not delete previous bunker private panel.", exc_info=True)
+            registry.pop(key, None)
+            active_message = None
+
         if force_current_response:
             if not response_done:
                 await interaction.response.defer(ephemeral=True, thinking=True)
@@ -1185,7 +1198,12 @@ class Bunker(commands.Cog):
             )
             return
 
+        first_build_status = True
+
         async def build_status(message: str, *, voice_channel: discord.VoiceChannel | None = None) -> None:
+            nonlocal first_build_status
+            replace_existing_private = first_build_status
+            first_build_status = False
             await self.send_or_edit_setup_status(
                 interaction,
                 setup,
@@ -1193,6 +1211,7 @@ class Bunker(commands.Cog):
                 voice_channel=voice_channel,
                 prefer_current_response=True,
                 force_current_response=True,
+                replace_existing_private=replace_existing_private,
             )
 
         await build_status("Строю бункер... Создаю text/voice каналы и права доступа.")
@@ -1776,6 +1795,7 @@ class Bunker(commands.Cog):
         screen: str = "settings",
         status: str | None = None,
         complete_deferred_notice: bool = False,
+        replace_existing_private: bool = False,
     ) -> None:
         setup = await self._setup_from_interaction_message(interaction)
         if setup is None:
@@ -1816,6 +1836,7 @@ class Bunker(commands.Cog):
             embed=embed,
             view=view,
             complete_deferred_notice=complete_deferred_notice,
+            replace_existing_private=replace_existing_private,
         )
 
     async def show_setup_rules(self, interaction: discord.Interaction) -> None:
@@ -1836,6 +1857,7 @@ class Bunker(commands.Cog):
         voice_channel: discord.VoiceChannel | None = None,
         prefer_current_response: bool = False,
         force_current_response: bool = False,
+        replace_existing_private: bool = False,
     ) -> None:
         settings = normalize_settings(await self.repository.get_draft(setup.id, interaction.user.id))
         is_operator = await self._is_bunker_operator(interaction)
@@ -1855,6 +1877,7 @@ class Bunker(commands.Cog):
             ),
             prefer_current_response=prefer_current_response,
             force_current_response=force_current_response,
+            replace_existing_private=replace_existing_private,
         )
 
     async def send_host_conflict_status(
@@ -2955,7 +2978,7 @@ class BunkerSetupIdleView(SafeView):
         await self.cog.open_setup_panel(
             interaction,
             screen="settings",
-            complete_deferred_notice=True,
+            replace_existing_private=True,
         )
 
     @discord.ui.button(label="Как играть", style=discord.ButtonStyle.secondary, custom_id=SETUP_RULES_ID)
@@ -2964,7 +2987,7 @@ class BunkerSetupIdleView(SafeView):
         await self.cog.open_setup_panel(
             interaction,
             screen="rules",
-            complete_deferred_notice=True,
+            replace_existing_private=True,
         )
 
     @discord.ui.button(label="Паки/контент", style=discord.ButtonStyle.secondary, custom_id=SETUP_PACKS_ID)
@@ -2973,7 +2996,7 @@ class BunkerSetupIdleView(SafeView):
         await self.cog.open_setup_panel(
             interaction,
             screen="content",
-            complete_deferred_notice=True,
+            replace_existing_private=True,
         )
 
 
