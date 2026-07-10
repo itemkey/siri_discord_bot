@@ -87,6 +87,19 @@ class FakeFollowup:
 
 
 class FakeInteraction:
+    __slots__ = (
+        "guild",
+        "user",
+        "channel",
+        "response",
+        "message",
+        "original_message",
+        "original_response",
+        "edit_original_response",
+        "followup",
+        "client",
+    )
+
     def __init__(
         self,
         *,
@@ -104,6 +117,7 @@ class FakeInteraction:
         self.original_response = AsyncMock(return_value=self.original_message)
         self.edit_original_response = AsyncMock(return_value=self.original_message)
         self.followup = FakeFollowup(followup_message)
+        self.client = None
 
 
 class FakeBunkerRepository:
@@ -245,6 +259,32 @@ class BunkerCogTests(unittest.TestCase):
         self.assertIn("Настроить бункер", labels)
         self.assertNotIn("Зайти в бункер", labels)
 
+    def test_setup_nav_view_uses_unique_custom_ids(self) -> None:
+        view = BunkerSetupNavView(cog=object(), setup_id=10, user_id=200, settings=BunkerSettings(), screen="status")
+        custom_ids = [
+            child.custom_id
+            for child in view.children
+            if isinstance(child, discord.ui.Button) and child.style != discord.ButtonStyle.link
+        ]
+
+        self.assertEqual(len(custom_ids), len(set(custom_ids)))
+        self.assertIn("siri:b:v1:s:200:10:close", custom_ids)
+
+    def test_public_setup_settings_button_uses_explicit_deferred_notice_flag(self) -> None:
+        cog = type("Cog", (), {"open_setup_panel": AsyncMock()})()
+        view = BunkerSetupIdleView(cog=cog)
+        interaction = FakeInteraction()
+        button = next(child for child in view.children if isinstance(child, discord.ui.Button) and child.label == "Настроить бункер")
+
+        asyncio.run(button.callback(interaction))
+
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+        cog.open_setup_panel.assert_awaited_once_with(
+            interaction,
+            screen="settings",
+            complete_deferred_notice=True,
+        )
+
     def test_public_game_view_only_shows_panel_button(self) -> None:
         view = BunkerPublicGameView(cog=object())
         buttons = [child for child in view.children if isinstance(child, discord.ui.Button)]
@@ -252,6 +292,17 @@ class BunkerCogTests(unittest.TestCase):
         self.assertEqual(len(buttons), 1)
         self.assertEqual(buttons[0].label, "Панель")
         self.assertEqual(buttons[0].custom_id, GAME_PANEL_ID)
+
+    def test_public_game_panel_button_uses_explicit_deferred_notice_flag(self) -> None:
+        cog = type("Cog", (), {"open_game_panel": AsyncMock()})()
+        view = BunkerPublicGameView(cog=cog)
+        interaction = FakeInteraction()
+        button = next(child for child in view.children if isinstance(child, discord.ui.Button) and child.custom_id == GAME_PANEL_ID)
+
+        asyncio.run(button.callback(interaction))
+
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+        cog.open_game_panel.assert_awaited_once_with(interaction, complete_deferred_notice=True)
 
     def test_public_game_view_can_show_finish_speech_button_for_leader(self) -> None:
         view = BunkerPublicGameView(cog=object(), show_finish_speech=True)

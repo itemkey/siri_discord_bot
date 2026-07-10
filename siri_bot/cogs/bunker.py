@@ -123,10 +123,13 @@ def _set_button_custom_id(view: discord.ui.View, callback_name: str, custom_id: 
             return
 
 
-async def _complete_deferred_panel_notice(interaction: discord.Interaction) -> None:
-    if not getattr(interaction, "_siri_complete_deferred_panel_notice", False):
+async def _complete_deferred_panel_notice(
+    interaction: discord.Interaction,
+    *,
+    complete_deferred_notice: bool,
+) -> None:
+    if not complete_deferred_notice:
         return
-    setattr(interaction, "_siri_complete_deferred_panel_notice", False)
     try:
         await interaction.edit_original_response(content="Панель обновлена.", embed=None, view=None)
     except discord.HTTPException:
@@ -644,13 +647,26 @@ class Bunker(commands.Cog):
         status = "Роль интереса очищена." if role_id is None else "Роль интереса сохранена."
         await self.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_ACCESS, status=status)
 
-    async def open_game_panel(self, interaction: discord.Interaction, *, screen: str = "main", status: str | None = None) -> None:
+    async def open_game_panel(
+        self,
+        interaction: discord.Interaction,
+        *,
+        screen: str = "main",
+        status: str | None = None,
+        complete_deferred_notice: bool = False,
+    ) -> None:
         game = await self._game_from_interaction_channel(interaction)
         if game is None:
             await send_safe_interaction_message(interaction, "Эта панель работает в игровом text-канале бункера.")
             return
 
-        await self.send_or_edit_private_panel(interaction, game, screen=screen, status=status)
+        await self.send_or_edit_private_panel(
+            interaction,
+            game,
+            screen=screen,
+            status=status,
+            complete_deferred_notice=complete_deferred_notice,
+        )
 
     async def send_or_edit_private_panel(
         self,
@@ -662,6 +678,7 @@ class Bunker(commands.Cog):
         embed: discord.Embed | None = None,
         view: discord.ui.View | None = None,
         force_current_response: bool = False,
+        complete_deferred_notice: bool = False,
     ) -> None:
         panel_key = self._game_panel_key(interaction, game)
         if embed is None or view is None:
@@ -676,6 +693,7 @@ class Bunker(commands.Cog):
             embed=embed,
             view=view,
             force_current_response=force_current_response,
+            complete_deferred_notice=complete_deferred_notice,
         )
 
     async def update_current_game_panel(
@@ -809,6 +827,7 @@ class Bunker(commands.Cog):
         view: discord.ui.View | None,
         prefer_current_response: bool = False,
         force_current_response: bool = False,
+        complete_deferred_notice: bool = False,
     ) -> None:
         active_message = registry.get(key)
         response_done = _interaction_response_done(interaction)
@@ -837,7 +856,10 @@ class Bunker(commands.Cog):
                     response_done = True
                 try:
                     await active_message.edit(content=None, embed=embed, view=view)
-                    await _complete_deferred_panel_notice(interaction)
+                    await _complete_deferred_panel_notice(
+                        interaction,
+                        complete_deferred_notice=complete_deferred_notice,
+                    )
                     return
                 except discord.HTTPException:
                     LOGGER.info("Could not edit saved bunker private panel.", exc_info=True)
@@ -880,11 +902,17 @@ class Bunker(commands.Cog):
             await interaction.response.defer(ephemeral=True)
         try:
             await active_message.edit(content=None, embed=embed, view=view)
-            await _complete_deferred_panel_notice(interaction)
+            await _complete_deferred_panel_notice(
+                interaction,
+                complete_deferred_notice=complete_deferred_notice,
+            )
         except discord.HTTPException:
             message = await interaction.followup.send(embed=embed, view=view, ephemeral=True, wait=True)
             registry[key] = message
-            await _complete_deferred_panel_notice(interaction)
+            await _complete_deferred_panel_notice(
+                interaction,
+                complete_deferred_notice=complete_deferred_notice,
+            )
 
     async def panel_join_game(self, interaction: discord.Interaction, game_id: int) -> None:
         game = await self.repository.get_game(game_id)
@@ -1741,7 +1769,14 @@ class Bunker(commands.Cog):
     async def show_packs(self, interaction: discord.Interaction) -> None:
         await self.open_game_panel(interaction, screen="packs")
 
-    async def open_setup_panel(self, interaction: discord.Interaction, *, screen: str = "settings", status: str | None = None) -> None:
+    async def open_setup_panel(
+        self,
+        interaction: discord.Interaction,
+        *,
+        screen: str = "settings",
+        status: str | None = None,
+        complete_deferred_notice: bool = False,
+    ) -> None:
         setup = await self._setup_from_interaction_message(interaction)
         if setup is None:
             await interaction.response.send_message("Эта панель не привязана к комнате.", ephemeral=True)
@@ -1780,6 +1815,7 @@ class Bunker(commands.Cog):
             self._setup_panel_key(interaction, setup),
             embed=embed,
             view=view,
+            complete_deferred_notice=complete_deferred_notice,
         )
 
     async def show_setup_rules(self, interaction: discord.Interaction) -> None:
@@ -2915,21 +2951,30 @@ class BunkerSetupIdleView(SafeView):
 
     @discord.ui.button(label="Настроить бункер", style=discord.ButtonStyle.secondary, custom_id=SETUP_SETTINGS_ID)
     async def settings(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        setattr(interaction, "_siri_complete_deferred_panel_notice", True)
         await interaction.response.defer(ephemeral=True, thinking=True)
-        await self.cog.show_setup_settings(interaction)
+        await self.cog.open_setup_panel(
+            interaction,
+            screen="settings",
+            complete_deferred_notice=True,
+        )
 
     @discord.ui.button(label="Как играть", style=discord.ButtonStyle.secondary, custom_id=SETUP_RULES_ID)
     async def rules(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        setattr(interaction, "_siri_complete_deferred_panel_notice", True)
         await interaction.response.defer(ephemeral=True, thinking=True)
-        await self.cog.show_setup_rules(interaction)
+        await self.cog.open_setup_panel(
+            interaction,
+            screen="rules",
+            complete_deferred_notice=True,
+        )
 
     @discord.ui.button(label="Паки/контент", style=discord.ButtonStyle.secondary, custom_id=SETUP_PACKS_ID)
     async def packs(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        setattr(interaction, "_siri_complete_deferred_panel_notice", True)
         await interaction.response.defer(ephemeral=True, thinking=True)
-        await self.cog.show_setup_packs(interaction)
+        await self.cog.open_setup_panel(
+            interaction,
+            screen="content",
+            complete_deferred_notice=True,
+        )
 
 
 class BunkerPublicGameView(SafeView):
@@ -2947,9 +2992,8 @@ class BunkerPublicGameView(SafeView):
 
     @discord.ui.button(label="Панель", style=discord.ButtonStyle.primary, custom_id=GAME_PANEL_ID)
     async def panel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        setattr(interaction, "_siri_complete_deferred_panel_notice", True)
         await interaction.response.defer(ephemeral=True, thinking=True)
-        await self.cog.open_game_panel(interaction)
+        await self.cog.open_game_panel(interaction, complete_deferred_notice=True)
 
     async def finish_speech(self, interaction: discord.Interaction) -> None:
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -3566,7 +3610,7 @@ class BunkerSetupNavView(SafeView):
         self._add_button("Настройки", discord.ButtonStyle.primary if self.screen == "settings" else discord.ButtonStyle.secondary, self._settings, row=0)
         self._add_button("Как играть", discord.ButtonStyle.primary if self.screen == "rules" else discord.ButtonStyle.secondary, self._rules, row=0)
         self._add_button("Контент", discord.ButtonStyle.primary if self.screen == "content" else discord.ButtonStyle.secondary, self._content, row=0)
-        self._add_button("Назад", discord.ButtonStyle.secondary, self._settings, row=0)
+        self._add_button("Назад", discord.ButtonStyle.secondary, self._close, row=0)
         if self.voice_url:
             self.add_item(discord.ui.Button(label="Перейти в голосовой", style=discord.ButtonStyle.link, url=self.voice_url, row=1))
 
@@ -3598,6 +3642,14 @@ class BunkerSetupNavView(SafeView):
     async def _content(self, interaction: discord.Interaction) -> None:
         if await self._ensure_owner(interaction):
             await self.cog.open_setup_panel(interaction, screen="content")
+
+    async def _close(self, interaction: discord.Interaction) -> None:
+        if await self._ensure_owner(interaction):
+            await interaction.response.edit_message(
+                embed=_status_embed("Панель закрыта. Чтобы открыть ее снова, нажми кнопку на публичной панели."),
+                view=None,
+            )
+
 
 class BunkerSetupContentView(SafeView):
     def __init__(

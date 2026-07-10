@@ -70,10 +70,13 @@ def _rank_panel_mode_from_message(interaction: discord.Interaction) -> str:
     return RANK_PANEL_MODE_RANK
 
 
-async def _complete_deferred_rank_notice(interaction: discord.Interaction) -> None:
-    if not getattr(interaction, "_siri_complete_deferred_rank_notice", False):
+async def _complete_deferred_rank_notice(
+    interaction: discord.Interaction,
+    *,
+    complete_deferred_notice: bool,
+) -> None:
+    if not complete_deferred_notice:
         return
-    setattr(interaction, "_siri_complete_deferred_rank_notice", False)
     try:
         await interaction.edit_original_response(content="XP-панель обновлена.", embed=None, view=None)
     except discord.HTTPException:
@@ -826,23 +829,47 @@ class Leveling(commands.Cog):
         embed.set_footer(text=f"Page {page}")
         return embed
 
-    async def _send_rank_panel_response(self, interaction: discord.Interaction) -> None:
+    async def _send_rank_panel_response(
+        self,
+        interaction: discord.Interaction,
+        *,
+        complete_deferred_notice: bool = False,
+    ) -> None:
         guild = interaction.guild
         if guild is None:
             await send_safe_interaction_message(interaction, "Эта кнопка работает только на сервере.")
             return
 
-        await self._send_or_update_private_rank_panel_result(interaction, RANK_PANEL_MODE_RANK)
+        await self._send_or_update_private_rank_panel_result(
+            interaction,
+            RANK_PANEL_MODE_RANK,
+            complete_deferred_notice=complete_deferred_notice,
+        )
 
-    async def _send_leaderboard_panel_response(self, interaction: discord.Interaction) -> None:
+    async def _send_leaderboard_panel_response(
+        self,
+        interaction: discord.Interaction,
+        *,
+        complete_deferred_notice: bool = False,
+    ) -> None:
         guild = interaction.guild
         if guild is None:
             await send_safe_interaction_message(interaction, "Эта кнопка работает только на сервере.")
             return
 
-        await self._send_or_update_private_rank_panel_result(interaction, RANK_PANEL_MODE_LEADERBOARD)
+        await self._send_or_update_private_rank_panel_result(
+            interaction,
+            RANK_PANEL_MODE_LEADERBOARD,
+            complete_deferred_notice=complete_deferred_notice,
+        )
 
-    async def _send_or_update_private_rank_panel_result(self, interaction: discord.Interaction, mode: str) -> None:
+    async def _send_or_update_private_rank_panel_result(
+        self,
+        interaction: discord.Interaction,
+        mode: str,
+        *,
+        complete_deferred_notice: bool = False,
+    ) -> None:
         key = self._rank_panel_result_key(interaction)
         active = self._rank_panel_results_registry().get(key) if key is not None else None
         response_done = interaction_response_done(interaction)
@@ -866,7 +893,10 @@ class Leveling(commands.Cog):
 
         try:
             await active.message.edit(content=content, embed=embed, view=view)
-            await _complete_deferred_rank_notice(interaction)
+            await _complete_deferred_rank_notice(
+                interaction,
+                complete_deferred_notice=complete_deferred_notice,
+            )
         except discord.HTTPException:
             LOGGER.info("Stored private leveling panel result is unavailable; sending a new one.", exc_info=True)
             message = await interaction.followup.send(
@@ -877,7 +907,10 @@ class Leveling(commands.Cog):
                 wait=True,
             )
             self._rank_panel_results_registry()[key] = RankPanelActiveResult(message=message, mode=mode)
-            await _complete_deferred_rank_notice(interaction)
+            await _complete_deferred_rank_notice(
+                interaction,
+                complete_deferred_notice=complete_deferred_notice,
+            )
             return
 
         active.mode = mode
@@ -1330,14 +1363,19 @@ class RankPanelView(SafeView):
         await self._handle_panel_button(interaction, RANK_PANEL_MODE_LEADERBOARD)
 
     async def _handle_panel_button(self, interaction: discord.Interaction, mode: str) -> None:
-        setattr(interaction, "_siri_complete_deferred_rank_notice", True)
         try:
             await interaction.response.defer(ephemeral=True, thinking=True)
             if mode == RANK_PANEL_MODE_LEADERBOARD:
-                await self.cog._send_leaderboard_panel_response(interaction)
+                await self.cog._send_leaderboard_panel_response(
+                    interaction,
+                    complete_deferred_notice=True,
+                )
                 return
 
-            await self.cog._send_rank_panel_response(interaction)
+            await self.cog._send_rank_panel_response(
+                interaction,
+                complete_deferred_notice=True,
+            )
         except asyncpg.PostgresError:
             await _send_rank_panel_handled_error(
                 interaction,

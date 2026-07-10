@@ -105,6 +105,19 @@ class FakeClient:
 
 
 class FakeInteraction:
+    __slots__ = (
+        "guild",
+        "user",
+        "channel",
+        "response",
+        "original_message",
+        "original_response",
+        "edit_original_response",
+        "followup",
+        "message",
+        "client",
+    )
+
     def __init__(self, original_message: FakeMessage | None = None, followup_message: FakeMessage | None = None) -> None:
         self.guild = FakeGuild()
         self.user = FakeUser()
@@ -246,6 +259,28 @@ class LevelingPanelTests(unittest.TestCase):
         self.assertEqual(kwargs["view"].mode, RANK_PANEL_MODE_LEADERBOARD)
         _assert_only_refresh_button(kwargs["view"], RANK_PANEL_MODE_LEADERBOARD)
         self.assertEqual(cog._rank_panel_results[(100, 300, 200)].mode, RANK_PANEL_MODE_LEADERBOARD)
+
+    def test_public_rank_panel_button_edits_remembered_result_and_completes_notice(self) -> None:
+        cog = Leveling.__new__(Leveling)
+        saved_message = FakeMessage()
+        cog._rank_panel_results = {
+            (100, 300, 200): type("Active", (), {"message": saved_message, "mode": RANK_PANEL_MODE_LEADERBOARD})()
+        }
+        embed = discord.Embed(title="Rank")
+        cog._build_rank_embed = AsyncMock(return_value=embed)
+        interaction = FakeInteraction()
+        view = RankPanelView(cog)
+
+        asyncio.run(_button(view, RANK_PANEL_LEVEL_CUSTOM_ID).callback(interaction))
+
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+        saved_message.edit.assert_awaited_once()
+        interaction.edit_original_response.assert_awaited_once_with(
+            content="XP-панель обновлена.",
+            embed=None,
+            view=None,
+        )
+        self.assertEqual(cog._rank_panel_results[(100, 300, 200)].mode, RANK_PANEL_MODE_RANK)
 
     def test_public_rank_button_edits_remembered_private_result_back(self) -> None:
         cog = Leveling.__new__(Leveling)
