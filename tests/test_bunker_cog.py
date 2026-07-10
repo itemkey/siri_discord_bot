@@ -334,10 +334,9 @@ class BunkerCogTests(unittest.TestCase):
         speech_view = _leader_view_for_game(object(), base_game)
         pause_view = _leader_view_for_game(object(), replace(base_game, state=GameState.SPEECH_PAUSE))
         speech_ids = [child.custom_id for child in speech_view.children if isinstance(child, discord.ui.Button)]
-        pause_ids = [child.custom_id for child in pause_view.children if isinstance(child, discord.ui.Button)]
 
-        self.assertIn(GAME_FINISH_SPEECH_ID, speech_ids)
-        self.assertNotIn(GAME_FINISH_SPEECH_ID, pause_ids)
+        self.assertEqual(speech_ids, [GAME_FINISH_SPEECH_ID])
+        self.assertIsNone(pause_view)
 
     def test_public_panel_button_reuses_saved_private_panel_without_duplicate(self) -> None:
         game = BunkerGame(

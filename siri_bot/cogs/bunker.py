@@ -3009,9 +3009,20 @@ class BunkerSetupIdleView(SafeView):
 
 
 class BunkerPublicGameView(SafeView):
-    def __init__(self, cog: Bunker, *, show_finish_speech: bool = False) -> None:
+    def __init__(self, cog: Bunker, *, show_panel: bool = True, show_finish_speech: bool = False) -> None:
         super().__init__(timeout=None)
         self.cog = cog
+        if not show_panel:
+            panel = next(
+                (
+                    child
+                    for child in self.children
+                    if isinstance(child, discord.ui.Button) and child.custom_id == GAME_PANEL_ID
+                ),
+                None,
+            )
+            if panel is not None:
+                self.remove_item(panel)
         if show_finish_speech:
             finish = discord.ui.Button(
                 label="Закончить речь",
@@ -4731,7 +4742,11 @@ def _voting_prompt(game: BunkerGame, players: list[BunkerPlayer]) -> str:
 
 
 def _leader_view_for_game(cog: Bunker, game: BunkerGame) -> discord.ui.View | None:
-    return BunkerPublicGameView(cog, show_finish_speech=game.state == GameState.SPEECH_PHASE)
+    show_panel = game.state == GameState.LOBBY
+    show_finish_speech = game.state == GameState.SPEECH_PHASE
+    if not show_panel and not show_finish_speech:
+        return None
+    return BunkerPublicGameView(cog, show_panel=show_panel, show_finish_speech=show_finish_speech)
 
 
 def _game_embed(game: BunkerGame, players: list[BunkerPlayer]) -> discord.Embed:

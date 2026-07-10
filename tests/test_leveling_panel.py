@@ -13,6 +13,7 @@ from siri_bot.cogs.leveling import (
     RANK_PANEL_LEVEL_CUSTOM_ID,
     RANK_PANEL_MODE_LEADERBOARD,
     RANK_PANEL_MODE_RANK,
+    RANK_PANEL_UPDATE_NOTICE,
     Leveling,
     RankPanelLegacyRefreshDynamicButton,
     RankPanelRefreshDynamicButton,
@@ -169,23 +170,32 @@ def _settings(*, channel_id: int | None = 300, enabled: bool = True) -> Leveling
 
 
 class LevelingPanelTests(unittest.TestCase):
-    def test_public_rank_panel_button_defers_and_edits_private_rank(self) -> None:
+    def test_public_rank_panel_button_sends_private_rank_and_single_notice(self) -> None:
         cog = Leveling.__new__(Leveling)
         embed = discord.Embed(title="Rank")
         cog._build_rank_embed = AsyncMock(return_value=embed)
+        notice_message = FakeMessage()
         interaction = FakeInteraction()
+        interaction.followup = FakeFollowup(notice_message)
         view = RankPanelView(cog)
 
         asyncio.run(_button(view, RANK_PANEL_LEVEL_CUSTOM_ID).callback(interaction))
 
-        interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
-        interaction.response.send_message.assert_not_called()
-        interaction.edit_original_response.assert_awaited_once()
-        kwargs = interaction.edit_original_response.await_args.kwargs
+        interaction.response.defer.assert_not_awaited()
+        interaction.response.send_message.assert_awaited_once()
+        interaction.edit_original_response.assert_not_awaited()
+        kwargs = interaction.response.send_message.await_args.kwargs
+        self.assertTrue(kwargs["ephemeral"])
         self.assertIsNone(kwargs["content"])
         self.assertIs(kwargs["embed"], embed)
         self.assertIsInstance(kwargs["view"], RankPanelResultView)
         self.assertEqual(kwargs["view"].mode, RANK_PANEL_MODE_RANK)
+        interaction.followup.send.assert_awaited_once()
+        notice_kwargs = interaction.followup.send.await_args.kwargs
+        self.assertEqual(notice_kwargs["content"], RANK_PANEL_UPDATE_NOTICE)
+        self.assertTrue(notice_kwargs["ephemeral"])
+        self.assertTrue(notice_kwargs["wait"])
+        self.assertIs(cog._rank_panel_update_notices[(100, 300, 200)], notice_message)
 
     def test_public_rank_panel_button_reports_database_error(self) -> None:
         cog = Leveling.__new__(Leveling)
@@ -195,23 +205,27 @@ class LevelingPanelTests(unittest.TestCase):
 
         asyncio.run(_button(view, RANK_PANEL_LEVEL_CUSTOM_ID).callback(interaction))
 
-        interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+        interaction.response.defer.assert_not_awaited()
         interaction.edit_original_response.assert_not_called()
-        interaction.followup.send.assert_awaited_once_with(RANK_PANEL_DATABASE_ERROR_MESSAGE, ephemeral=True)
+        interaction.response.send_message.assert_awaited_once_with(RANK_PANEL_DATABASE_ERROR_MESSAGE, ephemeral=True)
 
     def test_public_rank_panel_button_reports_discord_response_error(self) -> None:
         cog = Leveling.__new__(Leveling)
         embed = discord.Embed(title="Rank")
         cog._build_rank_embed = AsyncMock(return_value=embed)
         interaction = FakeInteraction()
-        interaction.edit_original_response.side_effect = discord.HTTPException(FakeNotFoundResponse(), "missing")
+        interaction.response.send_message.side_effect = [
+            discord.HTTPException(FakeNotFoundResponse(), "missing"),
+            None,
+        ]
         view = RankPanelView(cog)
 
         asyncio.run(_button(view, RANK_PANEL_LEVEL_CUSTOM_ID).callback(interaction))
 
-        interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
-        interaction.edit_original_response.assert_awaited_once()
-        interaction.followup.send.assert_awaited_once_with(RANK_PANEL_DISCORD_ERROR_MESSAGE, ephemeral=True)
+        interaction.response.defer.assert_not_awaited()
+        interaction.edit_original_response.assert_not_awaited()
+        self.assertEqual(interaction.response.send_message.await_count, 2)
+        self.assertEqual(interaction.response.send_message.await_args.args[0], RANK_PANEL_DISCORD_ERROR_MESSAGE)
 
     def test_public_rank_button_sends_private_result_menu_and_remembers_it(self) -> None:
         cog = Leveling.__new__(Leveling)
@@ -260,7 +274,7 @@ class LevelingPanelTests(unittest.TestCase):
         _assert_only_refresh_button(kwargs["view"], RANK_PANEL_MODE_LEADERBOARD)
         self.assertEqual(cog._rank_panel_results[(100, 300, 200)].mode, RANK_PANEL_MODE_LEADERBOARD)
 
-    def test_public_rank_panel_button_edits_remembered_result_and_completes_notice(self) -> None:
+    def test_public_rank_panel_button_edits_remembered_result_and_creates_single_notice(self) -> None:
         cog = Leveling.__new__(Leveling)
         saved_message = FakeMessage()
         cog._rank_panel_results = {
@@ -268,19 +282,71 @@ class LevelingPanelTests(unittest.TestCase):
         }
         embed = discord.Embed(title="Rank")
         cog._build_rank_embed = AsyncMock(return_value=embed)
+        notice_message = FakeMessage()
+        interaction = FakeInteraction(followup_message=notice_message)
+        view = RankPanelView(cog)
+
+        asyncio.run(_button(view, RANK_PANEL_LEVEL_CUSTOM_ID).callback(interaction))
+
+        interaction.response.defer.assert_awaited_once_with()
+        saved_message.edit.assert_awaited_once()
+        interaction.edit_original_response.assert_not_awaited()
+        interaction.followup.send.assert_awaited_once()
+        notice_kwargs = interaction.followup.send.await_args.kwargs
+        self.assertEqual(notice_kwargs["content"], RANK_PANEL_UPDATE_NOTICE)
+        self.assertTrue(notice_kwargs["ephemeral"])
+        self.assertTrue(notice_kwargs["wait"])
+        self.assertEqual(cog._rank_panel_results[(100, 300, 200)].mode, RANK_PANEL_MODE_RANK)
+        self.assertIs(cog._rank_panel_update_notices[(100, 300, 200)], notice_message)
+
+    def test_public_rank_panel_button_edits_existing_notice_without_duplicate(self) -> None:
+        cog = Leveling.__new__(Leveling)
+        saved_message = FakeMessage()
+        notice_message = FakeMessage(content=RANK_PANEL_UPDATE_NOTICE)
+        cog._rank_panel_results = {
+            (100, 300, 200): type("Active", (), {"message": saved_message, "mode": RANK_PANEL_MODE_LEADERBOARD})()
+        }
+        cog._rank_panel_update_notices = {(100, 300, 200): notice_message}
+        embed = discord.Embed(title="Rank")
+        cog._build_rank_embed = AsyncMock(return_value=embed)
         interaction = FakeInteraction()
         view = RankPanelView(cog)
 
         asyncio.run(_button(view, RANK_PANEL_LEVEL_CUSTOM_ID).callback(interaction))
 
-        interaction.response.defer.assert_awaited_once_with(ephemeral=True, thinking=True)
+        interaction.response.defer.assert_awaited_once_with()
         saved_message.edit.assert_awaited_once()
-        interaction.edit_original_response.assert_awaited_once_with(
-            content="XP-панель обновлена.",
-            embed=None,
-            view=None,
-        )
-        self.assertEqual(cog._rank_panel_results[(100, 300, 200)].mode, RANK_PANEL_MODE_RANK)
+        notice_message.edit.assert_awaited_once_with(content=RANK_PANEL_UPDATE_NOTICE, embed=None, view=None)
+        interaction.edit_original_response.assert_not_awaited()
+        interaction.followup.send.assert_not_awaited()
+        self.assertIs(cog._rank_panel_update_notices[(100, 300, 200)], notice_message)
+
+    def test_public_rank_panel_button_replaces_expired_notice(self) -> None:
+        cog = Leveling.__new__(Leveling)
+        saved_message = FakeMessage()
+        expired_notice = FakeMessage(content=RANK_PANEL_UPDATE_NOTICE)
+        expired_notice.edit.side_effect = discord.NotFound(FakeNotFoundResponse(), "missing")
+        replacement_notice = FakeMessage(content=RANK_PANEL_UPDATE_NOTICE)
+        cog._rank_panel_results = {
+            (100, 300, 200): type("Active", (), {"message": saved_message, "mode": RANK_PANEL_MODE_LEADERBOARD})()
+        }
+        cog._rank_panel_update_notices = {(100, 300, 200): expired_notice}
+        embed = discord.Embed(title="Rank")
+        cog._build_rank_embed = AsyncMock(return_value=embed)
+        interaction = FakeInteraction(followup_message=replacement_notice)
+        view = RankPanelView(cog)
+
+        asyncio.run(_button(view, RANK_PANEL_LEVEL_CUSTOM_ID).callback(interaction))
+
+        interaction.response.defer.assert_awaited_once_with()
+        saved_message.edit.assert_awaited_once()
+        expired_notice.edit.assert_awaited_once_with(content=RANK_PANEL_UPDATE_NOTICE, embed=None, view=None)
+        interaction.followup.send.assert_awaited_once()
+        notice_kwargs = interaction.followup.send.await_args.kwargs
+        self.assertEqual(notice_kwargs["content"], RANK_PANEL_UPDATE_NOTICE)
+        self.assertTrue(notice_kwargs["ephemeral"])
+        self.assertTrue(notice_kwargs["wait"])
+        self.assertIs(cog._rank_panel_update_notices[(100, 300, 200)], replacement_notice)
 
     def test_public_rank_button_edits_remembered_private_result_back(self) -> None:
         cog = Leveling.__new__(Leveling)

@@ -49,6 +49,7 @@ RANK_PANEL_REFRESH_DYNAMIC_TEMPLATE = rf"{re.escape(RANK_PANEL_REFRESH_CUSTOM_ID
 RANK_PANEL_LEGACY_REFRESH_DYNAMIC_TEMPLATE = re.escape(RANK_PANEL_REFRESH_CUSTOM_ID)
 RANK_PANEL_MODE_RANK = "rank"
 RANK_PANEL_MODE_LEADERBOARD = "leaderboard"
+RANK_PANEL_UPDATE_NOTICE = "XP-панель обновлена."
 RankPanelResultKey = tuple[int, int, int]
 
 
@@ -68,19 +69,6 @@ def _rank_panel_mode_from_message(interaction: discord.Interaction) -> str:
             return RANK_PANEL_MODE_LEADERBOARD
 
     return RANK_PANEL_MODE_RANK
-
-
-async def _complete_deferred_rank_notice(
-    interaction: discord.Interaction,
-    *,
-    complete_deferred_notice: bool,
-) -> None:
-    if not complete_deferred_notice:
-        return
-    try:
-        await interaction.edit_original_response(content="XP-панель обновлена.", embed=None, view=None)
-    except discord.HTTPException:
-        LOGGER.info("Could not complete deferred leveling panel notice.", exc_info=True)
 
 
 async def _send_rank_panel_handled_error(
@@ -123,6 +111,7 @@ class Leveling(commands.Cog):
         self.pool = pool
         self._voice_synced_once = False
         self._rank_panel_results: dict[RankPanelResultKey, RankPanelActiveResult] = {}
+        self._rank_panel_update_notices: dict[RankPanelResultKey, Any] = {}
         self._levelup_backfill_guild_ids: set[int] = set()
         self._levelup_backfill_tasks: set[asyncio.Task[None]] = set()
         self.bot.add_view(RankPanelView(self))
@@ -884,17 +873,28 @@ class Leveling(commands.Cog):
                 message = await interaction.edit_original_response(content=content, embed=embed, view=view)
                 if key is not None:
                     self._rank_panel_results_registry()[key] = RankPanelActiveResult(message=message, mode=mode)
+                await self._complete_rank_panel_update_notice(
+                    interaction,
+                    key=key,
+                    complete_deferred_notice=complete_deferred_notice,
+                )
                 return
 
             await interaction.response.send_message(content=content, embed=embed, view=view, ephemeral=True)
             if key is not None:
                 await self._remember_rank_panel_result(interaction, key, mode)
+            await self._complete_rank_panel_update_notice(
+                interaction,
+                key=key,
+                complete_deferred_notice=complete_deferred_notice,
+            )
             return
 
         try:
             await active.message.edit(content=content, embed=embed, view=view)
-            await _complete_deferred_rank_notice(
+            await self._complete_rank_panel_update_notice(
                 interaction,
+                key=key,
                 complete_deferred_notice=complete_deferred_notice,
             )
         except discord.HTTPException:
@@ -907,8 +907,9 @@ class Leveling(commands.Cog):
                 wait=True,
             )
             self._rank_panel_results_registry()[key] = RankPanelActiveResult(message=message, mode=mode)
-            await _complete_deferred_rank_notice(
+            await self._complete_rank_panel_update_notice(
                 interaction,
+                key=key,
                 complete_deferred_notice=complete_deferred_notice,
             )
             return
@@ -949,6 +950,46 @@ class Leveling(commands.Cog):
 
         self._rank_panel_results_registry()[key] = RankPanelActiveResult(message=message, mode=mode)
 
+    async def _complete_rank_panel_update_notice(
+        self,
+        interaction: discord.Interaction,
+        *,
+        key: RankPanelResultKey | None,
+        complete_deferred_notice: bool,
+    ) -> None:
+        if not complete_deferred_notice or key is None:
+            return
+
+        notices = self._rank_panel_update_notices_registry()
+        notice_message = notices.get(key)
+        if notice_message is not None:
+            if not interaction_response_done(interaction):
+                await interaction.response.defer()
+            try:
+                await notice_message.edit(content=RANK_PANEL_UPDATE_NOTICE, embed=None, view=None)
+                return
+            except discord.HTTPException:
+                LOGGER.info("Stored leveling panel notice is unavailable; sending a new one.", exc_info=True)
+                notices.pop(key, None)
+
+        try:
+            if interaction_response_done(interaction):
+                message = await interaction.followup.send(
+                    content=RANK_PANEL_UPDATE_NOTICE,
+                    embed=None,
+                    view=None,
+                    ephemeral=True,
+                    wait=True,
+                )
+            else:
+                await interaction.response.send_message(RANK_PANEL_UPDATE_NOTICE, ephemeral=True)
+                message = await interaction.original_response()
+        except discord.HTTPException:
+            LOGGER.info("Could not complete leveling panel notice.", exc_info=True)
+            return
+
+        notices[key] = message
+
     def _rank_panel_result_key(self, interaction: discord.Interaction) -> RankPanelResultKey | None:
         guild = interaction.guild
         channel = interaction.channel
@@ -963,6 +1004,12 @@ class Leveling(commands.Cog):
             self._rank_panel_results = {}
 
         return self._rank_panel_results
+
+    def _rank_panel_update_notices_registry(self) -> dict[RankPanelResultKey, Any]:
+        if not hasattr(self, "_rank_panel_update_notices"):
+            self._rank_panel_update_notices = {}
+
+        return self._rank_panel_update_notices
 
     async def _refresh_rank_panel_response(self, interaction: discord.Interaction) -> None:
         guild = interaction.guild
@@ -1364,7 +1411,6 @@ class RankPanelView(SafeView):
 
     async def _handle_panel_button(self, interaction: discord.Interaction, mode: str) -> None:
         try:
-            await interaction.response.defer(ephemeral=True, thinking=True)
             if mode == RANK_PANEL_MODE_LEADERBOARD:
                 await self.cog._send_leaderboard_panel_response(
                     interaction,
