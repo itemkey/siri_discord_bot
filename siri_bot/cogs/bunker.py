@@ -764,6 +764,7 @@ class Bunker(commands.Cog):
             game,
             screen=screen,
             status=status,
+            force_current_response=complete_deferred_notice,
             complete_deferred_notice=complete_deferred_notice,
         )
 
@@ -931,109 +932,83 @@ class Bunker(commands.Cog):
     ) -> None:
         active_message = registry.get(key)
         response_done = _interaction_response_done(interaction)
-        if prefer_existing_private and active_message is not None:
-            if not response_done and _same_discord_message(active_message, getattr(interaction, "message", None)):
-                try:
-                    await interaction.response.edit_message(content=None, embed=embed, view=view)
-                    return
-                except discord.HTTPException:
-                    LOGGER.info("Could not edit current bunker private panel.", exc_info=True)
-                    response_done = _interaction_response_done(interaction)
-            if not response_done:
-                await interaction.response.defer()
-                response_done = True
-            try:
-                await active_message.edit(content=None, embed=embed, view=view)
-                return
-            except discord.HTTPException:
-                LOGGER.info("Could not edit saved bunker private panel.", exc_info=True)
-                registry.pop(key, None)
-                message = await interaction.followup.send(embed=embed, view=view, ephemeral=True, wait=True)
-                registry[key] = message
-                return
+        current_message = getattr(interaction, "message", None)
+        current_is_active = active_message is not None and _same_discord_message(active_message, current_message)
+        current_is_private = _message_is_ephemeral(current_message)
 
-        if force_current_response:
-            if not response_done:
-                await interaction.response.defer(ephemeral=True, thinking=True)
-            try:
-                message = await interaction.edit_original_response(content=None, embed=embed, view=view)
-            except discord.HTTPException:
-                LOGGER.info("Could not edit current bunker private response.", exc_info=True)
-                message = await interaction.followup.send(embed=embed, view=view, ephemeral=True, wait=True)
-            registry[key] = message
-            return
-
-        if prefer_current_response:
-            if active_message is not None:
-                if not response_done and _same_discord_message(active_message, getattr(interaction, "message", None)):
-                    try:
-                        await interaction.response.edit_message(content=None, embed=embed, view=view)
-                        return
-                    except discord.HTTPException:
-                        LOGGER.info("Could not edit current bunker private panel.", exc_info=True)
-                        response_done = _interaction_response_done(interaction)
-                if not response_done:
-                    await interaction.response.defer(ephemeral=True)
-                    response_done = True
-                try:
-                    await active_message.edit(content=None, embed=embed, view=view)
-                    await _complete_deferred_panel_notice(
-                        interaction,
-                        complete_deferred_notice=complete_deferred_notice,
-                    )
-                    return
-                except discord.HTTPException:
-                    LOGGER.info("Could not edit saved bunker private panel.", exc_info=True)
-
-            if not response_done:
-                await interaction.response.defer(ephemeral=True, thinking=True)
-            try:
-                message = await interaction.edit_original_response(content=None, embed=embed, view=view)
-                registry[key] = message
-                return
-            except discord.HTTPException:
-                LOGGER.info("Could not edit current bunker private response.", exc_info=True)
-                message = await interaction.followup.send(embed=embed, view=view, ephemeral=True, wait=True)
-                registry[key] = message
-                return
-
-        if active_message is None:
+        async def send_or_edit_current_response() -> None:
+            nonlocal response_done
             if response_done:
                 try:
                     message = await interaction.edit_original_response(content=None, embed=embed, view=view)
                 except discord.HTTPException:
+                    LOGGER.info("Could not edit current bunker private response.", exc_info=True)
                     message = await interaction.followup.send(embed=embed, view=view, ephemeral=True, wait=True)
                 registry[key] = message
-            else:
-                await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-                try:
-                    registry[key] = await interaction.original_response()
-                except discord.HTTPException:
-                    LOGGER.info("Could not remember bunker private panel.", exc_info=True)
-            return
-
-        if not response_done and _same_discord_message(active_message, getattr(interaction, "message", None)):
-            try:
-                await interaction.response.edit_message(content=None, embed=embed, view=view)
                 return
+
+            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+            response_done = True
+            try:
+                registry[key] = await interaction.original_response()
+            except discord.HTTPException:
+                LOGGER.info("Could not remember bunker private panel.", exc_info=True)
+
+        async def edit_current_message() -> bool:
+            nonlocal response_done
+            try:
+                if response_done:
+                    message = await interaction.edit_original_response(content=None, embed=embed, view=view)
+                    registry[key] = message
+                else:
+                    await interaction.response.edit_message(content=None, embed=embed, view=view)
+                    response_done = True
+                    registry[key] = current_message
+                return True
             except discord.HTTPException:
                 LOGGER.info("Could not edit current bunker private panel.", exc_info=True)
+                response_done = _interaction_response_done(interaction)
+                return False
 
-        if not response_done:
-            await interaction.response.defer(ephemeral=True)
-        try:
-            await active_message.edit(content=None, embed=embed, view=view)
-            await _complete_deferred_panel_notice(
-                interaction,
-                complete_deferred_notice=complete_deferred_notice,
-            )
-        except discord.HTTPException:
-            message = await interaction.followup.send(embed=embed, view=view, ephemeral=True, wait=True)
-            registry[key] = message
-            await _complete_deferred_panel_notice(
-                interaction,
-                complete_deferred_notice=complete_deferred_notice,
-            )
+        async def edit_saved_message() -> bool:
+            nonlocal response_done
+            if active_message is None:
+                return False
+            if not response_done:
+                await interaction.response.defer(ephemeral=True)
+                response_done = True
+            try:
+                await active_message.edit(content=None, embed=embed, view=view)
+                await _complete_deferred_panel_notice(
+                    interaction,
+                    complete_deferred_notice=complete_deferred_notice,
+                )
+                return True
+            except discord.HTTPException:
+                LOGGER.info("Could not edit saved bunker private panel.", exc_info=True)
+                registry.pop(key, None)
+                return False
+
+        if force_current_response:
+            await send_or_edit_current_response()
+            return
+
+        if current_is_active:
+            if await edit_current_message():
+                return
+
+        if current_is_private:
+            if await edit_current_message():
+                return
+
+        # Discord does not tell bots when a user dismissed an ephemeral message.
+        # A new public/slash interaction must therefore get a fresh private response.
+        if active_message is None or not response_done or prefer_current_response or prefer_existing_private:
+            await send_or_edit_current_response()
+            return
+
+        if not await edit_saved_message():
+            await send_or_edit_current_response()
 
     async def panel_join_game(self, interaction: discord.Interaction, game_id: int) -> None:
         game = await self.repository.get_game(game_id)
@@ -2690,6 +2665,8 @@ class Bunker(commands.Cog):
         if ability.effect == "reroll_stat" and player.card is not None:
             content_pack = await self._content_pack_for_game(game)
             values = {
+                "age": content_pack.ages,
+                "gender": content_pack.genders,
                 "health": content_pack.weaknesses,
                 "hobby": content_pack.skills,
                 "phobia": content_pack.phobias,
@@ -2697,6 +2674,7 @@ class Bunker(commands.Cog):
                 "extra_fact": content_pack.secrets,
                 "profession": content_pack.professions,
                 "character_trait": content_pack.funny_traits,
+                "biology": content_pack.biology,
             }.get(stat, ())
             if values:
                 await self.repository.assign_cards(game.id, {player.user_id: replace(player.card, **{stat: rng.choice(values)})})
@@ -5266,6 +5244,15 @@ def _same_discord_message(left: Any, right: Any) -> bool:
     if left_id is not None and right_id is not None:
         return left_id == right_id
     return left is right
+
+
+def _message_is_ephemeral(message: Any) -> bool:
+    flags = getattr(message, "flags", None)
+    ephemeral = getattr(flags, "ephemeral", None)
+    if isinstance(ephemeral, bool):
+        return ephemeral
+    value = getattr(flags, "value", None)
+    return isinstance(value, int) and bool(value & 64)
 
 
 def _interaction_response_done(interaction: discord.Interaction) -> bool:

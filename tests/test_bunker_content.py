@@ -10,12 +10,15 @@ class BunkerContentTests(unittest.TestCase):
         counts = BUILTIN_PACK.counts()
 
         self.assertGreaterEqual(counts["professions"], 8)
+        self.assertGreaterEqual(counts["ages"], 50)
+        self.assertGreaterEqual(counts["genders"], 3)
         self.assertGreaterEqual(counts["items"], 8)
         self.assertGreaterEqual(counts["weaknesses"], 8)
         self.assertGreaterEqual(counts["secrets"], 8)
         self.assertGreaterEqual(counts["skills"], 8)
         self.assertGreaterEqual(counts["phobias"], 8)
         self.assertGreaterEqual(counts["funny_traits"], 8)
+        self.assertGreaterEqual(counts["biology"], 5)
         self.assertGreaterEqual(counts["apocalypses"], 5)
         self.assertGreaterEqual(counts["bunker_defects"], 5)
         self.assertGreaterEqual(counts["chaos_events"], 5)
@@ -25,6 +28,9 @@ class BunkerContentTests(unittest.TestCase):
         content = normalize_pack_content(
             {
                 "professions": ["  Свой инженер  ", "Свой инженер", ""],
+                "ages": ["99 лет"],
+                "genders": ["свой пол"],
+                "biology": ["своя биология"],
                 "items": ["Личный фильтр"],
             }
         )
@@ -33,6 +39,9 @@ class BunkerContentTests(unittest.TestCase):
         merged = merge_content_packs(BUILTIN_PACK, custom)
 
         self.assertIn("Свой инженер", merged.professions)
+        self.assertIn("99 лет", merged.ages)
+        self.assertIn("свой пол", merged.genders)
+        self.assertIn("своя биология", merged.biology)
         self.assertIn("Личный фильтр", merged.items)
         self.assertGreater(len(merged.professions), len(custom.professions))
 

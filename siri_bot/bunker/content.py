@@ -20,6 +20,15 @@ KNOWN_ABILITY_EFFECTS: frozenset[str] = frozenset(
 
 GENDERS: tuple[str, ...] = ("женщина", "мужчина", "небинарный человек")
 
+BIOLOGY_TRAITS: tuple[str, ...] = (
+    "может иметь детей, хронических ограничений не выявлено",
+    "репродуктивная функция снижена, но общее состояние стабильное",
+    "имеет медицинское ограничение по репродукции",
+    "генетических рисков по базовому скринингу не обнаружено",
+    "требуется дополнительное обследование репродуктивного здоровья",
+    "репродуктивный статус неизвестен",
+)
+
 BODY_TYPES: tuple[str, ...] = (
     "выносливое телосложение",
     "среднее телосложение",
@@ -114,48 +123,57 @@ SPECIAL_ACTIONS: tuple[str, ...] = tuple(
 
 PACK_FIELDS: tuple[str, ...] = (
     "professions",
-    "items",
+    "ages",
+    "genders",
     "weaknesses",
-    "secrets",
-    "skills",
     "phobias",
+    "skills",
+    "items",
+    "secrets",
     "funny_traits",
+    "biology",
+    "special_actions",
     "apocalypses",
+    "layouts",
     "bunker_defects",
     "chaos_events",
-    "layouts",
-    "special_actions",
 )
 
 PACK_FIELD_LABELS: dict[str, str] = {
     "professions": "Профессии",
-    "items": "Багаж",
+    "ages": "Возраст",
+    "genders": "Пол",
     "weaknesses": "Здоровье",
-    "secrets": "Доп. факты",
-    "skills": "Хобби/навыки",
     "phobias": "Фобии",
+    "skills": "Хобби/навыки",
+    "items": "Багаж",
+    "secrets": "Доп. факты",
     "funny_traits": "Черты характера",
+    "biology": "Биология",
+    "special_actions": "Спец. возможности",
     "apocalypses": "Катаклизмы",
+    "layouts": "Планировки",
     "bunker_defects": "Состояние бункера",
     "chaos_events": "События",
-    "layouts": "Планировки",
-    "special_actions": "Спец. возможности",
 }
 
 
 @dataclass(frozen=True)
 class ContentPack:
     professions: tuple[str, ...]
-    items: tuple[str, ...]
+    ages: tuple[str, ...]
+    genders: tuple[str, ...]
     weaknesses: tuple[str, ...]
-    secrets: tuple[str, ...]
-    skills: tuple[str, ...]
     phobias: tuple[str, ...]
+    skills: tuple[str, ...]
+    items: tuple[str, ...]
+    secrets: tuple[str, ...]
     funny_traits: tuple[str, ...]
+    biology: tuple[str, ...]
     apocalypses: tuple[str, ...]
+    layouts: tuple[str, ...]
     bunker_defects: tuple[str, ...]
     chaos_events: tuple[str, ...]
-    layouts: tuple[str, ...]
     special_actions: tuple[str, ...] = SPECIAL_ACTIONS
 
     def counts(self) -> dict[str, int]:
@@ -293,6 +311,20 @@ def _dump_ability_payload(payload: dict[str, Any]) -> str:
         text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return text
 
+
+def _age_label(age: int) -> str:
+    if 11 <= age % 100 <= 14:
+        suffix = "лет"
+    elif age % 10 == 1:
+        suffix = "год"
+    elif 2 <= age % 10 <= 4:
+        suffix = "года"
+    else:
+        suffix = "лет"
+    return f"{age} {suffix}"
+
+
+CORE_AGES = tuple(_age_label(age) for age in range(18, 79))
 
 CORE_PROFESSIONS = (
     "инженер систем жизнеобеспечения",
@@ -434,14 +466,17 @@ def _extend(seed: tuple[str, ...], target: int, pattern: str) -> tuple[str, ...]
 
 BUILTIN_PACK = ContentPack(
     professions=CORE_PROFESSIONS,
-    items=CORE_ITEMS,
+    ages=CORE_AGES,
+    genders=GENDERS,
     weaknesses=CORE_HEALTH,
-    secrets=CORE_FACTS,
-    skills=CORE_SKILLS,
     phobias=CORE_PHOBIAS,
+    skills=CORE_SKILLS,
+    items=CORE_ITEMS,
+    secrets=CORE_FACTS,
     funny_traits=CORE_CHARACTER_TRAITS,
+    biology=BIOLOGY_TRAITS,
     apocalypses=CORE_APOCALYPSES,
+    layouts=CORE_LAYOUTS,
     bunker_defects=CORE_DEFECTS,
     chaos_events=CORE_EVENTS,
-    layouts=CORE_LAYOUTS,
 )

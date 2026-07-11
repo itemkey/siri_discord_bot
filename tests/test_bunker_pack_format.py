@@ -21,6 +21,9 @@ class BunkerPackFormatTests(unittest.TestCase):
             description="Для редактора",
             content={
                 "professions": ["  Инженер  ", "Инженер", ""],
+                "ages": ["42 года"],
+                "genders": ["женщина"],
+                "biology": ["может иметь детей"],
                 "items": ["Фильтр воды"],
             },
         )
@@ -33,6 +36,9 @@ class BunkerPackFormatTests(unittest.TestCase):
         self.assertEqual(parsed.name, "Городской пак")
         self.assertEqual(parsed.description, "Для редактора")
         self.assertEqual(parsed.content["professions"], ("Инженер",))
+        self.assertEqual(parsed.content["ages"], ("42 года",))
+        self.assertEqual(parsed.content["genders"], ("женщина",))
+        self.assertEqual(parsed.content["biology"], ("может иметь детей",))
         self.assertEqual(parsed.content["items"], ("Фильтр воды",))
         self.assertTrue(all(field in parsed.content for field in PACK_FIELDS))
 
@@ -52,6 +58,7 @@ class BunkerPackFormatTests(unittest.TestCase):
         self.assertEqual(parsed.description, "old")
         self.assertEqual(parsed.content["professions"], ("Врач",))
         self.assertEqual(parsed.content["items"], ("Аптечка",))
+        self.assertEqual(parsed.content["ages"], ())
 
     def test_raw_category_payload_is_accepted(self) -> None:
         parsed = parse_pack_file('{"professions": ["Пилот"], "items": ["Компас"]}')

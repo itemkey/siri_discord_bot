@@ -82,16 +82,19 @@ class BunkerEngineTests(unittest.TestCase):
     def test_assign_cards_uses_selected_content_pack(self) -> None:
         pack = ContentPack(
             professions=("Кастомный инженер",),
-            items=("Кастомный предмет",),
+            ages=("99 лет",),
+            genders=("кастомный пол",),
             weaknesses=("Кастомная слабость",),
-            secrets=("Кастомный секрет",),
-            skills=("Кастомный навык",),
             phobias=("Кастомная фобия",),
+            skills=("Кастомный навык",),
+            items=("Кастомный предмет",),
+            secrets=("Кастомный секрет",),
             funny_traits=("Кастомная черта",),
+            biology=("Кастомная биология",),
             apocalypses=("Кастомный апокалипсис",),
+            layouts=("Кастомная планировка",),
             bunker_defects=("Кастомный дефект",),
             chaos_events=("Кастомный хаос",),
-            layouts=("Кастомная планировка",),
             special_actions=("Кастомное действие",),
         )
         players = [_player(1, host=True), _player(2)]
@@ -99,6 +102,9 @@ class BunkerEngineTests(unittest.TestCase):
         cards = assign_cards(players, BunkerSettings(), random.Random(1), pack)
 
         self.assertEqual(cards[1].profession, "Кастомный инженер")
+        self.assertEqual(cards[1].age, "99 лет")
+        self.assertEqual(cards[1].gender, "кастомный пол")
+        self.assertEqual(cards[1].biology, "Кастомная биология")
         self.assertEqual(cards[2].inventory, "Кастомный предмет")
         self.assertEqual(len(cards[2].special_abilities), 2)
 

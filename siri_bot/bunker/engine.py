@@ -7,7 +7,7 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Iterable
 
-from siri_bot.bunker.content import BODY_TYPES, BUILTIN_PACK, ContentPack, GENDERS
+from siri_bot.bunker.content import BIOLOGY_TRAITS, BODY_TYPES, BUILTIN_PACK, ContentPack, GENDERS
 from siri_bot.bunker.models import (
     BunkerGame,
     BunkerPlayer,
@@ -29,15 +29,6 @@ from siri_bot.bunker.models import (
 MIN_PLAYERS = 6
 MAX_PLAYERS = 16
 FINAL_ALIVE_FLOOR = 2
-
-BIOLOGY_TRAITS: tuple[str, ...] = (
-    "может иметь детей, хронических ограничений не выявлено",
-    "репродуктивная функция снижена, но общее состояние стабильное",
-    "имеет медицинское ограничение по репродукции",
-    "генетических рисков по базовому скринингу не обнаружено",
-    "требуется дополнительное обследование репродуктивного здоровья",
-    "репродуктивный статус неизвестен",
-)
 
 ROUND_REVEAL_STATS: tuple[tuple[str, ...], ...] = (
     ("profession",),
@@ -141,19 +132,18 @@ def generate_card(
     traitor: bool = False,
 ) -> CharacterCard:
     rng = rng or random.Random()
-    age = rng.randint(18, 78)
     abilities = _pick_special_abilities(rng, pack)
     return CharacterCard(
         profession=rng.choice(pack.professions),
-        age=f"{age} лет",
-        gender=rng.choice(GENDERS),
+        age=rng.choice(pack.ages) if pack.ages else f"{rng.randint(18, 78)} лет",
+        gender=rng.choice(pack.genders or GENDERS),
         health=rng.choice(pack.weaknesses),
         phobia=rng.choice(pack.phobias),
         hobby=rng.choice(pack.skills),
         baggage=rng.choice(pack.items),
         extra_fact=rng.choice(pack.secrets),
         character_trait=rng.choice(pack.funny_traits or BODY_TYPES),
-        biology=rng.choice(BIOLOGY_TRAITS),
+        biology=rng.choice(pack.biology or BIOLOGY_TRAITS),
         special_abilities=abilities,
         traitor=traitor,
     )
