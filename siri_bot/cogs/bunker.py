@@ -118,7 +118,7 @@ SPEECH_HANDOFF_SECONDS = 15
 PRIVATE_VIEW_TIMEOUT_SECONDS = 30 * 24 * 60 * 60
 BUILDER_AGREEMENT_VERSION = 1
 BUILDER_UPLOAD_TIMEOUT_SECONDS = 10 * 60
-BUILDER_EDITOR_URL = "https://github.com/itemkey/dfile_editor"
+BUILDER_EDITOR_URL = "https://github.com/itemkey/dfile_editor/releases/latest"
 ADMIN_PACK_LIST_PAGE_SIZE = 24
 ADMIN_SUBMISSION_PAGE_SIZE = 4
 BUNKER_DYNAMIC_BUTTON_TEMPLATE = r"siri:b:v1:(?P<scope>[ags]):(?P<owner_id>\d+):(?P<target_id>\d+):(?P<action>[a-z0-9_]+)"
@@ -4375,7 +4375,7 @@ class BunkerBuilderHomeView(SafeView):
         self.setup_id = setup_id
         self.user_id = user_id
         self._add_button("Опубликовать пак", discord.ButtonStyle.success, self._publish, row=0)
-        self.add_item(discord.ui.Button(label="DFile Editor", style=discord.ButtonStyle.link, url=BUILDER_EDITOR_URL, row=0))
+        self.add_item(discord.ui.Button(label="Скачать DFile Editor", style=discord.ButtonStyle.link, url=BUILDER_EDITOR_URL, row=0))
         self._add_button("Инструкция", discord.ButtonStyle.secondary, self._instruction, row=1)
         self._add_button("Назад", discord.ButtonStyle.secondary, self._back, row=1)
 
@@ -4430,7 +4430,7 @@ class BunkerBuilderTutorialView(SafeView):
         elif screen == "install":
             self._add_button("Назад", discord.ButtonStyle.secondary, self._back, row=0)
             self._add_button("Дальше", discord.ButtonStyle.primary, self._next, row=0)
-            self.add_item(discord.ui.Button(label="GitHub", style=discord.ButtonStyle.link, url=BUILDER_EDITOR_URL, row=1))
+            self.add_item(discord.ui.Button(label="Скачать .exe", style=discord.ButtonStyle.link, url=BUILDER_EDITOR_URL, row=1))
         elif screen == "usage":
             self._add_button("Назад", discord.ButtonStyle.secondary, self._back, row=0)
             self._add_button("Дальше", discord.ButtonStyle.primary, self._next, row=0)
@@ -5816,7 +5816,7 @@ def _builder_home_embed(*, status: str | None = None) -> discord.Embed:
     embed = discord.Embed(title="Строитель паков", color=discord.Color.dark_teal())
     embed.description = status or "Здесь можно отправить свой `.bunker-pack.json` на проверку администрации."
     embed.add_field(name="Проверка", value="Админы проверят файл и примут или отклонят пак. Обычно это занимает до 24 часов.", inline=False)
-    embed.add_field(name="Редактор", value=f"Скачать DFile Editor: {BUILDER_EDITOR_URL}", inline=False)
+    embed.add_field(name="Редактор", value=f"Скачать готовый `.exe`: {BUILDER_EDITOR_URL}", inline=False)
     return embed
 
 
@@ -5834,11 +5834,12 @@ def _builder_tutorial_embed(screen: str, *, status: str | None = None) -> discor
             "Администрация может отклонить файл без отдельной причины."
         ),
         "install": (
-            f"Скачай редактор с GitHub: {BUILDER_EDITOR_URL}\n"
-            "Открой приложение, создай новый `.bunker-pack.json` или загрузи существующий файл пака."
+            f"Скачай готовый `DFile-Editor-*-x64.exe`: {BUILDER_EDITOR_URL}\n"
+            "Запусти скачанный `.exe` двойным кликом. Установщик не нужен: приложение открывается сразу."
         ),
         "usage": (
-            "Заполняй категории пака в редакторе: профессии, возраст, здоровье, багаж, фобии, факты, события и другие поля. "
+            "В приложении создай новый `.bunker-pack.json` или открой существующий файл. "
+            "Заполняй категории пака: профессии, возраст, здоровье, багаж, фобии, факты, события и другие поля. "
             "Сохрани результат как UTF-8 JSON с расширением `.bunker-pack.json`."
         ),
         "upload": (

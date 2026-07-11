@@ -17,6 +17,7 @@ from siri_bot.cogs.bunker import (
     PUBLIC_SECTION_TOGGLE_ID,
     Bunker,
     BunkerActionView,
+    BUILDER_EDITOR_URL,
     BunkerPrivatePlayerPanelView,
     BunkerPublicAbilityView,
     BunkerPublicGameView,
@@ -583,6 +584,8 @@ class BunkerCogTests(unittest.TestCase):
 
         kwargs = interaction.response.send_message.await_args.kwargs
         self.assertEqual(kwargs["embed"].title, "Строитель паков · установка DFile Editor")
+        self.assertIn("DFile-Editor-*-x64.exe", kwargs["embed"].description)
+        self.assertTrue(BUILDER_EDITOR_URL.endswith("/releases/latest"))
 
     def test_setup_content_view_shows_builder_to_everyone_and_editor_only_to_operator(self) -> None:
         public_view = BunkerSetupContentView(
