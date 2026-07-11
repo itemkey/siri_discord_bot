@@ -9,14 +9,17 @@ import asyncpg
 
 from siri_bot.bunker.content import PACK_FIELDS, normalize_pack_content
 from siri_bot.bunker.models import (
+    BunkerBuilderProgress,
     BunkerContentPack,
     BunkerGame,
     BunkerGuildSettings,
+    BunkerPackSubmission,
     BunkerPlayer,
     BunkerProfile,
     BunkerSettings,
     CharacterCard,
     GameState,
+    PackSubmissionStatus,
     RoomKind,
     RoomStatus,
     RoomSetup,
@@ -56,6 +59,8 @@ class BunkerRepository:
                     guild_id BIGINT PRIMARY KEY,
                     operator_role_id BIGINT,
                     interest_role_id BIGINT,
+                    builder_reward_role_id BIGINT,
+                    builder_info_channel_id BIGINT,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
@@ -71,6 +76,32 @@ class BunkerRepository:
                     updated_by BIGINT,
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+
+                CREATE TABLE IF NOT EXISTS bunker_builder_progress (
+                    guild_id BIGINT NOT NULL,
+                    user_id BIGINT NOT NULL,
+                    agreement_version INTEGER NOT NULL DEFAULT 1,
+                    accepted_agreement_at TIMESTAMPTZ,
+                    completed_at TIMESTAMPTZ,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (guild_id, user_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS bunker_pack_submissions (
+                    id BIGSERIAL PRIMARY KEY,
+                    guild_id BIGINT NOT NULL,
+                    author_id BIGINT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    content JSONB NOT NULL DEFAULT '{}',
+                    source_filename TEXT NOT NULL DEFAULT '',
+                    reviewer_id BIGINT,
+                    content_pack_id BIGINT REFERENCES bunker_content_packs(id) ON DELETE SET NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    reviewed_at TIMESTAMPTZ
                 );
 
                 CREATE TABLE IF NOT EXISTS bunker_games (
@@ -173,6 +204,8 @@ class BunkerRepository:
                 ALTER TABLE bunker_room_setups ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
 
                 ALTER TABLE bunker_guild_settings ADD COLUMN IF NOT EXISTS interest_role_id BIGINT;
+                ALTER TABLE bunker_guild_settings ADD COLUMN IF NOT EXISTS builder_reward_role_id BIGINT;
+                ALTER TABLE bunker_guild_settings ADD COLUMN IF NOT EXISTS builder_info_channel_id BIGINT;
 
                 ALTER TABLE bunker_content_packs ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT '';
                 ALTER TABLE bunker_content_packs ADD COLUMN IF NOT EXISTS content JSONB NOT NULL DEFAULT '{}';
@@ -180,6 +213,24 @@ class BunkerRepository:
                 ALTER TABLE bunker_content_packs ADD COLUMN IF NOT EXISTS updated_by BIGINT;
                 ALTER TABLE bunker_content_packs ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
                 ALTER TABLE bunker_content_packs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+                ALTER TABLE bunker_builder_progress ADD COLUMN IF NOT EXISTS agreement_version INTEGER NOT NULL DEFAULT 1;
+                ALTER TABLE bunker_builder_progress ADD COLUMN IF NOT EXISTS accepted_agreement_at TIMESTAMPTZ;
+                ALTER TABLE bunker_builder_progress ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ;
+                ALTER TABLE bunker_builder_progress ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+                ALTER TABLE bunker_builder_progress ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+
+                ALTER TABLE bunker_pack_submissions ADD COLUMN IF NOT EXISTS guild_id BIGINT;
+                ALTER TABLE bunker_pack_submissions ADD COLUMN IF NOT EXISTS author_id BIGINT;
+                ALTER TABLE bunker_pack_submissions ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending';
+                ALTER TABLE bunker_pack_submissions ADD COLUMN IF NOT EXISTS name TEXT NOT NULL DEFAULT 'Новый пак';
+                ALTER TABLE bunker_pack_submissions ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT '';
+                ALTER TABLE bunker_pack_submissions ADD COLUMN IF NOT EXISTS content JSONB NOT NULL DEFAULT '{}';
+                ALTER TABLE bunker_pack_submissions ADD COLUMN IF NOT EXISTS source_filename TEXT NOT NULL DEFAULT '';
+                ALTER TABLE bunker_pack_submissions ADD COLUMN IF NOT EXISTS reviewer_id BIGINT;
+                ALTER TABLE bunker_pack_submissions ADD COLUMN IF NOT EXISTS content_pack_id BIGINT;
+                ALTER TABLE bunker_pack_submissions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW();
+                ALTER TABLE bunker_pack_submissions ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ;
 
                 ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS setup_message_id BIGINT;
                 ALTER TABLE bunker_games ADD COLUMN IF NOT EXISTS category_id BIGINT;
@@ -235,6 +286,10 @@ class BunkerRepository:
                     ON bunker_room_setups (setup_channel_id);
                 CREATE INDEX IF NOT EXISTS idx_bunker_content_packs_guild_id
                     ON bunker_content_packs (guild_id);
+                CREATE INDEX IF NOT EXISTS idx_bunker_pack_submissions_guild_status
+                    ON bunker_pack_submissions (guild_id, status, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_bunker_pack_submissions_author
+                    ON bunker_pack_submissions (guild_id, author_id, created_at DESC);
                 DROP INDEX IF EXISTS idx_bunker_active_game_per_setup;
                 DROP INDEX IF EXISTS idx_bunker_active_game_by_host;
                 DROP INDEX IF EXISTS idx_bunker_game_text_channel;
@@ -287,9 +342,117 @@ class BunkerRepository:
         )
         return _guild_settings_from_row(row)
 
+    async def set_builder_reward_role(self, guild_id: int, role_id: int | None) -> BunkerGuildSettings:
+        row = await self.pool.fetchrow(
+            """
+            INSERT INTO bunker_guild_settings (guild_id, builder_reward_role_id)
+            VALUES ($1, $2)
+            ON CONFLICT (guild_id)
+            DO UPDATE SET builder_reward_role_id = EXCLUDED.builder_reward_role_id, updated_at = NOW()
+            RETURNING *
+            """,
+            guild_id,
+            role_id,
+        )
+        return _guild_settings_from_row(row)
+
+    async def set_builder_info_channel(self, guild_id: int, channel_id: int | None) -> BunkerGuildSettings:
+        row = await self.pool.fetchrow(
+            """
+            INSERT INTO bunker_guild_settings (guild_id, builder_info_channel_id)
+            VALUES ($1, $2)
+            ON CONFLICT (guild_id)
+            DO UPDATE SET builder_info_channel_id = EXCLUDED.builder_info_channel_id, updated_at = NOW()
+            RETURNING *
+            """,
+            guild_id,
+            channel_id,
+        )
+        return _guild_settings_from_row(row)
+
     async def is_bunker_operator(self, guild_id: int, role_ids: list[int]) -> bool:
         settings = await self.get_or_create_guild_settings(guild_id)
         return settings.operator_role_id is not None and settings.operator_role_id in set(role_ids)
+
+    async def get_builder_progress(
+        self,
+        guild_id: int,
+        user_id: int,
+        *,
+        agreement_version: int = 1,
+    ) -> BunkerBuilderProgress:
+        row = await self.pool.fetchrow(
+            """
+            INSERT INTO bunker_builder_progress (guild_id, user_id, agreement_version)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (guild_id, user_id) DO UPDATE
+            SET agreement_version = GREATEST(bunker_builder_progress.agreement_version, EXCLUDED.agreement_version),
+                updated_at = bunker_builder_progress.updated_at
+            RETURNING *
+            """,
+            guild_id,
+            user_id,
+            agreement_version,
+        )
+        return _builder_progress_from_row(row)
+
+    async def accept_builder_agreement(
+        self,
+        guild_id: int,
+        user_id: int,
+        *,
+        agreement_version: int = 1,
+    ) -> BunkerBuilderProgress:
+        row = await self.pool.fetchrow(
+            """
+            INSERT INTO bunker_builder_progress (
+                guild_id,
+                user_id,
+                agreement_version,
+                accepted_agreement_at
+            )
+            VALUES ($1, $2, $3, NOW())
+            ON CONFLICT (guild_id, user_id) DO UPDATE
+            SET agreement_version = EXCLUDED.agreement_version,
+                accepted_agreement_at = COALESCE(bunker_builder_progress.accepted_agreement_at, NOW()),
+                updated_at = NOW()
+            RETURNING *
+            """,
+            guild_id,
+            user_id,
+            agreement_version,
+        )
+        return _builder_progress_from_row(row)
+
+    async def complete_builder_tutorial(
+        self,
+        guild_id: int,
+        user_id: int,
+        *,
+        agreement_version: int = 1,
+    ) -> BunkerBuilderProgress:
+        row = await self.pool.fetchrow(
+            """
+            INSERT INTO bunker_builder_progress (
+                guild_id,
+                user_id,
+                agreement_version,
+                accepted_agreement_at,
+                completed_at
+            )
+            VALUES ($1, $2, $3, NOW(), NOW())
+            ON CONFLICT (guild_id, user_id) DO UPDATE
+            SET agreement_version = EXCLUDED.agreement_version,
+                accepted_agreement_at = COALESCE(bunker_builder_progress.accepted_agreement_at, NOW()),
+                completed_at = COALESCE(bunker_builder_progress.completed_at, NOW()),
+                updated_at = NOW()
+            RETURNING *
+            """,
+            guild_id,
+            user_id,
+            agreement_version,
+        )
+        return _builder_progress_from_row(row)
 
     async def upsert_room_setup(
         self,
@@ -443,6 +606,173 @@ class BunkerRepository:
             guild_id,
         )
         return result.endswith(" 1")
+
+    async def create_pack_submission(
+        self,
+        *,
+        guild_id: int,
+        author_id: int,
+        name: str,
+        description: str = "",
+        content: dict[str, tuple[str, ...]],
+        source_filename: str = "",
+    ) -> BunkerPackSubmission:
+        normalized = normalize_pack_content(content)
+        row = await self.pool.fetchrow(
+            """
+            INSERT INTO bunker_pack_submissions (
+                guild_id,
+                author_id,
+                status,
+                name,
+                description,
+                content,
+                source_filename
+            )
+            VALUES ($1, $2, 'pending', $3, $4, $5::jsonb, $6)
+            RETURNING *
+            """,
+            guild_id,
+            author_id,
+            name.strip()[:80] or "Новый пак",
+            description.strip()[:500],
+            json.dumps(_pack_content_to_json(normalized), ensure_ascii=False),
+            source_filename.strip()[:120],
+        )
+        return _pack_submission_from_row(row)
+
+    async def list_pack_submissions(
+        self,
+        guild_id: int,
+        *,
+        status: PackSubmissionStatus | str = PackSubmissionStatus.PENDING,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> list[BunkerPackSubmission]:
+        rows = await self.pool.fetch(
+            """
+            SELECT *
+            FROM bunker_pack_submissions
+            WHERE guild_id = $1 AND status = $2
+            ORDER BY created_at ASC, id ASC
+            LIMIT $3 OFFSET $4
+            """,
+            guild_id,
+            str(status),
+            max(1, min(limit, 100)),
+            max(0, offset),
+        )
+        return [_pack_submission_from_row(row) for row in rows]
+
+    async def count_pack_submissions(
+        self,
+        guild_id: int,
+        *,
+        status: PackSubmissionStatus | str = PackSubmissionStatus.PENDING,
+    ) -> int:
+        return int(
+            await self.pool.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM bunker_pack_submissions
+                WHERE guild_id = $1 AND status = $2
+                """,
+                guild_id,
+                str(status),
+            )
+        )
+
+    async def get_pack_submission(self, submission_id: int, *, guild_id: int | None = None) -> BunkerPackSubmission | None:
+        if guild_id is None:
+            row = await self.pool.fetchrow("SELECT * FROM bunker_pack_submissions WHERE id = $1", submission_id)
+        else:
+            row = await self.pool.fetchrow(
+                "SELECT * FROM bunker_pack_submissions WHERE id = $1 AND guild_id = $2",
+                submission_id,
+                guild_id,
+            )
+        return _pack_submission_from_row(row) if row else None
+
+    async def accept_pack_submission(
+        self,
+        submission_id: int,
+        *,
+        guild_id: int,
+        reviewer_id: int,
+    ) -> tuple[BunkerPackSubmission, BunkerContentPack] | None:
+        async with self.pool.acquire() as connection:
+            async with connection.transaction():
+                submission_row = await connection.fetchrow(
+                    """
+                    SELECT *
+                    FROM bunker_pack_submissions
+                    WHERE id = $1 AND guild_id = $2 AND status = 'pending'
+                    FOR UPDATE
+                    """,
+                    submission_id,
+                    guild_id,
+                )
+                if submission_row is None:
+                    return None
+                submission = _pack_submission_from_row(submission_row)
+                pack_row = await connection.fetchrow(
+                    """
+                    INSERT INTO bunker_content_packs (
+                        guild_id,
+                        name,
+                        description,
+                        content,
+                        created_by,
+                        updated_by
+                    )
+                    VALUES ($1, $2, $3, $4::jsonb, $5, $6)
+                    RETURNING *
+                    """,
+                    guild_id,
+                    submission.name.strip()[:80] or "Новый пак",
+                    submission.description.strip()[:500],
+                    json.dumps(_pack_content_to_json(submission.content), ensure_ascii=False),
+                    submission.author_id,
+                    reviewer_id,
+                )
+                updated_row = await connection.fetchrow(
+                    """
+                    UPDATE bunker_pack_submissions
+                    SET status = 'accepted',
+                        reviewer_id = $3,
+                        content_pack_id = $4,
+                        reviewed_at = NOW()
+                    WHERE id = $1 AND guild_id = $2
+                    RETURNING *
+                    """,
+                    submission_id,
+                    guild_id,
+                    reviewer_id,
+                    int(pack_row["id"]),
+                )
+        return _pack_submission_from_row(updated_row), _content_pack_from_row(pack_row)
+
+    async def reject_pack_submission(
+        self,
+        submission_id: int,
+        *,
+        guild_id: int,
+        reviewer_id: int,
+    ) -> BunkerPackSubmission | None:
+        row = await self.pool.fetchrow(
+            """
+            UPDATE bunker_pack_submissions
+            SET status = 'rejected',
+                reviewer_id = $3,
+                reviewed_at = NOW()
+            WHERE id = $1 AND guild_id = $2 AND status = 'pending'
+            RETURNING *
+            """,
+            submission_id,
+            guild_id,
+            reviewer_id,
+        )
+        return _pack_submission_from_row(row) if row else None
 
     async def add_pack_value(self, pack_id: int, *, guild_id: int, field: str, value: str, updated_by: int) -> BunkerContentPack | None:
         if field not in PACK_FIELDS:
@@ -1231,6 +1561,38 @@ def _content_pack_from_row(row: asyncpg.Record) -> BunkerContentPack:
     )
 
 
+def _builder_progress_from_row(row: asyncpg.Record) -> BunkerBuilderProgress:
+    return BunkerBuilderProgress(
+        guild_id=int(row["guild_id"]),
+        user_id=int(row["user_id"]),
+        agreement_version=int(row["agreement_version"]),
+        accepted_agreement_at=row["accepted_agreement_at"],
+        completed_at=row["completed_at"],
+    )
+
+
+def _pack_submission_from_row(row: asyncpg.Record) -> BunkerPackSubmission:
+    raw_status = str(row["status"] or PackSubmissionStatus.PENDING.value)
+    try:
+        status = PackSubmissionStatus(raw_status)
+    except ValueError:
+        status = PackSubmissionStatus.PENDING
+    return BunkerPackSubmission(
+        id=int(row["id"]),
+        guild_id=int(row["guild_id"]),
+        author_id=int(row["author_id"]),
+        status=status,
+        name=str(row["name"] or "Новый пак"),
+        description=str(row["description"] or ""),
+        content=normalize_pack_content(_json_load(row["content"], {})),
+        source_filename=str(row["source_filename"] or ""),
+        reviewer_id=int(row["reviewer_id"]) if row["reviewer_id"] is not None else None,
+        content_pack_id=int(row["content_pack_id"]) if row["content_pack_id"] is not None else None,
+        created_at=row["created_at"],
+        reviewed_at=row["reviewed_at"],
+    )
+
+
 def _setup_from_row(row: asyncpg.Record) -> RoomSetup:
     return RoomSetup(
         id=int(row["id"]),
@@ -1248,6 +1610,8 @@ def _guild_settings_from_row(row: asyncpg.Record) -> BunkerGuildSettings:
         guild_id=int(row["guild_id"]),
         operator_role_id=int(row["operator_role_id"]) if row["operator_role_id"] is not None else None,
         interest_role_id=int(row["interest_role_id"]) if row["interest_role_id"] is not None else None,
+        builder_reward_role_id=int(row["builder_reward_role_id"]) if row["builder_reward_role_id"] is not None else None,
+        builder_info_channel_id=int(row["builder_info_channel_id"]) if row["builder_info_channel_id"] is not None else None,
     )
 
 

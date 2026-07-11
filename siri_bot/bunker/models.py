@@ -180,6 +180,8 @@ class BunkerGuildSettings:
     guild_id: int
     operator_role_id: int | None
     interest_role_id: int | None = None
+    builder_reward_role_id: int | None = None
+    builder_info_channel_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -194,6 +196,45 @@ class BunkerContentPack:
     updated_by: int | None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+
+class PackSubmissionStatus(StrEnum):
+    PENDING = "pending"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+
+
+@dataclass(frozen=True)
+class BunkerBuilderProgress:
+    guild_id: int
+    user_id: int
+    agreement_version: int
+    accepted_agreement_at: datetime | None = None
+    completed_at: datetime | None = None
+
+    @property
+    def agreement_accepted(self) -> bool:
+        return self.accepted_agreement_at is not None
+
+    @property
+    def tutorial_completed(self) -> bool:
+        return self.completed_at is not None
+
+
+@dataclass(frozen=True)
+class BunkerPackSubmission:
+    id: int
+    guild_id: int
+    author_id: int
+    status: PackSubmissionStatus
+    name: str
+    description: str
+    content: dict[str, tuple[str, ...]]
+    source_filename: str
+    reviewer_id: int | None = None
+    content_pack_id: int | None = None
+    created_at: datetime | None = None
+    reviewed_at: datetime | None = None
 
 
 @dataclass(frozen=True)

@@ -24,6 +24,7 @@ from siri_bot.cogs.bunker import (
     BunkerPublicSectionView,
     BunkerRevealView,
     BunkerSettingsView,
+    BunkerSetupContentView,
     BunkerSetupIdleView,
     BunkerSetupNavView,
     STALE_PANEL_REFRESH_STATUS,
@@ -40,22 +41,42 @@ from siri_bot.cogs.bunker import (
     _public_specials_embed,
     _setup_embed,
 )
-from siri_bot.bunker.models import BunkerContentPack, BunkerPlayer, BunkerSettings, RoomKind, RoomSetup, SpecialAbility
+from siri_bot.bunker.models import (
+    BunkerBuilderProgress,
+    BunkerContentPack,
+    BunkerPackSubmission,
+    BunkerPlayer,
+    BunkerSettings,
+    PackSubmissionStatus,
+    RoomKind,
+    RoomSetup,
+    SpecialAbility,
+)
 from siri_bot.bunker.models import BunkerGame, BunkerProfile, BunkerResources, GameState
 from siri_bot.bunker.engine import generate_card
 
 
 class FakeGuild:
     id = 100
+    me = None
+
+    def get_role(self, role_id: int):
+        return None
+
+    def get_member(self, user_id: int):
+        return None
 
 
 class FakeUser:
     def __init__(self, user_id: int = 200) -> None:
         self.id = user_id
+        self.mention = f"<@{user_id}>"
+        self.send = AsyncMock()
 
 
 class FakeChannel:
     id = 300
+    send = AsyncMock()
 
 
 class FakeResponse:
@@ -92,6 +113,15 @@ class FakeAttachment:
         self.filename = filename
         self.size = len(payload)
         self.read = AsyncMock(return_value=payload)
+
+
+class FakeUploadMessage(FakeMessage):
+    def __init__(self, attachment: FakeAttachment | None, *, author_id: int = 200) -> None:
+        super().__init__(777)
+        self.attachments = [attachment] if attachment is not None else []
+        self.author = FakeUser(author_id)
+        self.guild = FakeGuild()
+        self.channel = FakeChannel()
 
 
 class FakeInteraction:
@@ -145,6 +175,31 @@ class FakeBunkerRepository:
         self.repair_setup_message_id = AsyncMock(return_value=self.repaired_setup)
         self.get_draft = AsyncMock(return_value=BunkerSettings())
         self.save_draft = AsyncMock()
+        self.list_content_packs = AsyncMock(return_value=[])
+        self.get_builder_progress = AsyncMock(
+            return_value=BunkerBuilderProgress(
+                guild_id=setup.guild_id,
+                user_id=200,
+                agreement_version=1,
+            )
+        )
+        self.accept_builder_agreement = AsyncMock(
+            return_value=BunkerBuilderProgress(
+                guild_id=setup.guild_id,
+                user_id=200,
+                agreement_version=1,
+                accepted_agreement_at=datetime.now(UTC),
+            )
+        )
+        self.complete_builder_tutorial = AsyncMock(
+            return_value=BunkerBuilderProgress(
+                guild_id=setup.guild_id,
+                user_id=200,
+                agreement_version=1,
+                accepted_agreement_at=datetime.now(UTC),
+                completed_at=datetime.now(UTC),
+            )
+        )
 
     async def _get_setup_by_message(self, message_id: int) -> RoomSetup | None:
         return self.setup if message_id == self.setup.setup_message_id else None
@@ -216,6 +271,60 @@ class FakePackRepository:
         if guild_id is not None and guild_id != self.pack.guild_id:
             return None
         return self.pack
+
+
+class FakeBuilderRepository(FakeBunkerRepository):
+    def __init__(
+        self,
+        setup: RoomSetup,
+        *,
+        progress: BunkerBuilderProgress | None = None,
+        accept_result: tuple[BunkerPackSubmission, BunkerContentPack] | None = None,
+        reject_result: BunkerPackSubmission | None = None,
+    ) -> None:
+        super().__init__(setup)
+        self.progress = progress or BunkerBuilderProgress(
+            guild_id=setup.guild_id,
+            user_id=200,
+            agreement_version=1,
+            accepted_agreement_at=datetime.now(UTC),
+            completed_at=datetime.now(UTC),
+        )
+        self.submission = BunkerPackSubmission(
+            id=44,
+            guild_id=setup.guild_id,
+            author_id=200,
+            status=PackSubmissionStatus.PENDING,
+            name="Пользовательский пак",
+            description="",
+            content={"professions": ("Инженер",), "items": ("Фильтр",)},
+            source_filename="pack.bunker-pack.json",
+        )
+        self.get_builder_progress = AsyncMock(return_value=self.progress)
+        self.create_pack_submission = AsyncMock(side_effect=self._create_pack_submission)
+        self.accept_pack_submission = AsyncMock(return_value=accept_result)
+        self.reject_pack_submission = AsyncMock(return_value=reject_result)
+
+    async def _create_pack_submission(
+        self,
+        *,
+        guild_id: int,
+        author_id: int,
+        name: str,
+        description: str,
+        content: dict[str, tuple[str, ...]],
+        source_filename: str,
+    ) -> BunkerPackSubmission:
+        self.submission = replace(
+            self.submission,
+            guild_id=guild_id,
+            author_id=author_id,
+            name=name,
+            description=description,
+            content=content,
+            source_filename=source_filename,
+        )
+        return self.submission
 
 
 def _test_game(*, state: GameState = GameState.LOBBY) -> BunkerGame:
@@ -424,6 +533,227 @@ class BunkerCogTests(unittest.TestCase):
         self.assertEqual(payload["version"], 1)
         self.assertEqual(payload["name"], "Экспорт")
         self.assertEqual(payload["content"]["professions"], ["Инженер"])
+
+    def test_builder_panel_first_open_starts_with_agreement(self) -> None:
+        setup = RoomSetup(
+            id=10,
+            guild_id=100,
+            setup_channel_id=300,
+            category_id=None,
+            setup_message_id=500,
+            room_name="build-a-bunker",
+            active_game_id=None,
+        )
+        cog = Bunker.__new__(Bunker)
+        cog.repository = FakeBunkerRepository(setup)
+        cog._builder_private_panels = {}
+        interaction = FakeInteraction(message=FakeMessage(500))
+
+        asyncio.run(cog.open_builder_panel(interaction))
+
+        interaction.response.send_message.assert_awaited_once()
+        kwargs = interaction.response.send_message.await_args.kwargs
+        self.assertEqual(kwargs["embed"].title, "Строитель паков · соглашение")
+
+    def test_builder_instruction_after_agreement_skips_second_acceptance(self) -> None:
+        setup = RoomSetup(
+            id=10,
+            guild_id=100,
+            setup_channel_id=300,
+            category_id=None,
+            setup_message_id=500,
+            room_name="build-a-bunker",
+            active_game_id=None,
+        )
+        repository = FakeBunkerRepository(setup)
+        repository.get_builder_progress = AsyncMock(
+            return_value=BunkerBuilderProgress(
+                guild_id=100,
+                user_id=200,
+                agreement_version=1,
+                accepted_agreement_at=datetime.now(UTC),
+            )
+        )
+        cog = Bunker.__new__(Bunker)
+        cog.repository = repository
+        cog._builder_private_panels = {}
+        interaction = FakeInteraction(message=FakeMessage(500))
+
+        asyncio.run(cog.open_builder_panel(interaction, screen="instruction"))
+
+        kwargs = interaction.response.send_message.await_args.kwargs
+        self.assertEqual(kwargs["embed"].title, "Строитель паков · установка DFile Editor")
+
+    def test_setup_content_view_shows_builder_to_everyone_and_editor_only_to_operator(self) -> None:
+        public_view = BunkerSetupContentView(
+            object(),
+            setup_id=10,
+            user_id=200,
+            settings=BunkerSettings(),
+            packs=[],
+            is_operator=False,
+        )
+        admin_view = BunkerSetupContentView(
+            object(),
+            setup_id=10,
+            user_id=200,
+            settings=BunkerSettings(),
+            packs=[],
+            is_operator=True,
+        )
+
+        public_labels = [child.label for child in public_view.children if isinstance(child, discord.ui.Button)]
+        admin_labels = [child.label for child in admin_view.children if isinstance(child, discord.ui.Button)]
+
+        self.assertIn("Строитель паков", public_labels)
+        self.assertNotIn("Редактор паков", public_labels)
+        self.assertIn("Строитель паков", admin_labels)
+        self.assertIn("Редактор паков", admin_labels)
+
+    def test_builder_upload_valid_file_creates_pending_submission(self) -> None:
+        setup = RoomSetup(
+            id=10,
+            guild_id=100,
+            setup_channel_id=300,
+            category_id=None,
+            setup_message_id=500,
+            room_name="build-a-bunker",
+            active_game_id=None,
+        )
+        repository = FakeBuilderRepository(setup)
+        attachment = FakeAttachment(
+            json.dumps(
+                {
+                    "format": "siri-bunker-pack",
+                    "version": 1,
+                    "name": "Новый пользовательский",
+                    "content": {"professions": ["Инженер"], "items": ["Фильтр"]},
+                },
+                ensure_ascii=False,
+            ).encode("utf-8")
+        )
+        upload = FakeUploadMessage(attachment)
+        bot = type("Bot", (), {"wait_for": AsyncMock(return_value=upload)})()
+        cog = Bunker.__new__(Bunker)
+        cog.repository = repository
+        cog.bot = bot
+        interaction = FakeInteraction()
+
+        asyncio.run(cog.start_builder_pack_upload(interaction))
+
+        interaction.response.send_message.assert_awaited_once()
+        repository.create_pack_submission.assert_awaited_once()
+        kwargs = repository.create_pack_submission.await_args.kwargs
+        self.assertEqual(kwargs["name"], "Новый пользовательский")
+        self.assertEqual(kwargs["content"]["professions"], ("Инженер",))
+        upload.delete.assert_awaited_once()
+        interaction.followup.send.assert_awaited_once()
+
+    def test_builder_upload_invalid_file_does_not_create_submission(self) -> None:
+        setup = RoomSetup(
+            id=10,
+            guild_id=100,
+            setup_channel_id=300,
+            category_id=None,
+            setup_message_id=500,
+            room_name="build-a-bunker",
+            active_game_id=None,
+        )
+        repository = FakeBuilderRepository(setup)
+        upload = FakeUploadMessage(FakeAttachment(b'{"unknown": ["value"]}'))
+        bot = type("Bot", (), {"wait_for": AsyncMock(return_value=upload)})()
+        cog = Bunker.__new__(Bunker)
+        cog.repository = repository
+        cog.bot = bot
+        interaction = FakeInteraction()
+
+        asyncio.run(cog.start_builder_pack_upload(interaction))
+
+        repository.create_pack_submission.assert_not_awaited()
+        upload.delete.assert_awaited_once()
+        interaction.user.send.assert_awaited_once()
+        interaction.followup.send.assert_awaited_once()
+
+    def test_accept_submission_delegates_pack_creation_and_notifications(self) -> None:
+        setup = RoomSetup(
+            id=10,
+            guild_id=100,
+            setup_channel_id=300,
+            category_id=None,
+            setup_message_id=500,
+            room_name="build-a-bunker",
+            active_game_id=None,
+        )
+        submission = BunkerPackSubmission(
+            id=44,
+            guild_id=100,
+            author_id=200,
+            status=PackSubmissionStatus.ACCEPTED,
+            name="Принятый пак",
+            description="",
+            content={"professions": ("Инженер",)},
+            source_filename="pack.bunker-pack.json",
+            content_pack_id=8,
+        )
+        pack = BunkerContentPack(
+            id=8,
+            guild_id=100,
+            name="Принятый пак",
+            description="",
+            content={"professions": ("Инженер",)},
+            is_enabled=True,
+            created_by=200,
+            updated_by=200,
+        )
+        repository = FakeBuilderRepository(setup, accept_result=(submission, pack))
+        cog = Bunker.__new__(Bunker)
+        cog.repository = repository
+        cog._grant_builder_reward = AsyncMock(return_value=[])
+        cog._notify_builder_review_result = AsyncMock()
+        cog.open_bunker_admin_panel = AsyncMock()
+        interaction = FakeInteraction()
+
+        asyncio.run(cog.accept_pack_submission(interaction, 44, page=2))
+
+        repository.accept_pack_submission.assert_awaited_once_with(44, guild_id=100, reviewer_id=200)
+        cog._grant_builder_reward.assert_awaited_once_with(interaction.guild, 200)
+        cog._notify_builder_review_result.assert_awaited_once_with(interaction.guild, submission, accepted=True, pack=pack)
+        cog.open_bunker_admin_panel.assert_awaited_once()
+        self.assertEqual(cog.open_bunker_admin_panel.await_args.kwargs["screen"], "submissions")
+
+    def test_reject_submission_does_not_create_pack_and_notifies_author(self) -> None:
+        setup = RoomSetup(
+            id=10,
+            guild_id=100,
+            setup_channel_id=300,
+            category_id=None,
+            setup_message_id=500,
+            room_name="build-a-bunker",
+            active_game_id=None,
+        )
+        submission = BunkerPackSubmission(
+            id=44,
+            guild_id=100,
+            author_id=200,
+            status=PackSubmissionStatus.REJECTED,
+            name="Отклоненный пак",
+            description="",
+            content={"professions": ("Инженер",)},
+            source_filename="pack.bunker-pack.json",
+        )
+        repository = FakeBuilderRepository(setup, reject_result=submission)
+        cog = Bunker.__new__(Bunker)
+        cog.repository = repository
+        cog._notify_builder_review_result = AsyncMock()
+        cog.open_bunker_admin_panel = AsyncMock()
+        interaction = FakeInteraction()
+
+        asyncio.run(cog.reject_pack_submission(interaction, 44, page=1))
+
+        repository.reject_pack_submission.assert_awaited_once_with(44, guild_id=100, reviewer_id=200)
+        repository.accept_pack_submission.assert_not_awaited()
+        cog._notify_builder_review_result.assert_awaited_once_with(interaction.guild, submission, accepted=False, pack=None)
+        self.assertEqual(cog.open_bunker_admin_panel.await_args.kwargs["screen"], "submissions")
 
     def test_composite_special_action_applies_steps_in_order_with_shared_target(self) -> None:
         class FakePool:

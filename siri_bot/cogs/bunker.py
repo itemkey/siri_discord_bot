@@ -42,14 +42,17 @@ from siri_bot.bunker.engine import (
     tally_votes,
 )
 from siri_bot.bunker.models import (
+    BunkerBuilderProgress,
     BunkerContentPack,
     BunkerGame,
+    BunkerPackSubmission,
     BunkerPlayer,
     BunkerProfile,
     BunkerSettings,
     CARD_STAT_LABELS,
     GameMode,
     GameState,
+    PackSubmissionStatus,
     REVEALABLE_STATS,
     RoomKind,
     Vote,
@@ -88,6 +91,8 @@ ADMIN_PANEL_SCREEN_LIST = "list"
 ADMIN_PANEL_SCREEN_PACK = "pack"
 ADMIN_PANEL_SCREEN_CATEGORY = "category"
 ADMIN_PANEL_SCREEN_ACCESS = "access"
+ADMIN_PANEL_SCREEN_HOME = "home"
+ADMIN_PANEL_SCREEN_SUBMISSIONS = "submissions"
 
 GAME_PANEL_ID = "siri:bunker:game:panel"
 PUBLIC_SECTION_TOGGLE_ID = "siri:bunker:section:toggle"
@@ -111,6 +116,11 @@ GAME_CHAOS_ID = "siri:bunker:game:chaos"
 SPEECH_HANDOFF_SECONDS = 15
 # Ephemeral Discord views with timeout=None are forced to 15 minutes by discord.py.
 PRIVATE_VIEW_TIMEOUT_SECONDS = 30 * 24 * 60 * 60
+BUILDER_AGREEMENT_VERSION = 1
+BUILDER_UPLOAD_TIMEOUT_SECONDS = 10 * 60
+BUILDER_EDITOR_URL = "https://github.com/itemkey/dfile_editor"
+ADMIN_PACK_LIST_PAGE_SIZE = 24
+ADMIN_SUBMISSION_PAGE_SIZE = 4
 BUNKER_DYNAMIC_BUTTON_TEMPLATE = r"siri:b:v1:(?P<scope>[ags]):(?P<owner_id>\d+):(?P<target_id>\d+):(?P<action>[a-z0-9_]+)"
 STALE_PANEL_REFRESH_STATUS = "Панель обновлена. Нажми нужное действие еще раз."
 
@@ -126,6 +136,16 @@ def _set_button_custom_id(view: discord.ui.View, callback_name: str, custom_id: 
         callback = getattr(child, "callback", None)
         if getattr(callback, "__name__", None) == callback_name:
             child.custom_id = custom_id
+            return
+
+
+def _set_button_disabled(view: discord.ui.View, callback_name: str, disabled: bool) -> None:
+    for child in view.children:
+        if not isinstance(child, discord.ui.Button):
+            continue
+        callback = getattr(child, "callback", None)
+        if getattr(callback, "__name__", None) == callback_name:
+            child.disabled = disabled
             return
 
 
@@ -160,6 +180,7 @@ class Bunker(commands.Cog):
         self._setup_private_panels: dict[tuple[int, int, int], Any] = {}
         self._game_private_panels: dict[tuple[int, int, int], Any] = {}
         self._admin_private_panels: dict[tuple[int, int, int], Any] = {}
+        self._builder_private_panels: dict[tuple[int, int, int], Any] = {}
         self.bot.add_view(BunkerSetupIdleView(self))
         self.bot.add_view(BunkerPublicGameView(self, show_finish_speech=True))
         self.bot.add_view(BunkerPublicSectionView(self))
@@ -264,10 +285,60 @@ class Bunker(commands.Cog):
         await self.repository.set_operator_role(guild.id, role.id)
         await interaction.response.send_message(f"Роль операторов Бункера: {role.mention}.", ephemeral=True)
 
-    @app_commands.command(name="bunkeradminpanel", description="Открыть закрытую админ-панель Бункера для паков и тестов.")
+    @app_commands.command(name="newbunkersupport", description="Выдать пользователю роль поддержки Бункера.")
+    @app_commands.describe(member="Пользователь, которому нужно выдать bunker operator-role")
+    @admin_only()
+    async def newbunkersupport(self, interaction: discord.Interaction, member: discord.Member) -> None:
+        guild = interaction.guild
+        if guild is None or member.guild.id != guild.id:
+            await interaction.response.send_message("Выбери участника этого сервера.", ephemeral=True)
+            return
+
+        settings = await self.repository.get_or_create_guild_settings(guild.id)
+        role = guild.get_role(settings.operator_role_id) if settings.operator_role_id is not None else None
+        if role is None:
+            await interaction.response.send_message("Сначала назначь operator-role через `/opbunker role`.", ephemeral=True)
+            return
+        if not self._can_manage_role(guild, role):
+            await interaction.response.send_message("Я не могу выдать эту роль: проверь `Manage Roles` и позицию роли бота.", ephemeral=True)
+            return
+
+        try:
+            await member.add_roles(role, reason="Bunker support role granted by command")
+        except discord.HTTPException:
+            LOGGER.info("Could not grant bunker support role %s to member %s.", role.id, member.id, exc_info=True)
+            await interaction.response.send_message("Discord не дал выдать эту роль. Проверь права и позицию роли бота.", ephemeral=True)
+            return
+        await interaction.response.send_message(f"{member.mention} получил роль поддержки Бункера: {role.mention}.", ephemeral=True)
+
+    @app_commands.command(name="bunkerbuildersroles", description="Назначить роль-награду за принятый пользовательский пак.")
+    @app_commands.describe(role="Роль, которую автор получает после принятия пака")
+    @admin_only()
+    async def bunkerbuildersroles(self, interaction: discord.Interaction, role: discord.Role) -> None:
+        guild = interaction.guild
+        if guild is None or role.guild.id != guild.id:
+            await interaction.response.send_message("Выбери роль на этом же сервере.", ephemeral=True)
+            return
+
+        await self.repository.set_builder_reward_role(guild.id, role.id)
+        warning = "" if self._can_manage_role(guild, role) else " Внимание: сейчас я не могу управлять этой ролью."
+        await interaction.response.send_message(f"Роль-награда строителей паков: {role.mention}.{warning}", ephemeral=True)
+
+    @app_commands.command(name="bunkerbuildersinfo", description="Назначить канал уведомлений о пользовательских паках.")
+    @app_commands.describe(channel="Канал для новостей о принятых и отклоненных паках")
+    @admin_only()
+    async def bunkerbuildersinfo(self, interaction: discord.Interaction, channel: discord.TextChannel) -> None:
+        guild = interaction.guild
+        if guild is None or channel.guild.id != guild.id:
+            await interaction.response.send_message("Выбери текстовый канал на этом же сервере.", ephemeral=True)
+            return
+
+        await self.repository.set_builder_info_channel(guild.id, channel.id)
+        await interaction.response.send_message(f"Канал уведомлений строителей паков: {channel.mention}.", ephemeral=True)
+
     async def bunkeradminpanel(self, interaction: discord.Interaction) -> None:
         if not await self._is_bunker_admin_or_operator(interaction):
-            await interaction.response.send_message("Эта панель доступна только админу сервера или operator-role Бункера.", ephemeral=True)
+            await interaction.response.send_message("Редактор паков доступен только админу сервера или operator-role Бункера.", ephemeral=True)
             return
 
         await self.open_bunker_admin_panel(interaction)
@@ -343,7 +414,7 @@ class Bunker(commands.Cog):
         await interaction.followup.send("Проверка комнат завершена. Зависшие партии с удаленными каналами закрыты.", ephemeral=True)
 
     @bunker_group.command(name="pack-validate", description="Проверить контент-пак Бункера по счетчикам.")
-    @app_commands.describe(pack_id="ID кастомного пака из /bunkeradminpanel; пусто = встроенный пак")
+    @app_commands.describe(pack_id="ID кастомного пака из редактора паков; пусто = встроенный пак")
     async def pack_validate_command(self, interaction: discord.Interaction, pack_id: int | None = None) -> None:
         if not await self._is_bunker_admin_or_operator(interaction):
             await interaction.response.send_message("Проверка паков доступна только админу или operator-role Бункера.", ephemeral=True)
@@ -421,7 +492,7 @@ class Bunker(commands.Cog):
         await interaction.followup.send(embed=_pack_file_result_embed(pack, "Пак полностью заменен из файла."), ephemeral=True)
 
     @bunker_group.command(name="pack-export", description="Экспортировать кастомный пак в файл для редактора.")
-    @app_commands.describe(pack_id="ID кастомного пака из /bunkeradminpanel")
+    @app_commands.describe(pack_id="ID кастомного пака из редактора паков")
     async def pack_export_command(self, interaction: discord.Interaction, pack_id: int) -> None:
         if not await self._is_bunker_admin_or_operator(interaction):
             await interaction.response.send_message("Экспорт паков доступен только админу или operator-role Бункера.", ephemeral=True)
@@ -591,26 +662,41 @@ class Bunker(commands.Cog):
         self,
         interaction: discord.Interaction,
         *,
-        screen: str = ADMIN_PANEL_SCREEN_LIST,
+        screen: str = ADMIN_PANEL_SCREEN_HOME,
         pack_id: int | None = None,
         field: str | None = None,
+        page: int = 0,
         status: str | None = None,
     ) -> None:
         guild = interaction.guild
         if guild is None:
-            await interaction.response.send_message("Админ-панель Бункера работает только на сервере.", ephemeral=True)
+            await interaction.response.send_message("Редактор паков работает только на сервере.", ephemeral=True)
             return
         if not await self._is_bunker_admin_or_operator(interaction):
-            await interaction.response.send_message("Эта панель доступна только админу сервера или operator-role Бункера.", ephemeral=True)
+            await interaction.response.send_message("Редактор паков доступен только админу сервера или operator-role Бункера.", ephemeral=True)
             return
 
         guild_settings = await self.repository.get_or_create_guild_settings(guild.id)
         packs = await self.repository.list_content_packs(guild.id)
+        pending_count = await self.repository.count_pack_submissions(guild.id, status=PackSubmissionStatus.PENDING)
         embed: discord.Embed
         view: discord.ui.View | None
         if screen == ADMIN_PANEL_SCREEN_ACCESS:
             embed = _admin_access_embed(guild, guild_settings, status=status)
             view = BunkerAdminAccessView(self, guild_settings)
+        elif screen == ADMIN_PANEL_SCREEN_LIST:
+            embed = _admin_packs_embed(packs, status=status, page=page)
+            view = BunkerAdminListView(self, packs, page=page)
+        elif screen == ADMIN_PANEL_SCREEN_SUBMISSIONS:
+            page = max(0, page)
+            submissions = await self.repository.list_pack_submissions(
+                guild.id,
+                status=PackSubmissionStatus.PENDING,
+                limit=ADMIN_SUBMISSION_PAGE_SIZE,
+                offset=page * ADMIN_SUBMISSION_PAGE_SIZE,
+            )
+            embed = _admin_submissions_embed(submissions, total=pending_count, page=page, status=status)
+            view = BunkerAdminSubmissionsView(self, submissions, page=page, total=pending_count)
         elif screen == ADMIN_PANEL_SCREEN_PACK and pack_id is not None:
             pack = await self.repository.get_content_pack(pack_id, guild_id=guild.id)
             if pack is None:
@@ -628,8 +714,8 @@ class Bunker(commands.Cog):
                 embed = _admin_category_embed(pack, field, status=status)
                 view = BunkerAdminCategoryView(self, pack, field)
         else:
-            embed = _admin_packs_embed(packs, status=status)
-            view = BunkerAdminListView(self, packs)
+            embed = _admin_home_embed(len(packs), pending_count, status=status)
+            view = BunkerAdminHomeView(self)
 
         await self._send_or_edit_private_message(
             interaction,
@@ -642,7 +728,7 @@ class Bunker(commands.Cog):
     async def create_admin_pack(self, interaction: discord.Interaction, *, name: str, description: str) -> None:
         guild = interaction.guild
         if guild is None:
-            await interaction.response.send_message("Админ-панель Бункера работает только на сервере.", ephemeral=True)
+            await interaction.response.send_message("Редактор паков работает только на сервере.", ephemeral=True)
             return
         pack = await self.repository.create_content_pack(
             guild_id=guild.id,
@@ -655,7 +741,7 @@ class Bunker(commands.Cog):
     async def rename_admin_pack(self, interaction: discord.Interaction, pack_id: int, *, name: str, description: str) -> None:
         guild = interaction.guild
         if guild is None:
-            await interaction.response.send_message("Админ-панель Бункера работает только на сервере.", ephemeral=True)
+            await interaction.response.send_message("Редактор паков работает только на сервере.", ephemeral=True)
             return
         pack = await self.repository.update_content_pack(
             pack_id,
@@ -669,7 +755,7 @@ class Bunker(commands.Cog):
     async def import_admin_pack_json(self, interaction: discord.Interaction, pack_id: int, raw_json: str) -> None:
         guild = interaction.guild
         if guild is None:
-            await interaction.response.send_message("Админ-панель Бункера работает только на сервере.", ephemeral=True)
+            await interaction.response.send_message("Редактор паков работает только на сервере.", ephemeral=True)
             return
         try:
             parsed = parse_pack_file(raw_json)
@@ -706,7 +792,7 @@ class Bunker(commands.Cog):
     async def add_admin_pack_value(self, interaction: discord.Interaction, pack_id: int, field: str, value: str) -> None:
         guild = interaction.guild
         if guild is None:
-            await interaction.response.send_message("Админ-панель Бункера работает только на сервере.", ephemeral=True)
+            await interaction.response.send_message("Редактор паков работает только на сервере.", ephemeral=True)
             return
         await self.repository.add_pack_value(pack_id, guild_id=guild.id, field=field, value=value, updated_by=interaction.user.id)
         await self.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_CATEGORY, pack_id=pack_id, field=field, status="Строка добавлена.")
@@ -714,7 +800,7 @@ class Bunker(commands.Cog):
     async def remove_admin_pack_value(self, interaction: discord.Interaction, pack_id: int, field: str, value: str) -> None:
         guild = interaction.guild
         if guild is None:
-            await interaction.response.send_message("Админ-панель Бункера работает только на сервере.", ephemeral=True)
+            await interaction.response.send_message("Редактор паков работает только на сервере.", ephemeral=True)
             return
         await self.repository.remove_pack_value(pack_id, guild_id=guild.id, field=field, value=value, updated_by=interaction.user.id)
         await self.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_CATEGORY, pack_id=pack_id, field=field, status="Строка удалена.")
@@ -722,7 +808,7 @@ class Bunker(commands.Cog):
     async def toggle_admin_pack(self, interaction: discord.Interaction, pack_id: int) -> None:
         guild = interaction.guild
         if guild is None:
-            await interaction.response.send_message("Админ-панель Бункера работает только на сервере.", ephemeral=True)
+            await interaction.response.send_message("Редактор паков работает только на сервере.", ephemeral=True)
             return
         pack = await self.repository.get_content_pack(pack_id, guild_id=guild.id)
         if pack is not None:
@@ -732,19 +818,417 @@ class Bunker(commands.Cog):
     async def delete_admin_pack(self, interaction: discord.Interaction, pack_id: int) -> None:
         guild = interaction.guild
         if guild is None:
-            await interaction.response.send_message("Админ-панель Бункера работает только на сервере.", ephemeral=True)
+            await interaction.response.send_message("Редактор паков работает только на сервере.", ephemeral=True)
             return
         deleted = await self.repository.delete_content_pack(pack_id, guild_id=guild.id)
-        await self.open_bunker_admin_panel(interaction, status="Пак удален." if deleted else "Пак не найден.")
+        await self.open_bunker_admin_panel(
+            interaction,
+            screen=ADMIN_PANEL_SCREEN_LIST,
+            status="Пак удален." if deleted else "Пак не найден.",
+        )
 
     async def set_admin_interest_role(self, interaction: discord.Interaction, role_id: int | None) -> None:
         guild = interaction.guild
         if guild is None:
-            await interaction.response.send_message("Админ-панель Бункера работает только на сервере.", ephemeral=True)
+            await interaction.response.send_message("Редактор паков работает только на сервере.", ephemeral=True)
             return
         await self.repository.set_interest_role(guild.id, role_id)
         status = "Роль интереса очищена." if role_id is None else "Роль интереса сохранена."
         await self.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_ACCESS, status=status)
+
+    async def open_builder_panel(
+        self,
+        interaction: discord.Interaction,
+        *,
+        screen: str | None = None,
+        status: str | None = None,
+    ) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Строитель паков работает только на сервере.", ephemeral=True)
+            return
+        setup = await self._setup_from_interaction_message(interaction)
+        if setup is None:
+            await interaction.response.send_message("Эта панель не привязана к комнате.", ephemeral=True)
+            return
+
+        if not hasattr(self, "_builder_private_panels"):
+            self._builder_private_panels = {}
+
+        progress = await self.repository.get_builder_progress(
+            guild.id,
+            interaction.user.id,
+            agreement_version=BUILDER_AGREEMENT_VERSION,
+        )
+        target_screen = screen
+        if target_screen is None:
+            target_screen = "home" if progress.tutorial_completed else "agreement"
+        if target_screen == "instruction":
+            target_screen = "install" if progress.agreement_accepted else "agreement"
+        if target_screen == "home" and not progress.tutorial_completed:
+            target_screen = "agreement"
+
+        if target_screen == "home":
+            embed = _builder_home_embed(status=status)
+            view: discord.ui.View | None = BunkerBuilderHomeView(self, setup.id, interaction.user.id)
+        else:
+            embed = _builder_tutorial_embed(target_screen, status=status)
+            view = BunkerBuilderTutorialView(self, setup.id, interaction.user.id, target_screen, progress)
+
+        await self._send_or_edit_private_message(
+            interaction,
+            self._builder_private_panels,
+            self._setup_panel_key(interaction, setup),
+            embed=embed,
+            view=view,
+        )
+
+    async def accept_builder_agreement(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Строитель паков работает только на сервере.", ephemeral=True)
+            return
+        await self.repository.accept_builder_agreement(
+            guild.id,
+            interaction.user.id,
+            agreement_version=BUILDER_AGREEMENT_VERSION,
+        )
+        await self.open_builder_panel(interaction, screen="install")
+
+    async def complete_builder_tutorial(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Строитель паков работает только на сервере.", ephemeral=True)
+            return
+        await self.repository.complete_builder_tutorial(
+            guild.id,
+            interaction.user.id,
+            agreement_version=BUILDER_AGREEMENT_VERSION,
+        )
+        await self.open_builder_panel(interaction, screen="home", status="Обучение завершено. Теперь можно отправить пак на проверку.")
+
+    async def start_builder_pack_upload(self, interaction: discord.Interaction) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Строитель паков работает только на сервере.", ephemeral=True)
+            return
+
+        progress = await self.repository.get_builder_progress(
+            guild.id,
+            interaction.user.id,
+            agreement_version=BUILDER_AGREEMENT_VERSION,
+        )
+        if not progress.tutorial_completed:
+            await self.open_builder_panel(interaction, screen="agreement", status="Сначала пройди короткое обучение.")
+            return
+
+        message = await self._wait_for_pack_upload_message(
+            interaction,
+            prompt="Отправь `.bunker-pack.json` следующим сообщением в этот канал. Я подожду 10 минут.",
+        )
+        if message is None:
+            return
+
+        attachment = _first_message_attachment(message)
+        if attachment is None:
+            await self._handle_builder_upload_error(interaction, message, "Я не нашёл вложение с файлом пака.")
+            return
+        if not str(getattr(attachment, "filename", "")).lower().endswith(PACK_FILE_EXTENSION):
+            await self._handle_builder_upload_error(interaction, message, f"Файл должен заканчиваться на `{PACK_FILE_EXTENSION}`.")
+            return
+
+        try:
+            parsed = await self._read_pack_attachment(attachment)
+        except ValueError as exc:
+            await self._handle_builder_upload_error(interaction, message, f"Файл пака не принят: {exc}")
+            return
+        except discord.HTTPException:
+            LOGGER.exception("Could not read builder pack attachment %s", getattr(attachment, "filename", "<unknown>"))
+            await self._handle_builder_upload_error(interaction, message, "Не смог прочитать вложение из Discord. Попробуй загрузить файл ещё раз.")
+            return
+
+        submission = await self.repository.create_pack_submission(
+            guild_id=guild.id,
+            author_id=interaction.user.id,
+            name=parsed.name or _pack_name_from_attachment(getattr(attachment, "filename", "")),
+            description=parsed.description or "",
+            content=parsed.content,
+            source_filename=getattr(attachment, "filename", ""),
+        )
+        await self._delete_uploaded_pack_message(message)
+        await interaction.followup.send(
+            f"Пак `{submission.name}` отправлен на проверку. Админы обычно проверяют такие заявки в течение 24 часов.",
+            ephemeral=True,
+        )
+
+    async def start_admin_pack_file_import(self, interaction: discord.Interaction, *, pack_id: int | None = None) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Редактор паков работает только на сервере.", ephemeral=True)
+            return
+        if not await self._is_bunker_admin_or_operator(interaction):
+            await interaction.response.send_message("Редактор паков доступен только админу сервера или operator-role Бункера.", ephemeral=True)
+            return
+
+        prompt = (
+            "Отправь новый `.bunker-pack.json` следующим сообщением. Пак будет создан из файла."
+            if pack_id is None
+            else "Отправь `.bunker-pack.json` следующим сообщением. Текущий пак будет полностью заменён."
+        )
+        message = await self._wait_for_pack_upload_message(interaction, prompt=prompt)
+        if message is None:
+            return
+
+        attachment = _first_message_attachment(message)
+        if attachment is None:
+            await self._delete_uploaded_pack_message(message)
+            await interaction.followup.send("Я не нашёл вложение с файлом пака.", ephemeral=True)
+            return
+        try:
+            parsed = await self._read_pack_attachment(attachment)
+        except (ValueError, discord.HTTPException) as exc:
+            await self._delete_uploaded_pack_message(message)
+            await interaction.followup.send(f"Файл пака не принят: {exc}", ephemeral=True)
+            return
+
+        if pack_id is None:
+            pack = await self.repository.create_content_pack(
+                guild_id=guild.id,
+                name=parsed.name or _pack_name_from_attachment(getattr(attachment, "filename", "")),
+                description=parsed.description or "",
+                content=parsed.content,
+                created_by=interaction.user.id,
+            )
+            await self._delete_uploaded_pack_message(message)
+            await interaction.followup.send(embed=_pack_file_result_embed(pack, "Пак создан из файла."), ephemeral=True)
+            return
+
+        pack = await self.repository.update_content_pack(
+            pack_id,
+            guild_id=guild.id,
+            updated_by=interaction.user.id,
+            name=parsed.name,
+            description=parsed.description,
+            content=parsed.content,
+        )
+        await self._delete_uploaded_pack_message(message)
+        if pack is None:
+            await interaction.followup.send("Пак не найден.", ephemeral=True)
+            return
+        await interaction.followup.send(embed=_pack_file_result_embed(pack, "Пак полностью заменён из файла."), ephemeral=True)
+
+    async def export_admin_pack_file(self, interaction: discord.Interaction, pack_id: int) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Редактор паков работает только на сервере.", ephemeral=True)
+            return
+        pack = await self.repository.get_content_pack(pack_id, guild_id=guild.id)
+        if pack is None:
+            await interaction.response.send_message("Пак не найден.", ephemeral=True)
+            return
+        raw = dump_pack_file(name=pack.name, description=pack.description, content=pack.content).encode("utf-8")
+        await interaction.response.send_message(
+            "Файл готов для проверки или редактирования.",
+            file=discord.File(io.BytesIO(raw), filename=_pack_export_filename(pack)),
+            ephemeral=True,
+        )
+
+    async def confirm_delete_admin_pack(self, interaction: discord.Interaction, pack_id: int) -> None:
+        pack = await self.repository.get_content_pack(pack_id, guild_id=interaction.guild.id) if interaction.guild else None
+        if pack is None:
+            await interaction.response.send_message("Пак не найден.", ephemeral=True)
+            return
+        await interaction.response.edit_message(
+            embed=_status_embed(f"Удалить пак `{pack.name}`? Это действие нельзя отменить."),
+            view=BunkerAdminDeletePackConfirmView(self, pack.id),
+        )
+
+    async def export_pack_submission(self, interaction: discord.Interaction, submission_id: int) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Редактор паков работает только на сервере.", ephemeral=True)
+            return
+        submission = await self.repository.get_pack_submission(submission_id, guild_id=guild.id)
+        if submission is None:
+            await interaction.response.send_message("Заявка не найдена.", ephemeral=True)
+            return
+        raw = dump_pack_file(name=submission.name, description=submission.description, content=submission.content).encode("utf-8")
+        filename = _submission_export_filename(submission)
+        await interaction.response.send_message(
+            f"Файл заявки от <@{submission.author_id}> готов для проверки.",
+            file=discord.File(io.BytesIO(raw), filename=filename),
+            ephemeral=True,
+        )
+
+    async def accept_pack_submission(self, interaction: discord.Interaction, submission_id: int, *, page: int = 0) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Редактор паков работает только на сервере.", ephemeral=True)
+            return
+        accepted = await self.repository.accept_pack_submission(
+            submission_id,
+            guild_id=guild.id,
+            reviewer_id=interaction.user.id,
+        )
+        if accepted is None:
+            await self.open_bunker_admin_panel(
+                interaction,
+                screen=ADMIN_PANEL_SCREEN_SUBMISSIONS,
+                page=page,
+                status="Заявка уже обработана или не найдена.",
+            )
+            return
+        submission, pack = accepted
+        warnings = await self._grant_builder_reward(guild, submission.author_id)
+        await self._notify_builder_review_result(guild, submission, accepted=True, pack=pack)
+        suffix = "" if not warnings else "\n" + "\n".join(warnings)
+        await self.open_bunker_admin_panel(
+            interaction,
+            screen=ADMIN_PANEL_SCREEN_SUBMISSIONS,
+            page=page,
+            status=f"Пак `{submission.name}` принят и добавлен в список паков.{suffix}",
+        )
+
+    async def reject_pack_submission(self, interaction: discord.Interaction, submission_id: int, *, page: int = 0) -> None:
+        guild = interaction.guild
+        if guild is None:
+            await interaction.response.send_message("Редактор паков работает только на сервере.", ephemeral=True)
+            return
+        submission = await self.repository.reject_pack_submission(
+            submission_id,
+            guild_id=guild.id,
+            reviewer_id=interaction.user.id,
+        )
+        if submission is None:
+            await self.open_bunker_admin_panel(
+                interaction,
+                screen=ADMIN_PANEL_SCREEN_SUBMISSIONS,
+                page=page,
+                status="Заявка уже обработана или не найдена.",
+            )
+            return
+        await self._notify_builder_review_result(guild, submission, accepted=False, pack=None)
+        await self.open_bunker_admin_panel(
+            interaction,
+            screen=ADMIN_PANEL_SCREEN_SUBMISSIONS,
+            page=page,
+            status=f"Заявка `{submission.name}` отклонена.",
+        )
+
+    async def _wait_for_pack_upload_message(self, interaction: discord.Interaction, *, prompt: str) -> discord.Message | None:
+        channel = interaction.channel
+        guild = interaction.guild
+        if guild is None or channel is None:
+            await interaction.response.send_message("Загрузка паков работает только в канале сервера.", ephemeral=True)
+            return None
+
+        await interaction.response.send_message(prompt, ephemeral=True)
+
+        def check(message: discord.Message) -> bool:
+            return (
+                getattr(message.author, "id", None) == interaction.user.id
+                and getattr(getattr(message, "guild", None), "id", None) == guild.id
+                and getattr(getattr(message, "channel", None), "id", None) == channel.id
+            )
+
+        try:
+            return await self.bot.wait_for("message", check=check, timeout=BUILDER_UPLOAD_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            await interaction.followup.send("Время ожидания файла вышло. Нажми кнопку загрузки ещё раз.", ephemeral=True)
+            return None
+
+    async def _read_pack_attachment(self, attachment: discord.Attachment) -> ParsedPackFile:
+        attachment_size = getattr(attachment, "size", 0) or 0
+        if attachment_size > PACK_FILE_MAX_BYTES:
+            raise ValueError(f"Файл слишком большой: максимум {PACK_FILE_MAX_BYTES // 1024} КБ.")
+        raw = await attachment.read()
+        return parse_pack_file(raw)
+
+    async def _handle_builder_upload_error(
+        self,
+        interaction: discord.Interaction,
+        message: discord.Message,
+        error_text: str,
+    ) -> None:
+        await self._delete_uploaded_pack_message(message)
+        dm_sent = await self._try_send_dm(interaction.user, error_text)
+        if not dm_sent:
+            try:
+                mention = getattr(interaction.user, "mention", f"<@{interaction.user.id}>")
+                await message.channel.send(f"{mention}, {error_text}")
+            except discord.HTTPException:
+                LOGGER.info("Could not send builder upload error fallback.", exc_info=True)
+        await interaction.followup.send(error_text, ephemeral=True)
+
+    async def _delete_uploaded_pack_message(self, message: discord.Message) -> None:
+        try:
+            await message.delete()
+        except discord.HTTPException:
+            LOGGER.info("Could not delete uploaded bunker pack message.", exc_info=True)
+        except AttributeError:
+            return
+
+    async def _grant_builder_reward(self, guild: discord.Guild, author_id: int) -> list[str]:
+        settings = await self.repository.get_or_create_guild_settings(guild.id)
+        if settings.builder_reward_role_id is None:
+            return ["Роль-награда не настроена через `/bunkerbuildersroles`."]
+        role = guild.get_role(settings.builder_reward_role_id)
+        if role is None:
+            return ["Роль-награда не найдена на сервере."]
+        if not self._can_manage_role(guild, role):
+            return ["Я не могу выдать роль-награду: проверь `Manage Roles` и позицию роли бота."]
+        member = guild.get_member(author_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(author_id)
+            except discord.HTTPException:
+                member = None
+        if member is None:
+            return ["Автор заявки не найден на сервере, роль-награда не выдана."]
+        if role not in getattr(member, "roles", ()):
+            await member.add_roles(role, reason="Bunker pack accepted")
+        return []
+
+    async def _notify_builder_review_result(
+        self,
+        guild: discord.Guild,
+        submission: BunkerPackSubmission,
+        *,
+        accepted: bool,
+        pack: BunkerContentPack | None,
+    ) -> None:
+        settings = await self.repository.get_or_create_guild_settings(guild.id)
+        if accepted:
+            message = f"Пак `{submission.name}` от <@{submission.author_id}> принят и добавлен в Бункер."
+        else:
+            message = f"Пак `{submission.name}` от <@{submission.author_id}> отклонён после проверки."
+
+        if settings.builder_info_channel_id is not None:
+            channel = await self._fetch_text_channel(settings.builder_info_channel_id)
+            if channel is not None:
+                try:
+                    await channel.send(message)
+                except discord.HTTPException:
+                    LOGGER.info("Could not send bunker builder info notification.", exc_info=True)
+
+        user = guild.get_member(submission.author_id) or self.bot.get_user(submission.author_id)
+        if user is None:
+            try:
+                user = await self.bot.fetch_user(submission.author_id)
+            except discord.HTTPException:
+                user = None
+        if user is not None:
+            await self._try_send_dm(user, message)
+
+    async def _try_send_dm(self, user: Any, message: str) -> bool:
+        send = getattr(user, "send", None)
+        if not callable(send):
+            return False
+        try:
+            await send(message)
+            return True
+        except discord.HTTPException:
+            return False
 
     async def open_game_panel(
         self,
@@ -2802,6 +3286,15 @@ class Bunker(commands.Cog):
         settings = await self.repository.get_or_create_guild_settings(guild.id)
         return guild.get_role(settings.interest_role_id) if settings.interest_role_id is not None else None
 
+    def _can_manage_role(self, guild: discord.Guild, role: discord.Role) -> bool:
+        me = getattr(guild, "me", None)
+        permissions = getattr(me, "guild_permissions", None)
+        try:
+            below_bot = bool(me is not None and role < me.top_role)
+        except TypeError:
+            below_bot = True
+        return bool(me and permissions and permissions.manage_roles and below_bot and not role.managed)
+
     def _setup_panel_key(self, interaction: discord.Interaction, setup) -> tuple[int, int, int]:
         channel_id = setup.setup_channel_id
         if not channel_id and interaction.channel is not None:
@@ -2837,7 +3330,7 @@ class Bunker(commands.Cog):
             await self._handle_dynamic_setup_button(interaction, action)
             return
         if scope == "a":
-            await self._handle_dynamic_admin_button(interaction)
+            await self._handle_dynamic_admin_button(interaction, action)
             return
 
         await send_safe_interaction_message(interaction)
@@ -2895,6 +3388,15 @@ class Bunker(commands.Cog):
         if action == "admin":
             await self.open_bunker_admin_panel(interaction)
             return
+        if action == "builder":
+            await self.open_builder_panel(interaction)
+            return
+        if action == "builder_instruction":
+            await self.open_builder_panel(interaction, screen="instruction")
+            return
+        if action.startswith("builder_"):
+            await self.open_builder_panel(interaction, status=STALE_PANEL_REFRESH_STATUS)
+            return
         if action == "close":
             await interaction.response.edit_message(
                 embed=_status_embed("Панель закрыта. Чтобы открыть ее снова, нажми кнопку на публичной панели."),
@@ -2904,8 +3406,21 @@ class Bunker(commands.Cog):
 
         await self.open_setup_panel(interaction, status=STALE_PANEL_REFRESH_STATUS)
 
-    async def _handle_dynamic_admin_button(self, interaction: discord.Interaction) -> None:
-        await self.open_bunker_admin_panel(interaction, status=STALE_PANEL_REFRESH_STATUS)
+    async def _handle_dynamic_admin_button(self, interaction: discord.Interaction, action: str) -> None:
+        screen_by_action = {
+            "packs": ADMIN_PANEL_SCREEN_LIST,
+            "refresh": ADMIN_PANEL_SCREEN_LIST,
+            "submissions": ADMIN_PANEL_SCREEN_SUBMISSIONS,
+            "sub_refresh": ADMIN_PANEL_SCREEN_SUBMISSIONS,
+            "access": ADMIN_PANEL_SCREEN_ACCESS,
+            "back": ADMIN_PANEL_SCREEN_HOME,
+            "sub_back": ADMIN_PANEL_SCREEN_HOME,
+        }
+        await self.open_bunker_admin_panel(
+            interaction,
+            screen=screen_by_action.get(action, ADMIN_PANEL_SCREEN_HOME),
+            status=STALE_PANEL_REFRESH_STATUS,
+        )
 
     async def _delete_duplicate_setup_panels(self, channel: discord.TextChannel, *, keep_message_id: int) -> None:
         if self.bot.user is None:
@@ -3499,28 +4014,135 @@ class BunkerSetupHostConflictView(SafeView):
             await self.cog.open_setup_panel(interaction, screen="settings")
 
 
+class BunkerAdminHomeView(SafeView):
+    def __init__(self, cog: Bunker) -> None:
+        super().__init__(timeout=900)
+        self.cog = cog
+        _set_button_custom_id(self, "packs", _bunker_button_id("a", 0, 0, "packs"))
+        _set_button_custom_id(self, "submissions", _bunker_button_id("a", 0, 0, "submissions"))
+        _set_button_custom_id(self, "access", _bunker_button_id("a", 0, 0, "access"))
+
+    @discord.ui.button(label="Список паков", style=discord.ButtonStyle.primary, row=0)
+    async def packs(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_LIST)
+
+    @discord.ui.button(label="Пользовательские паки", style=discord.ButtonStyle.primary, row=0)
+    async def submissions(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_SUBMISSIONS)
+
+    @discord.ui.button(label="Доступ", style=discord.ButtonStyle.secondary, row=1)
+    async def access(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_ACCESS)
+
+
 class BunkerAdminListView(SafeView):
-    def __init__(self, cog: Bunker, packs: list[BunkerContentPack]) -> None:
+    def __init__(self, cog: Bunker, packs: list[BunkerContentPack], *, page: int = 0) -> None:
         super().__init__(timeout=900)
         self.cog = cog
         self.packs = packs
-        if packs:
-            self.add_item(BunkerAdminPackSelect(cog, packs))
-        _set_button_custom_id(self, "create", _bunker_button_id("a", 0, 0, "create"))
+        self.page = max(0, page)
+        page_packs = packs[self.page * ADMIN_PACK_LIST_PAGE_SIZE : (self.page + 1) * ADMIN_PACK_LIST_PAGE_SIZE]
+        if page_packs:
+            self.add_item(BunkerAdminPackSelect(cog, page_packs))
+        _set_button_custom_id(self, "add_file", _bunker_button_id("a", 0, 0, "add_file"))
         _set_button_custom_id(self, "refresh", _bunker_button_id("a", 0, 0, "refresh"))
-        _set_button_custom_id(self, "access", _bunker_button_id("a", 0, 0, "access"))
+        _set_button_custom_id(self, "prev_page", _bunker_button_id("a", 0, 0, "prev_page"))
+        _set_button_custom_id(self, "next_page", _bunker_button_id("a", 0, 0, "next_page"))
+        _set_button_custom_id(self, "back", _bunker_button_id("a", 0, 0, "back"))
+        max_page = max(0, (len(packs) - 1) // ADMIN_PACK_LIST_PAGE_SIZE)
+        if self.page <= 0:
+            _set_button_disabled(self, "prev_page", True)
+        if self.page >= max_page:
+            _set_button_disabled(self, "next_page", True)
 
-    @discord.ui.button(label="Создать пак", style=discord.ButtonStyle.success, row=1)
-    async def create(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.send_modal(BunkerPackCreateModal(self.cog))
+    @discord.ui.button(label="Добавить файлом", style=discord.ButtonStyle.success, row=1)
+    async def add_file(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.start_admin_pack_file_import(interaction, pack_id=None)
 
     @discord.ui.button(label="Обновить", style=discord.ButtonStyle.secondary, row=1)
     async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_LIST, page=self.page)
+
+    @discord.ui.button(label="Назад", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.cog.open_bunker_admin_panel(interaction)
 
-    @discord.ui.button(label="Доступ", style=discord.ButtonStyle.primary, row=2)
-    async def access(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await self.cog.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_ACCESS)
+    @discord.ui.button(label="←", style=discord.ButtonStyle.secondary, row=2)
+    async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_LIST, page=max(0, self.page - 1))
+
+    @discord.ui.button(label="→", style=discord.ButtonStyle.secondary, row=2)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_LIST, page=self.page + 1)
+
+
+class BunkerAdminSubmissionsView(SafeView):
+    def __init__(self, cog: Bunker, submissions: list[BunkerPackSubmission], *, page: int, total: int) -> None:
+        super().__init__(timeout=900)
+        self.cog = cog
+        self.submissions = submissions
+        self.page = max(0, page)
+        self.total = total
+        for row, submission in enumerate(submissions[:ADMIN_SUBMISSION_PAGE_SIZE]):
+            self._add_submission_button(submission, "Экспорт", "export", discord.ButtonStyle.secondary, row=row)
+            self._add_submission_button(submission, "Принять", "accept", discord.ButtonStyle.success, row=row)
+            self._add_submission_button(submission, "Отклонить", "reject", discord.ButtonStyle.danger, row=row)
+        _set_button_custom_id(self, "prev_page", _bunker_button_id("a", 0, 0, "sub_prev_page"))
+        _set_button_custom_id(self, "next_page", _bunker_button_id("a", 0, 0, "sub_next_page"))
+        _set_button_custom_id(self, "refresh", _bunker_button_id("a", 0, 0, "sub_refresh"))
+        _set_button_custom_id(self, "back", _bunker_button_id("a", 0, 0, "sub_back"))
+        max_page = max(0, (total - 1) // ADMIN_SUBMISSION_PAGE_SIZE)
+        if self.page <= 0:
+            _set_button_disabled(self, "prev_page", True)
+        if self.page >= max_page:
+            _set_button_disabled(self, "next_page", True)
+
+    def _add_submission_button(
+        self,
+        submission: BunkerPackSubmission,
+        label: str,
+        action: str,
+        style: discord.ButtonStyle,
+        *,
+        row: int,
+    ) -> None:
+        button = discord.ui.Button(
+            label=label,
+            style=style,
+            row=row,
+            custom_id=_bunker_button_id("a", 0, submission.id, f"sub_{action}"),
+        )
+
+        async def callback(interaction: discord.Interaction) -> None:
+            if action == "export":
+                await self.cog.export_pack_submission(interaction, submission.id)
+            elif action == "accept":
+                await self.cog.accept_pack_submission(interaction, submission.id, page=self.page)
+            else:
+                await self.cog.reject_pack_submission(interaction, submission.id, page=self.page)
+
+        button.callback = callback
+        self.add_item(button)
+
+    @discord.ui.button(label="←", style=discord.ButtonStyle.secondary, row=4)
+    async def prev_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.open_bunker_admin_panel(
+            interaction,
+            screen=ADMIN_PANEL_SCREEN_SUBMISSIONS,
+            page=max(0, self.page - 1),
+        )
+
+    @discord.ui.button(label="→", style=discord.ButtonStyle.secondary, row=4)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_SUBMISSIONS, page=self.page + 1)
+
+    @discord.ui.button(label="Обновить", style=discord.ButtonStyle.secondary, row=4)
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_SUBMISSIONS, page=self.page)
+
+    @discord.ui.button(label="Назад", style=discord.ButtonStyle.secondary, row=4)
+    async def back(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.open_bunker_admin_panel(interaction)
 
 
 class BunkerAdminAccessView(SafeView):
@@ -3576,8 +4198,8 @@ class BunkerAdminPackView(SafeView):
         self.pack = pack
         self.add_item(BunkerAdminCategorySelect(cog, pack))
         _set_button_custom_id(self, "rename", _bunker_button_id("a", 0, pack.id, "rename"))
-        _set_button_custom_id(self, "import_json", _bunker_button_id("a", 0, pack.id, "import_json"))
-        _set_button_custom_id(self, "export_json", _bunker_button_id("a", 0, pack.id, "export_json"))
+        _set_button_custom_id(self, "replace_file", _bunker_button_id("a", 0, pack.id, "replace_file"))
+        _set_button_custom_id(self, "export_file", _bunker_button_id("a", 0, pack.id, "export_file"))
         _set_button_custom_id(self, "toggle", _bunker_button_id("a", 0, pack.id, "toggle"))
         _set_button_custom_id(self, "delete", _bunker_button_id("a", 0, pack.id, "delete"))
         _set_button_custom_id(self, "back", _bunker_button_id("a", 0, pack.id, "back"))
@@ -3586,13 +4208,13 @@ class BunkerAdminPackView(SafeView):
     async def rename(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await interaction.response.send_modal(BunkerPackRenameModal(self.cog, self.pack))
 
-    @discord.ui.button(label="Импорт JSON", style=discord.ButtonStyle.primary, row=1)
-    async def import_json(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.send_modal(BunkerPackImportModal(self.cog, self.pack))
+    @discord.ui.button(label="Заменить файлом", style=discord.ButtonStyle.primary, row=1)
+    async def replace_file(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.start_admin_pack_file_import(interaction, pack_id=self.pack.id)
 
-    @discord.ui.button(label="Экспорт JSON", style=discord.ButtonStyle.secondary, row=1)
-    async def export_json(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await interaction.response.edit_message(embed=_pack_export_embed(self.pack), view=BunkerAdminExportView(self.cog, self.pack.id))
+    @discord.ui.button(label="Экспорт", style=discord.ButtonStyle.secondary, row=1)
+    async def export_file(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.export_admin_pack_file(interaction, self.pack.id)
 
     @discord.ui.button(label="Вкл/выкл", style=discord.ButtonStyle.secondary, row=2)
     async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -3600,11 +4222,11 @@ class BunkerAdminPackView(SafeView):
 
     @discord.ui.button(label="Удалить", style=discord.ButtonStyle.danger, row=2)
     async def delete(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await self.cog.delete_admin_pack(interaction, self.pack.id)
+        await self.cog.confirm_delete_admin_pack(interaction, self.pack.id)
 
     @discord.ui.button(label="Назад", style=discord.ButtonStyle.secondary, row=2)
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        await self.cog.open_bunker_admin_panel(interaction)
+        await self.cog.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_LIST)
 
 
 class BunkerAdminExportView(SafeView):
@@ -3616,6 +4238,23 @@ class BunkerAdminExportView(SafeView):
 
     @discord.ui.button(label="Назад к паку", style=discord.ButtonStyle.primary)
     async def back(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_PACK, pack_id=self.pack_id)
+
+
+class BunkerAdminDeletePackConfirmView(SafeView):
+    def __init__(self, cog: Bunker, pack_id: int) -> None:
+        super().__init__(timeout=900)
+        self.cog = cog
+        self.pack_id = pack_id
+        _set_button_custom_id(self, "confirm", _bunker_button_id("a", 0, pack_id, "delete_confirm"))
+        _set_button_custom_id(self, "cancel", _bunker_button_id("a", 0, pack_id, "delete_cancel"))
+
+    @discord.ui.button(label="Удалить", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.delete_admin_pack(interaction, self.pack_id)
+
+    @discord.ui.button(label="Отмена", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         await self.cog.open_bunker_admin_panel(interaction, screen=ADMIN_PANEL_SCREEN_PACK, pack_id=self.pack_id)
 
 
@@ -3729,6 +4368,123 @@ class BunkerPackValueModal(SafeModal, title="Добавить строку"):
         await self.cog.add_admin_pack_value(interaction, self.pack_id, self.field, str(self.value.value))
 
 
+class BunkerBuilderHomeView(SafeView):
+    def __init__(self, cog: Bunker, setup_id: int, user_id: int) -> None:
+        super().__init__(timeout=PRIVATE_VIEW_TIMEOUT_SECONDS)
+        self.cog = cog
+        self.setup_id = setup_id
+        self.user_id = user_id
+        self._add_button("Опубликовать пак", discord.ButtonStyle.success, self._publish, row=0)
+        self.add_item(discord.ui.Button(label="DFile Editor", style=discord.ButtonStyle.link, url=BUILDER_EDITOR_URL, row=0))
+        self._add_button("Инструкция", discord.ButtonStyle.secondary, self._instruction, row=1)
+        self._add_button("Назад", discord.ButtonStyle.secondary, self._back, row=1)
+
+    def _add_button(self, label: str, style: discord.ButtonStyle, callback, *, row: int) -> None:
+        action = getattr(callback, "__name__", "button").lstrip("_")
+        button = discord.ui.Button(
+            label=label,
+            style=style,
+            row=row,
+            custom_id=_bunker_button_id("s", self.user_id, self.setup_id, f"builder_{action}"),
+        )
+        button.callback = callback
+        self.add_item(button)
+
+    async def _ensure_owner(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.user_id:
+            return True
+        await interaction.response.send_message("Эта приватная панель открыта другим пользователем.", ephemeral=True)
+        return False
+
+    async def _publish(self, interaction: discord.Interaction) -> None:
+        if await self._ensure_owner(interaction):
+            await self.cog.start_builder_pack_upload(interaction)
+
+    async def _instruction(self, interaction: discord.Interaction) -> None:
+        if await self._ensure_owner(interaction):
+            await self.cog.open_builder_panel(interaction, screen="instruction")
+
+    async def _back(self, interaction: discord.Interaction) -> None:
+        if await self._ensure_owner(interaction):
+            await self.cog.open_setup_panel(interaction, screen="content")
+
+
+class BunkerBuilderTutorialView(SafeView):
+    def __init__(
+        self,
+        cog: Bunker,
+        setup_id: int,
+        user_id: int,
+        screen: str,
+        progress: BunkerBuilderProgress,
+    ) -> None:
+        super().__init__(timeout=PRIVATE_VIEW_TIMEOUT_SECONDS)
+        self.cog = cog
+        self.setup_id = setup_id
+        self.user_id = user_id
+        self.screen = screen
+        self.progress = progress
+        if screen == "agreement":
+            self._add_button("Принять соглашение", discord.ButtonStyle.success, self._accept, row=0)
+            self._add_button("Отклонить соглашение", discord.ButtonStyle.secondary, self._decline, row=0)
+        elif screen == "install":
+            self._add_button("Назад", discord.ButtonStyle.secondary, self._back, row=0)
+            self._add_button("Дальше", discord.ButtonStyle.primary, self._next, row=0)
+            self.add_item(discord.ui.Button(label="GitHub", style=discord.ButtonStyle.link, url=BUILDER_EDITOR_URL, row=1))
+        elif screen == "usage":
+            self._add_button("Назад", discord.ButtonStyle.secondary, self._back, row=0)
+            self._add_button("Дальше", discord.ButtonStyle.primary, self._next, row=0)
+        else:
+            self._add_button("Назад", discord.ButtonStyle.secondary, self._back, row=0)
+            self._add_button("Всё понятно", discord.ButtonStyle.success, self._done, row=0)
+
+    def _add_button(self, label: str, style: discord.ButtonStyle, callback, *, row: int) -> None:
+        action = getattr(callback, "__name__", "button").lstrip("_")
+        button = discord.ui.Button(
+            label=label,
+            style=style,
+            row=row,
+            custom_id=_bunker_button_id("s", self.user_id, self.setup_id, f"builder_{self.screen}_{action}"),
+        )
+        button.callback = callback
+        self.add_item(button)
+
+    async def _ensure_owner(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.user_id:
+            return True
+        await interaction.response.send_message("Эта приватная панель открыта другим пользователем.", ephemeral=True)
+        return False
+
+    async def _accept(self, interaction: discord.Interaction) -> None:
+        if await self._ensure_owner(interaction):
+            await self.cog.accept_builder_agreement(interaction)
+
+    async def _decline(self, interaction: discord.Interaction) -> None:
+        if await self._ensure_owner(interaction):
+            await self.cog.open_setup_panel(interaction, screen="content")
+
+    async def _back(self, interaction: discord.Interaction) -> None:
+        if not await self._ensure_owner(interaction):
+            return
+        if self.screen == "install":
+            target = "home" if self.progress.tutorial_completed else "agreement"
+        elif self.screen == "usage":
+            target = "install"
+        else:
+            target = "usage"
+        await self.cog.open_builder_panel(interaction, screen=target)
+
+    async def _next(self, interaction: discord.Interaction) -> None:
+        if not await self._ensure_owner(interaction):
+            return
+        target = "usage" if self.screen == "install" else "upload"
+        await self.cog.open_builder_panel(interaction, screen=target)
+
+    async def _done(self, interaction: discord.Interaction) -> None:
+        if await self._ensure_owner(interaction):
+            await self.cog.complete_builder_tutorial(interaction)
+
+
 class BunkerSetupNavView(SafeView):
     def __init__(
         self,
@@ -3819,8 +4575,9 @@ class BunkerSetupContentView(SafeView):
         self.add_item(BunkerSetupPackSelect(self))
         self._add_button("Настройки", discord.ButtonStyle.secondary, self._settings, row=1)
         self._add_button("Как играть", discord.ButtonStyle.secondary, self._rules, row=1)
+        self._add_button("Строитель паков", discord.ButtonStyle.success, self._builder, row=2)
         if is_operator:
-            self._add_button("Админка паков", discord.ButtonStyle.primary, self._admin_panel, row=1)
+            self._add_button("Редактор паков", discord.ButtonStyle.primary, self._admin_panel, row=2)
 
     def _add_button(self, label: str, style: discord.ButtonStyle, callback, *, row: int) -> None:
         action = getattr(callback, "__name__", "button").lstrip("_")
@@ -3862,6 +4619,10 @@ class BunkerSetupContentView(SafeView):
                 await self.cog.update_current_game_panel(interaction, game, screen="rules")
             else:
                 await self.cog.open_setup_panel(interaction, screen="rules")
+
+    async def _builder(self, interaction: discord.Interaction) -> None:
+        if await self._ensure_owner(interaction):
+            await self.cog.open_builder_panel(interaction)
 
     async def _admin_panel(self, interaction: discord.Interaction) -> None:
         if await self._ensure_owner(interaction):
@@ -5028,7 +5789,7 @@ def _setup_content_embed(settings: BunkerSettings, packs: list[BunkerContentPack
         lines = [f"{pack.name}: {_pack_total(pack)} строк" for pack in packs[:10]]
         embed.add_field(name="Доступные паки", value="\n".join(lines), inline=False)
     else:
-        embed.add_field(name="Доступные паки", value="Кастомных паков пока нет. Создай их через /bunkeradminpanel.", inline=False)
+        embed.add_field(name="Доступные паки", value="Кастомных паков пока нет. Админы могут добавить их через редактор паков.", inline=False)
     return embed
 
 
@@ -5051,29 +5812,101 @@ def _packs_embed() -> discord.Embed:
     return embed
 
 
-def _admin_packs_embed(packs: list[BunkerContentPack], *, status: str | None = None) -> discord.Embed:
-    embed = discord.Embed(title="Админ-панель Бункера", color=discord.Color.dark_teal())
-    embed.description = status or "Создавай кастомные паки вручную или через файл редактора."
+def _builder_home_embed(*, status: str | None = None) -> discord.Embed:
+    embed = discord.Embed(title="Строитель паков", color=discord.Color.dark_teal())
+    embed.description = status or "Здесь можно отправить свой `.bunker-pack.json` на проверку администрации."
+    embed.add_field(name="Проверка", value="Админы проверят файл и примут или отклонят пак. Обычно это занимает до 24 часов.", inline=False)
+    embed.add_field(name="Редактор", value=f"Скачать DFile Editor: {BUILDER_EDITOR_URL}", inline=False)
+    return embed
+
+
+def _builder_tutorial_embed(screen: str, *, status: str | None = None) -> discord.Embed:
+    titles = {
+        "agreement": "Строитель паков · соглашение",
+        "install": "Строитель паков · установка DFile Editor",
+        "usage": "Строитель паков · работа в редакторе",
+        "upload": "Строитель паков · загрузка файла",
+    }
+    descriptions = {
+        "agreement": (
+            "Паки должны подходить для игры на сервере: без политики, травли, реальных персональных данных, "
+            "шок-контента, чрезмерной жестокости и материалов, которые ломают атмосферу Бункера. "
+            "Администрация может отклонить файл без отдельной причины."
+        ),
+        "install": (
+            f"Скачай редактор с GitHub: {BUILDER_EDITOR_URL}\n"
+            "Открой приложение, создай новый `.bunker-pack.json` или загрузи существующий файл пака."
+        ),
+        "usage": (
+            "Заполняй категории пака в редакторе: профессии, возраст, здоровье, багаж, фобии, факты, события и другие поля. "
+            "Сохрани результат как UTF-8 JSON с расширением `.bunker-pack.json`."
+        ),
+        "upload": (
+            "Когда файл готов, нажми `Всё понятно`, затем в панели строителя выбери `Опубликовать пак`. "
+            "Бот попросит отправить файл следующим сообщением; после проверки результат появится в канале уведомлений и в DM."
+        ),
+    }
+    embed = discord.Embed(title=titles.get(screen, "Строитель паков"), color=discord.Color.dark_teal())
+    embed.description = descriptions.get(screen, descriptions["agreement"])
+    if status:
+        embed.description = f"{status}\n\n{embed.description}"
+    return embed
+
+
+def _admin_home_embed(pack_count: int, pending_count: int, *, status: str | None = None) -> discord.Embed:
+    embed = discord.Embed(title="Редактор паков", color=discord.Color.dark_teal())
+    embed.description = status or "Управляй существующими паками и заявками от пользователей."
+    embed.add_field(name="Список паков", value=f"Всего кастомных паков: {pack_count}.", inline=False)
+    embed.add_field(name="Пользовательские паки", value=f"Ожидают проверки: {pending_count}.", inline=False)
+    return embed
+
+
+def _admin_packs_embed(packs: list[BunkerContentPack], *, status: str | None = None, page: int = 0) -> discord.Embed:
+    embed = discord.Embed(title="Редактор паков · список паков", color=discord.Color.dark_teal())
+    embed.description = status or "Экспортируй, заменяй через файл, удаляй и добавляй кастомные паки."
     embed.add_field(
-        name="Редактор паков",
-        value="Экспорт: `/bunker pack-export`. Проверка: `/bunker pack-file-check`. Импорт: `/bunker pack-import`.",
+        name="Файлы редактора",
+        value="Поддерживается формат `.bunker-pack.json` из DFile Editor.",
         inline=False,
     )
     if packs:
+        offset = max(0, page) * ADMIN_PACK_LIST_PAGE_SIZE
+        page_packs = packs[offset : offset + ADMIN_PACK_LIST_PAGE_SIZE]
         lines = [
             f"{pack.id}. {'вкл' if pack.is_enabled else 'выкл'} · {pack.name} · {_pack_total(pack)} строк"
-            for pack in packs[:15]
+            for pack in page_packs[:15]
         ]
+        if len(page_packs) > 15:
+            lines.append(f"...ещё {len(page_packs) - 15} на этой странице")
         embed.add_field(name="Паки", value="\n".join(lines), inline=False)
+        embed.set_footer(text=f"Страница {page + 1}/{max(1, (len(packs) - 1) // ADMIN_PACK_LIST_PAGE_SIZE + 1)}")
     else:
         embed.add_field(name="Паки", value="Паков пока нет.", inline=False)
+    return embed
+
+
+def _admin_submissions_embed(
+    submissions: list[BunkerPackSubmission],
+    *,
+    total: int,
+    page: int,
+    status: str | None = None,
+) -> discord.Embed:
+    embed = discord.Embed(title="Редактор паков · пользовательские паки", color=discord.Color.dark_teal())
+    embed.description = status or "Проверь файл через экспорт, затем прими или отклони заявку."
+    if submissions:
+        lines = [f"{submission.name} - <@{submission.author_id}>" for submission in submissions]
+        embed.add_field(name="Ожидают проверки", value="\n".join(lines), inline=False)
+    else:
+        embed.add_field(name="Ожидают проверки", value="Новых заявок нет.", inline=False)
+    embed.set_footer(text=f"Страница {page + 1}/{max(1, (total - 1) // ADMIN_SUBMISSION_PAGE_SIZE + 1)}")
     return embed
 
 
 def _admin_access_embed(guild: discord.Guild, settings: Any, *, status: str | None = None) -> discord.Embed:
     operator_role = guild.get_role(settings.operator_role_id) if settings.operator_role_id is not None else None
     interest_role = guild.get_role(settings.interest_role_id) if settings.interest_role_id is not None else None
-    embed = discord.Embed(title="Доступ Бункера", color=discord.Color.dark_teal())
+    embed = discord.Embed(title="Редактор паков · доступ Бункера", color=discord.Color.dark_teal())
     embed.description = status or "Настрой роли, которые управляют видимостью и админскими комнатами Бункера."
     embed.add_field(
         name="Operator-role",
@@ -5102,7 +5935,7 @@ def _admin_pack_embed(pack: BunkerContentPack, *, status: str | None = None) -> 
     embed.add_field(name="Категории", value="\n".join(counts)[:1024], inline=False)
     embed.add_field(
         name="Файл для редактора",
-        value=f"Экспортируй `/bunker pack-export pack_id:{pack.id}`, отредактируй файл и импортируй `/bunker pack-import pack_id:{pack.id}`.",
+        value="Используй кнопки `Экспорт` и `Заменить файлом`, чтобы проверить или полностью обновить пак через DFile Editor.",
         inline=False,
     )
     return embed
@@ -5180,6 +6013,19 @@ def _pack_export_filename(pack: BunkerContentPack) -> str:
     base = re.sub(r"\s+", "_", pack.name.strip())
     base = re.sub(r"[^\w.-]+", "_", base, flags=re.UNICODE).strip("._-")
     return f"{(base or 'bunker_pack')[:48]}-{pack.id}{PACK_FILE_EXTENSION}"
+
+
+def _submission_export_filename(submission: BunkerPackSubmission) -> str:
+    base = re.sub(r"\s+", "_", submission.name.strip())
+    base = re.sub(r"[^\w.-]+", "_", base, flags=re.UNICODE).strip("._-")
+    return f"{(base or 'builder_pack')[:48]}-submission-{submission.id}{PACK_FILE_EXTENSION}"
+
+
+def _first_message_attachment(message: discord.Message) -> Any | None:
+    attachments = getattr(message, "attachments", None)
+    if not attachments:
+        return None
+    return attachments[0]
 
 
 def _pack_name_from_attachment(filename: str) -> str:
