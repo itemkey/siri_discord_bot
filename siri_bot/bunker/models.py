@@ -197,6 +197,32 @@ class BunkerContentPack:
 
 
 @dataclass(frozen=True)
+class SpecialAbilityAction:
+    effect: str
+    target: str = "none"
+    stat_key: str | None = None
+
+    def to_json(self) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "effect": self.effect,
+            "target": self.target,
+        }
+        if self.stat_key:
+            payload["stat_key"] = self.stat_key
+        return payload
+
+    @classmethod
+    def from_json(cls, raw: Any) -> "SpecialAbilityAction":
+        if not isinstance(raw, dict):
+            return cls(effect="generic_note")
+        return cls(
+            effect=str(raw.get("effect") or "generic_note"),
+            target=str(raw.get("target") or "none"),
+            stat_key=str(raw["stat_key"]) if raw.get("stat_key") else None,
+        )
+
+
+@dataclass(frozen=True)
 class SpecialAbility:
     id: str
     name: str
@@ -209,9 +235,10 @@ class SpecialAbility:
     revealed: bool = False
     used: bool = False
     blocked: bool = False
+    actions: tuple[SpecialAbilityAction, ...] = field(default_factory=tuple)
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "id": self.id,
             "name": self.name,
             "description": self.description,
@@ -224,6 +251,20 @@ class SpecialAbility:
             "used": self.used,
             "blocked": self.blocked,
         }
+        if self.actions:
+            payload["actions"] = [action.to_json() for action in self.actions]
+        return payload
+
+    def action_steps(self) -> tuple[SpecialAbilityAction, ...]:
+        if self.actions:
+            return self.actions
+        return (
+            SpecialAbilityAction(
+                effect=self.effect,
+                target=self.target,
+                stat_key=self.stat_key,
+            ),
+        )
 
     @classmethod
     def from_json(cls, raw: Any) -> "SpecialAbility":
@@ -242,6 +283,10 @@ class SpecialAbility:
                 description="Нейтральная спец. возможность.",
                 effect="generic_note",
             )
+        raw_actions = raw.get("actions")
+        actions: tuple[SpecialAbilityAction, ...] = ()
+        if isinstance(raw_actions, (list, tuple)):
+            actions = tuple(SpecialAbilityAction.from_json(action) for action in raw_actions)[:8]
         return cls(
             id=str(raw.get("id") or raw.get("name") or "generic")[:64],
             name=str(raw.get("name") or "Спец. возможность")[:80],
@@ -254,6 +299,7 @@ class SpecialAbility:
             revealed=bool(raw.get("revealed", False)),
             used=bool(raw.get("used", False)),
             blocked=bool(raw.get("blocked", False)),
+            actions=actions,
         )
 
 

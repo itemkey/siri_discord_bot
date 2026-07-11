@@ -226,7 +226,7 @@ def normalize_pack_content(raw: dict[str, Any]) -> dict[str, tuple[str, ...]]:
 
 def _normalize_ability_payload(value: Any) -> str:
     if isinstance(value, dict):
-        effect = str(value.get("effect") or "generic_note")
+        effect = _normalize_ability_effect(value.get("effect") or "generic_note")
         if effect not in KNOWN_ABILITY_EFFECTS:
             raise ValueError(f"Неизвестный effect спец. возможности: {effect}")
         payload = {
@@ -239,7 +239,12 @@ def _normalize_ability_payload(value: Any) -> str:
             "uses": max(1, int(value.get("uses", 1))),
             "timing": str(value.get("timing") or "any")[:32],
         }
-        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        raw_actions = value.get("actions")
+        if isinstance(raw_actions, (list, tuple)):
+            actions = [_normalize_ability_action(action) for action in raw_actions[:8]]
+            if actions:
+                payload["actions"] = actions
+        return _dump_ability_payload(payload)
 
     text = str(value).strip()
     if not text:
@@ -250,6 +255,43 @@ def _normalize_ability_payload(value: Any) -> str:
             raise ValueError("Спец. возможность в JSON должна быть объектом.")
         return _normalize_ability_payload(parsed)
     return text[:180]
+
+
+def _normalize_ability_action(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError("Ability action must be an object.")
+    payload: dict[str, Any] = {
+        "effect": _normalize_ability_effect(value.get("effect") or "generic_note"),
+        "target": str(value.get("target") or "none")[:32],
+    }
+    if value.get("stat_key"):
+        payload["stat_key"] = str(value["stat_key"])[:64]
+    return payload
+
+
+def _normalize_ability_effect(value: Any) -> str:
+    effect = str(value or "generic_note")
+    if effect not in KNOWN_ABILITY_EFFECTS:
+        raise ValueError(f"Unknown special ability effect: {effect}")
+    return effect
+
+
+def _dump_ability_payload(payload: dict[str, Any]) -> str:
+    text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    if len(text) <= 600:
+        return text
+
+    payload = dict(payload)
+    payload["description"] = str(payload.get("description") or "")[:120]
+    text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    while len(text) > 600 and payload.get("actions"):
+        payload["actions"] = payload["actions"][:-1]
+        text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    if len(text) > 600:
+        payload.pop("actions", None)
+        payload["description"] = ""
+        text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return text
 
 
 CORE_PROFESSIONS = (

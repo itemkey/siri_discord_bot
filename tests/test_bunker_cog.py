@@ -40,7 +40,7 @@ from siri_bot.cogs.bunker import (
     _public_specials_embed,
     _setup_embed,
 )
-from siri_bot.bunker.models import BunkerContentPack, BunkerPlayer, BunkerSettings, RoomKind, RoomSetup
+from siri_bot.bunker.models import BunkerContentPack, BunkerPlayer, BunkerSettings, RoomKind, RoomSetup, SpecialAbility
 from siri_bot.bunker.models import BunkerGame, BunkerProfile, BunkerResources, GameState
 from siri_bot.bunker.engine import generate_card
 
@@ -424,6 +424,80 @@ class BunkerCogTests(unittest.TestCase):
         self.assertEqual(payload["version"], 1)
         self.assertEqual(payload["name"], "Экспорт")
         self.assertEqual(payload["content"]["professions"], ["Инженер"])
+
+    def test_composite_special_action_applies_steps_in_order_with_shared_target(self) -> None:
+        class FakePool:
+            def __init__(self) -> None:
+                self.execute = AsyncMock()
+
+        class FakeCompositeRepository:
+            def __init__(self, players: list[BunkerPlayer]) -> None:
+                self.players = players
+                self.pool = FakePool()
+                self.list_players = AsyncMock(return_value=players)
+                self.get_player = AsyncMock(side_effect=self._get_player)
+
+            async def _get_player(self, game_id: int, user_id: int) -> BunkerPlayer | None:
+                return next((player for player in self.players if player.user_id == user_id), None)
+
+        game = _test_game(state=GameState.DISCUSSION_PHASE)
+        actor = BunkerPlayer(
+            game_id=game.id,
+            user_id=200,
+            display_name="Actor",
+            is_host=True,
+            ready_at=None,
+            invited_at=None,
+            joined_at=None,
+            left_at=None,
+            is_eliminated=False,
+            card=generate_card(),
+            revealed_stats=(),
+            used_special_action=False,
+            immune_round=None,
+        )
+        target = BunkerPlayer(
+            game_id=game.id,
+            user_id=201,
+            display_name="Target",
+            is_host=False,
+            ready_at=None,
+            invited_at=None,
+            joined_at=None,
+            left_at=None,
+            is_eliminated=False,
+            card=generate_card(),
+            revealed_stats=(),
+            used_special_action=False,
+            immune_round=None,
+        )
+        repository = FakeCompositeRepository([actor, target])
+        cog = Bunker.__new__(Bunker)
+        cog.repository = repository
+        ability = SpecialAbility.from_json(
+            {
+                "id": "vote_combo",
+                "name": "Vote combo",
+                "effect": "second_vote",
+                "target": "self",
+                "actions": [
+                    {"effect": "second_vote", "target": "self"},
+                    {"effect": "block_vote", "target": "alive_other"},
+                ],
+            }
+        )
+
+        event = asyncio.run(cog._apply_special_action(game, actor, ability, target_id=target.user_id))
+
+        self.assertEqual(repository.pool.execute.await_count, 2)
+        first_args = repository.pool.execute.await_args_list[0].args
+        second_args = repository.pool.execute.await_args_list[1].args
+        self.assertIn("personal_bonus = personal_bonus + 1", first_args[0])
+        self.assertEqual(first_args[2], actor.user_id)
+        self.assertIn("personal_bonus = personal_bonus - 100", second_args[0])
+        self.assertEqual(second_args[2], target.user_id)
+        self.assertIn("Actor", event)
+        self.assertIn("Target", event)
 
     def test_missing_setup_permissions_lists_human_readable_names(self) -> None:
         permissions = discord.Permissions.none()

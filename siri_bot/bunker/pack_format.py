@@ -39,7 +39,8 @@ PACK_FILE_EDITOR_HINTS: dict[str, Any] = {
     ],
     "special_action": {
         "string_behavior": "A plain string becomes a neutral generic_note ability.",
-        "object_fields": ("id", "name", "description", "effect", "target", "stat_key", "uses", "timing"),
+        "object_fields": ("id", "name", "description", "effect", "target", "stat_key", "uses", "timing", "actions"),
+        "action_fields": ("effect", "target", "stat_key"),
         "known_effects": tuple(sorted(KNOWN_ABILITY_EFFECTS)),
     },
 }

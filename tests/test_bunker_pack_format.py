@@ -99,6 +99,56 @@ class BunkerPackFormatTests(unittest.TestCase):
         self.assertEqual(ability["effect"], "reroll_stat")
         self.assertEqual(ability["stat_key"], "health")
 
+    def test_composite_special_actions_round_trip_actions(self) -> None:
+        payload = pack_file_payload(
+            name="Composite",
+            content={
+                "special_actions": [
+                    {
+                        "id": "field_medic",
+                        "name": "Полевой медик",
+                        "description": "Перебросить здоровье и получить защиту на раунд.",
+                        "effect": "reroll_stat",
+                        "target": "self",
+                        "stat_key": "health",
+                        "uses": 1,
+                        "timing": "reveal_or_discussion",
+                        "actions": [
+                            {"effect": "reroll_stat", "target": "self", "stat_key": "health"},
+                            {"effect": "exile_immunity", "target": "self"},
+                        ],
+                    }
+                ]
+            },
+        )
+
+        exported_ability = payload["content"]["special_actions"][0]
+        self.assertIsInstance(exported_ability, dict)
+        self.assertEqual(len(exported_ability["actions"]), 2)
+
+        parsed = parse_pack_file(json.dumps(payload, ensure_ascii=False))
+        ability = json.loads(parsed.content["special_actions"][0])
+
+        self.assertEqual(ability["id"], "field_medic")
+        self.assertEqual(ability["actions"][0]["effect"], "reroll_stat")
+        self.assertEqual(ability["actions"][1]["effect"], "exile_immunity")
+
+    def test_composite_special_actions_reject_unknown_nested_effect(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Unknown special ability effect"):
+            pack_file_payload(
+                name="Bad",
+                content={
+                    "special_actions": [
+                        {
+                            "id": "bad",
+                            "name": "Bad",
+                            "effect": "generic_note",
+                            "actions": [{"effect": "teleport", "target": "self"}],
+                        }
+                    ]
+                },
+            )
+
     def test_template_is_valid_v1_file(self) -> None:
         parsed = parse_pack_file(pack_file_template())
 

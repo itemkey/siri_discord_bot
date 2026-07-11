@@ -1821,7 +1821,8 @@ class Bunker(commands.Cog):
             return
         players = await self.repository.list_players(game.id)
         alive_targets = [target for target in players if target.is_alive and target.user_id != player.user_id]
-        if ability.target in {"alive_other", "other"} and target_id is None:
+        needs_target = _ability_requires_target(ability)
+        if needs_target and target_id is None:
             if not alive_targets:
                 await interaction.response.edit_message(embed=_status_embed("Для этой спец. возможности нет доступных целей."), view=BunkerPanelBackView(self, game_id))
                 return
@@ -1830,7 +1831,7 @@ class Bunker(commands.Cog):
                 view=BunkerAbilityTargetView(self, game.id, player.user_id, ability_index, alive_targets),
             )
             return
-        if ability.target in {"alive_other", "other"} and target_id not in {target.user_id for target in alive_targets}:
+        if needs_target and target_id not in {target.user_id for target in alive_targets}:
             await interaction.response.edit_message(embed=_status_embed("Эта цель больше недоступна. Открой актуальную панель."), view=BunkerPanelBackView(self, game_id))
             return
 
@@ -2638,6 +2639,31 @@ class Bunker(commands.Cog):
         *,
         target_id: int | None = None,
     ) -> str:
+        events: list[str] = []
+        for step in _ability_action_steps(ability):
+            event = await self._apply_special_action_step(
+                game,
+                player,
+                step,
+                ability_name=getattr(ability, "name", "special ability"),
+                target_id=target_id,
+            )
+            if event:
+                events.append(event)
+            fresh_player = await self.repository.get_player(game.id, player.user_id)
+            if fresh_player is not None:
+                player = fresh_player
+        return " ".join(events) or f"{player.display_name} applies special ability: {getattr(ability, 'name', 'special ability')}."
+
+    async def _apply_special_action_step(
+        self,
+        game: BunkerGame,
+        player: BunkerPlayer,
+        ability: Any,
+        *,
+        ability_name: str,
+        target_id: int | None = None,
+    ) -> str:
         players = await self.repository.list_players(game.id)
         alive_targets = [target for target in players if target.is_alive and target.user_id != player.user_id]
         rng = random.Random()
@@ -2710,7 +2736,7 @@ class Bunker(commands.Cog):
         if ability.effect == "protect_action":
             return f"{player.display_name} активирует защиту от следующего спец. действия."
 
-        return f"{player.display_name} применяет спец. возможность: {ability.name}."
+        return f"{player.display_name} применяет спец. возможность: {ability_name}."
 
     async def _require_game_channel(self, interaction: discord.Interaction) -> BunkerGame | None:
         channel = interaction.channel
@@ -5129,6 +5155,20 @@ def _pack_export_embed(pack: BunkerContentPack) -> discord.Embed:
 
 def _pack_json_dump(pack: BunkerContentPack) -> str:
     return dump_pack_file(name=pack.name, description=pack.description, content=pack.content)
+
+
+def _ability_action_steps(ability: Any) -> tuple[Any, ...]:
+    action_steps = getattr(ability, "actions", ())
+    if action_steps:
+        return tuple(action_steps)
+    action_steps_method = getattr(ability, "action_steps", None)
+    if callable(action_steps_method):
+        return tuple(action_steps_method())
+    return (ability,)
+
+
+def _ability_requires_target(ability: Any) -> bool:
+    return any(getattr(step, "target", None) in {"alive_other", "other"} for step in _ability_action_steps(ability))
 
 
 def _pack_file_result_embed(pack: BunkerContentPack, status: str) -> discord.Embed:
