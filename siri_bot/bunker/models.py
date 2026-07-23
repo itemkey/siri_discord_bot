@@ -50,10 +50,15 @@ CARD_STAT_LABELS: dict[str, str] = {
     "profession": "Профессия",
     "age": "Возраст",
     "gender": "Пол",
+    "first_name": "Имя",
+    "last_name": "Фамилия",
+    "appearance": "Внешность",
+    "clothing": "Одежда",
     "health": "Здоровье",
     "phobia": "Фобия",
     "hobby": "Хобби/навык",
     "baggage": "Багаж",
+    "large_item": "Крупный инвентарь",
     "extra_fact": "Доп. факт",
     "character_trait": "Черта характера",
     "biology": "Биологическая характеристика",
@@ -63,10 +68,15 @@ REVEALABLE_STATS: tuple[str, ...] = (
     "profession",
     "age",
     "gender",
+    "first_name",
+    "last_name",
+    "appearance",
+    "clothing",
     "health",
     "phobia",
     "hobby",
     "baggage",
+    "large_item",
     "extra_fact",
     "character_trait",
     "biology",
@@ -74,8 +84,17 @@ REVEALABLE_STATS: tuple[str, ...] = (
 
 STAT_KEY_ALIASES: dict[str, str] = {
     "skill": "hobby",
+    "name": "first_name",
+    "names": "first_name",
+    "surname": "last_name",
+    "surnames": "last_name",
+    "appearances": "appearance",
+    "clothes": "clothing",
     "inventory": "baggage",
     "item": "baggage",
+    "large_inventory": "large_item",
+    "large_items": "large_item",
+    "big_item": "large_item",
     "fact": "extra_fact",
     "secret": "extra_fact",
     "body": "character_trait",
@@ -349,10 +368,15 @@ class CharacterCard:
     profession: str
     age: str
     gender: str
+    first_name: str
+    last_name: str
+    appearance: str
+    clothing: str
     health: str
     phobia: str
     hobby: str
     baggage: str
+    large_item: str
     extra_fact: str
     character_trait: str
     biology: str
@@ -364,10 +388,15 @@ class CharacterCard:
             "profession": self.profession,
             "age": self.age,
             "gender": self.gender,
+            "first_name": self.first_name,
+            "last_name": self.last_name,
+            "appearance": self.appearance,
+            "clothing": self.clothing,
             "health": self.health,
             "phobia": self.phobia,
             "hobby": self.hobby,
             "baggage": self.baggage,
+            "large_item": self.large_item,
             "extra_fact": self.extra_fact,
             "character_trait": self.character_trait,
             "biology": self.biology,
@@ -390,10 +419,15 @@ class CharacterCard:
             profession=str(raw.get("profession", "")),
             age=str(raw.get("age", "")),
             gender=str(raw.get("gender", "не указано")),
+            first_name=str(raw.get("first_name", raw.get("name", "не указано"))),
+            last_name=str(raw.get("last_name", raw.get("surname", "не указано"))),
+            appearance=str(raw.get("appearance", "не указано")),
+            clothing=str(raw.get("clothing", raw.get("clothes", "не указано"))),
             health=str(raw.get("health", "")),
             phobia=str(raw.get("phobia", "")),
             hobby=str(raw.get("hobby", raw.get("skill", ""))),
             baggage=str(raw.get("baggage", raw.get("inventory", raw.get("item", "")))),
+            large_item=str(raw.get("large_item", raw.get("large_inventory", raw.get("big_item", "не указано")))),
             extra_fact=str(raw.get("extra_fact", raw.get("fact", raw.get("secret", "")))),
             character_trait=str(raw.get("character_trait", raw.get("body", raw.get("funny_trait", "уравновешенный характер")))),
             biology=str(raw.get("biology", raw.get("biological", "репродуктивный статус не подтвержден"))),
@@ -412,6 +446,10 @@ class CharacterCard:
     @property
     def inventory(self) -> str:
         return self.baggage
+
+    @property
+    def large_inventory(self) -> str:
+        return self.large_item
 
     @property
     def fact(self) -> str:

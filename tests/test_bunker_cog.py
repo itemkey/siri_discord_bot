@@ -5,7 +5,7 @@ import json
 import unittest
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from unittest.mock import ANY, AsyncMock
+from unittest.mock import ANY, AsyncMock, patch
 
 import discord
 
@@ -17,6 +17,7 @@ from siri_bot.cogs.bunker import (
     PUBLIC_SECTION_TOGGLE_ID,
     Bunker,
     BunkerActionView,
+    BunkerAbilityTargetView,
     BUILDER_EDITOR_URL,
     BunkerPrivatePlayerPanelView,
     BunkerPublicAbilityView,
@@ -54,6 +55,7 @@ from siri_bot.bunker.models import (
     SpecialAbility,
 )
 from siri_bot.bunker.models import BunkerGame, BunkerProfile, BunkerResources, GameState
+from siri_bot.bunker.content import BUILTIN_PACK
 from siri_bot.bunker.engine import generate_card
 
 
@@ -2141,8 +2143,8 @@ class BunkerCogTests(unittest.TestCase):
             if button.style == discord.ButtonStyle.secondary and button.disabled
         ]
 
-        self.assertEqual(len(buttons), 11)
-        self.assertEqual(len(hidden_buttons), 9)
+        self.assertEqual(len(buttons), 16)
+        self.assertEqual(len(hidden_buttons), 14)
         self.assertTrue(all(not button.disabled for button in hidden_buttons))
         self.assertEqual(len(revealed_buttons), 1)
         self.assertIn(PUBLIC_REVEAL_SELF_ID, [button.custom_id for button in buttons])
@@ -2236,7 +2238,7 @@ class BunkerCogTests(unittest.TestCase):
             if isinstance(child, discord.ui.Button) and child.style == discord.ButtonStyle.secondary
         ]
 
-        self.assertEqual(len(stat_buttons), 10)
+        self.assertEqual(len(stat_buttons), 15)
         self.assertTrue(all(button.disabled for button in stat_buttons))
 
     def test_private_reveal_view_uses_red_hidden_and_gray_revealed_buttons(self) -> None:
@@ -2285,8 +2287,8 @@ class BunkerCogTests(unittest.TestCase):
             if button.style == discord.ButtonStyle.secondary and button.disabled
         ]
 
-        self.assertEqual(len(buttons), 11)
-        self.assertEqual(len(hidden_buttons), 9)
+        self.assertEqual(len(buttons), 16)
+        self.assertEqual(len(hidden_buttons), 14)
         self.assertTrue(all(not button.disabled for button in hidden_buttons))
         self.assertEqual(len(revealed_buttons), 1)
         self.assertTrue(any(button.label == "Назад к панели" for button in buttons))
@@ -2398,6 +2400,137 @@ class BunkerCogTests(unittest.TestCase):
         cog.refresh_game_message.assert_awaited_once_with(game.id)
         cog.update_current_game_panel.assert_awaited_once()
         self.assertEqual(cog.update_current_game_panel.await_args.kwargs["screen"], "action")
+
+    def test_reroll_health_uses_system_health_picker(self) -> None:
+        game = _test_game(state=GameState.DISCUSSION_PHASE)
+        ability = SpecialAbility(
+            id="reroll_health",
+            name="Медицинский пересмотр",
+            description="",
+            effect="reroll_stat",
+            target="self",
+            stat_key="health",
+            revealed=True,
+        )
+        card = replace(generate_card(), health="старое здоровье", special_abilities=(ability,))
+        player = BunkerPlayer(
+            game_id=55,
+            user_id=201,
+            display_name="Player",
+            is_host=True,
+            ready_at=None,
+            invited_at=None,
+            joined_at=None,
+            left_at=None,
+            is_eliminated=False,
+            card=card,
+            revealed_stats=(),
+            used_special_action=False,
+            immune_round=None,
+        )
+        repository = FakeRevealRepository(game, [player])
+        cog = Bunker.__new__(Bunker)
+        cog.repository = repository
+
+        with patch("siri_bot.cogs.bunker.pick_health", return_value="идеально здоровый") as picker:
+            message = asyncio.run(cog._apply_special_action_step(game, player, ability, ability_name=ability.name))
+
+        picker.assert_called_once()
+        repository.assign_cards.assert_awaited_once()
+        updated_card = repository.assign_cards.await_args.args[1][player.user_id]
+        self.assertEqual(updated_card.health, "идеально здоровый")
+        self.assertIn("Здоровье", message)
+
+    def test_reroll_large_item_uses_new_pack_category(self) -> None:
+        game = _test_game(state=GameState.DISCUSSION_PHASE)
+        ability = SpecialAbility(
+            id="reroll_large_item",
+            name="Пересмотр крупного инвентаря",
+            description="",
+            effect="reroll_stat",
+            target="self",
+            stat_key="large_item",
+            revealed=True,
+        )
+        card = replace(generate_card(), large_item="старый крупный предмет", special_abilities=(ability,))
+        player = BunkerPlayer(
+            game_id=55,
+            user_id=201,
+            display_name="Player",
+            is_host=True,
+            ready_at=None,
+            invited_at=None,
+            joined_at=None,
+            left_at=None,
+            is_eliminated=False,
+            card=card,
+            revealed_stats=(),
+            used_special_action=False,
+            immune_round=None,
+        )
+        repository = FakeRevealRepository(game, [player])
+        cog = Bunker.__new__(Bunker)
+        cog.repository = repository
+
+        message = asyncio.run(cog._apply_special_action_step(game, player, ability, ability_name=ability.name))
+
+        repository.assign_cards.assert_awaited_once()
+        updated_card = repository.assign_cards.await_args.args[1][player.user_id]
+        self.assertIn(updated_card.large_item, BUILTIN_PACK.large_items)
+        self.assertIn("Крупный инвентарь", message)
+
+    def test_ability_target_view_cancel_returns_to_action_menu(self) -> None:
+        game = _test_game(state=GameState.DISCUSSION_PHASE)
+        player = BunkerPlayer(
+            game_id=55,
+            user_id=201,
+            display_name="Player",
+            is_host=True,
+            ready_at=None,
+            invited_at=None,
+            joined_at=None,
+            left_at=None,
+            is_eliminated=False,
+            card=generate_card(),
+            revealed_stats=(),
+            used_special_action=False,
+            immune_round=None,
+        )
+        target = BunkerPlayer(
+            game_id=55,
+            user_id=202,
+            display_name="Target",
+            is_host=False,
+            ready_at=None,
+            invited_at=None,
+            joined_at=None,
+            left_at=None,
+            is_eliminated=False,
+            card=generate_card(),
+            revealed_stats=(),
+            used_special_action=False,
+            immune_round=None,
+        )
+        repository = FakeRevealRepository(game, [player, target])
+        cog = Bunker.__new__(Bunker)
+        cog.repository = repository
+        cog._can_act_as_public_player = AsyncMock(return_value=True)
+        cog.update_current_game_panel = AsyncMock()
+        cog.use_special_action = AsyncMock()
+        interaction = FakeInteraction(message=FakeMessage(900), user_id=player.user_id)
+
+        view = BunkerAbilityTargetView(cog, game.id, player.user_id, 0, [target])
+        buttons = [child for child in view.children if isinstance(child, discord.ui.Button)]
+        cancel = next(button for button in buttons if button.label == "Отмена")
+
+        self.assertEqual(cancel.custom_id, "siri:b:v1:g:201:55:action")
+
+        asyncio.run(cancel.callback(interaction))
+
+        cog.use_special_action.assert_not_awaited()
+        repository.assign_cards.assert_not_awaited()
+        repository.add_event.assert_not_awaited()
+        cog.update_current_game_panel.assert_awaited_once_with(interaction, game, screen="action")
 
     def test_public_personal_embed_keeps_admin_test_fake_values_private(self) -> None:
         card = generate_card()

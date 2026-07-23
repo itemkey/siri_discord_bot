@@ -125,10 +125,15 @@ PACK_FIELDS: tuple[str, ...] = (
     "professions",
     "ages",
     "genders",
+    "names",
+    "surnames",
+    "appearances",
+    "clothing",
     "weaknesses",
     "phobias",
     "skills",
     "items",
+    "large_items",
     "secrets",
     "funny_traits",
     "biology",
@@ -143,10 +148,15 @@ PACK_FIELD_LABELS: dict[str, str] = {
     "professions": "Профессии",
     "ages": "Возраст",
     "genders": "Пол",
+    "names": "Имена",
+    "surnames": "Фамилии",
+    "appearances": "Внешность",
+    "clothing": "Одежда",
     "weaknesses": "Здоровье",
     "phobias": "Фобии",
     "skills": "Хобби/навыки",
     "items": "Багаж",
+    "large_items": "Крупный инвентарь",
     "secrets": "Доп. факты",
     "funny_traits": "Черты характера",
     "biology": "Биология",
@@ -163,10 +173,15 @@ class ContentPack:
     professions: tuple[str, ...]
     ages: tuple[str, ...]
     genders: tuple[str, ...]
+    names: tuple[str, ...]
+    surnames: tuple[str, ...]
+    appearances: tuple[str, ...]
+    clothing: tuple[str, ...]
     weaknesses: tuple[str, ...]
     phobias: tuple[str, ...]
     skills: tuple[str, ...]
     items: tuple[str, ...]
+    large_items: tuple[str, ...]
     secrets: tuple[str, ...]
     funny_traits: tuple[str, ...]
     biology: tuple[str, ...]
@@ -354,6 +369,61 @@ CORE_ITEMS = (
     "портативная солнечная панель",
 )
 
+CORE_NAMES = (
+    "Алексей",
+    "Мария",
+    "Виктор",
+    "Анна",
+    "Дмитрий",
+    "Елена",
+    "Сергей",
+    "Ирина",
+)
+
+CORE_SURNAMES = (
+    "Ковалев",
+    "Морозова",
+    "Соколов",
+    "Новикова",
+    "Волков",
+    "Орлова",
+    "Лебедев",
+    "Романова",
+)
+
+CORE_APPEARANCES = (
+    "спокойное лицо",
+    "высокий худощавый силуэт",
+    "крепкое телосложение",
+    "заметный шрам на щеке",
+    "усталый взгляд",
+    "короткая стрижка",
+    "аккуратная борода",
+    "выразительная мимика",
+)
+
+CORE_CLOTHING = (
+    "рабочая куртка",
+    "утепленный комбинезон",
+    "медицинский халат поверх одежды",
+    "туристическая ветровка",
+    "армейский плащ",
+    "плотный свитер",
+    "защитный жилет",
+    "изношенный костюм",
+)
+
+CORE_LARGE_ITEMS = (
+    "переносной генератор",
+    "ящик инструментов",
+    "складная носилка",
+    "канистра топлива",
+    "компактная рация",
+    "ящик консервов",
+    "набор фильтров вентиляции",
+    "переносной аккумулятор",
+)
+
 CORE_HEALTH = (
     "здоров, высокая выносливость",
     "астма легкой степени",
@@ -468,10 +538,15 @@ BUILTIN_PACK = ContentPack(
     professions=CORE_PROFESSIONS,
     ages=CORE_AGES,
     genders=GENDERS,
+    names=CORE_NAMES,
+    surnames=CORE_SURNAMES,
+    appearances=CORE_APPEARANCES,
+    clothing=CORE_CLOTHING,
     weaknesses=CORE_HEALTH,
     phobias=CORE_PHOBIAS,
     skills=CORE_SKILLS,
     items=CORE_ITEMS,
+    large_items=CORE_LARGE_ITEMS,
     secrets=CORE_FACTS,
     funny_traits=CORE_CHARACTER_TRAITS,
     biology=BIOLOGY_TRAITS,

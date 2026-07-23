@@ -29,12 +29,18 @@ from siri_bot.bunker.models import (
 MIN_PLAYERS = 6
 MAX_PLAYERS = 16
 FINAL_ALIVE_FLOOR = 2
+SYSTEM_PERFECT_HEALTH = "идеально здоровый"
+PERFECT_HEALTH_CHANCE = 0.15
+DISEASE_DEGREES = ("легкая степень", "средняя степень", "тяжелая степень", "критическая степень")
+_SYSTEM_PERFECT_HEALTH_VALUES = frozenset({SYSTEM_PERFECT_HEALTH, "идеально здоров"})
 
 ROUND_REVEAL_STATS: tuple[tuple[str, ...], ...] = (
     ("profession",),
     ("health", "age"),
+    ("first_name", "last_name"),
+    ("appearance", "clothing"),
     ("hobby",),
-    ("baggage",),
+    ("baggage", "large_item"),
     ("phobia", "character_trait"),
     ("extra_fact",),
     ("gender", "biology"),
@@ -137,16 +143,41 @@ def generate_card(
         profession=rng.choice(pack.professions),
         age=rng.choice(pack.ages) if pack.ages else f"{rng.randint(18, 78)} лет",
         gender=rng.choice(pack.genders or GENDERS),
-        health=rng.choice(pack.weaknesses),
+        first_name=rng.choice(pack.names or BUILTIN_PACK.names),
+        last_name=rng.choice(pack.surnames or BUILTIN_PACK.surnames),
+        appearance=rng.choice(pack.appearances or BUILTIN_PACK.appearances),
+        clothing=rng.choice(pack.clothing or BUILTIN_PACK.clothing),
+        health=pick_health(rng, pack),
         phobia=rng.choice(pack.phobias),
         hobby=rng.choice(pack.skills),
         baggage=rng.choice(pack.items),
+        large_item=rng.choice(pack.large_items or BUILTIN_PACK.large_items),
         extra_fact=rng.choice(pack.secrets),
         character_trait=rng.choice(pack.funny_traits or BODY_TYPES),
         biology=rng.choice(pack.biology or BIOLOGY_TRAITS),
         special_abilities=abilities,
         traitor=traitor,
     )
+
+
+def pick_health(rng: random.Random, pack: ContentPack) -> str:
+    if rng.random() < PERFECT_HEALTH_CHANCE:
+        return SYSTEM_PERFECT_HEALTH
+
+    values = _non_system_health_values(pack.weaknesses)
+    if not values:
+        values = _non_system_health_values(BUILTIN_PACK.weaknesses)
+    if not values:
+        return SYSTEM_PERFECT_HEALTH
+
+    health = rng.choice(values)
+    if "степен" in health.casefold():
+        return health
+    return f"{health} ({rng.choice(DISEASE_DEGREES)})"
+
+
+def _non_system_health_values(values: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(value for value in values if value.strip().casefold() not in _SYSTEM_PERFECT_HEALTH_VALUES)
 
 
 def _pick_special_abilities(rng: random.Random, pack: ContentPack) -> tuple[SpecialAbility, SpecialAbility]:
@@ -385,10 +416,15 @@ def format_card(card: CharacterCard) -> str:
         f"Профессия: {card.profession}",
         f"Возраст: {card.age}",
         f"Пол: {card.gender}",
+        f"Имя: {card.first_name}",
+        f"Фамилия: {card.last_name}",
+        f"Внешность: {card.appearance}",
+        f"Одежда: {card.clothing}",
         f"Здоровье: {card.health}",
         f"Фобия: {card.phobia}",
         f"Хобби/навык: {card.hobby}",
         f"Багаж: {card.baggage}",
+        f"Крупный инвентарь: {card.large_item}",
         f"Доп. факт: {card.extra_fact}",
         f"Черта характера: {card.character_trait}",
         f"Биологическая характеристика: {card.biology}",

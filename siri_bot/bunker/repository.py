@@ -20,6 +20,7 @@ from siri_bot.bunker.models import (
     CharacterCard,
     GameState,
     PackSubmissionStatus,
+    REVEALABLE_STATS,
     RoomKind,
     RoomStatus,
     RoomSetup,
@@ -1400,21 +1401,7 @@ class BunkerRepository:
             """,
             game_id,
             user_id,
-            json.dumps(
-                [
-                    "profession",
-                    "age",
-                    "gender",
-                    "health",
-                    "phobia",
-                    "hobby",
-                    "baggage",
-                    "extra_fact",
-                    "character_trait",
-                    "biology",
-                ],
-                ensure_ascii=False,
-            ),
+            json.dumps(REVEALABLE_STATS, ensure_ascii=False),
         )
 
     async def mark_special_used(self, game_id: int, user_id: int) -> None:

@@ -12,7 +12,12 @@ class BunkerContentTests(unittest.TestCase):
         self.assertGreaterEqual(counts["professions"], 8)
         self.assertGreaterEqual(counts["ages"], 50)
         self.assertGreaterEqual(counts["genders"], 3)
+        self.assertGreaterEqual(counts["names"], 8)
+        self.assertGreaterEqual(counts["surnames"], 8)
+        self.assertGreaterEqual(counts["appearances"], 8)
+        self.assertGreaterEqual(counts["clothing"], 8)
         self.assertGreaterEqual(counts["items"], 8)
+        self.assertGreaterEqual(counts["large_items"], 8)
         self.assertGreaterEqual(counts["weaknesses"], 8)
         self.assertGreaterEqual(counts["secrets"], 8)
         self.assertGreaterEqual(counts["skills"], 8)
@@ -30,8 +35,13 @@ class BunkerContentTests(unittest.TestCase):
                 "professions": ["  Свой инженер  ", "Свой инженер", ""],
                 "ages": ["99 лет"],
                 "genders": ["свой пол"],
+                "names": ["Свое имя"],
+                "surnames": ["Своя фамилия"],
+                "appearances": ["своя внешность"],
+                "clothing": ["своя одежда"],
                 "biology": ["своя биология"],
                 "items": ["Личный фильтр"],
+                "large_items": ["личный генератор"],
             }
         )
         custom = ContentPack.from_json(content)
@@ -41,8 +51,13 @@ class BunkerContentTests(unittest.TestCase):
         self.assertIn("Свой инженер", merged.professions)
         self.assertIn("99 лет", merged.ages)
         self.assertIn("свой пол", merged.genders)
+        self.assertIn("Свое имя", merged.names)
+        self.assertIn("Своя фамилия", merged.surnames)
+        self.assertIn("своя внешность", merged.appearances)
+        self.assertIn("своя одежда", merged.clothing)
         self.assertIn("своя биология", merged.biology)
         self.assertIn("Личный фильтр", merged.items)
+        self.assertIn("личный генератор", merged.large_items)
         self.assertGreater(len(merged.professions), len(custom.professions))
 
     def test_unknown_pack_category_is_rejected(self) -> None:

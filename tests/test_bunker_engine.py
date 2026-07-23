@@ -5,12 +5,15 @@ import unittest
 from datetime import UTC, datetime
 
 from siri_bot.bunker.engine import (
+    DISEASE_DEGREES,
+    SYSTEM_PERFECT_HEALTH,
     can_start_game,
     assign_cards,
     generate_card,
     normalize_settings,
     next_state_after_timer,
     phase_deadline,
+    pick_health,
     recommended_rounds,
     reveal_stat,
     reveal_turn_limit,
@@ -39,6 +42,48 @@ def _player(user_id: int, *, host: bool = False, ready: bool = True, eliminated:
         used_special_action=False,
         immune_round=None,
         is_fake=fake,
+    )
+
+
+class FixedHealthRng:
+    def __init__(self, health_roll: float) -> None:
+        self.health_roll = health_roll
+
+    def random(self) -> float:
+        return self.health_roll
+
+    def shuffle(self, values: list[object]) -> None:
+        return None
+
+    def choice(self, values):
+        return values[0]
+
+    def randint(self, start: int, stop: int) -> int:
+        return start
+
+
+def _content_pack(*, weaknesses: tuple[str, ...]) -> ContentPack:
+    return ContentPack(
+        professions=("инженер",),
+        ages=("30 лет",),
+        genders=("пол",),
+        names=("имя",),
+        surnames=("фамилия",),
+        appearances=("внешность",),
+        clothing=("одежда",),
+        weaknesses=weaknesses,
+        phobias=("нет",),
+        skills=("навык",),
+        items=("предмет",),
+        large_items=("крупный предмет",),
+        secrets=("факт",),
+        funny_traits=("черта",),
+        biology=("биология",),
+        apocalypses=("апокалипсис",),
+        layouts=("планировка",),
+        bunker_defects=("дефект",),
+        chaos_events=("событие",),
+        special_actions=("действие",),
     )
 
 
@@ -84,10 +129,15 @@ class BunkerEngineTests(unittest.TestCase):
             professions=("Кастомный инженер",),
             ages=("99 лет",),
             genders=("кастомный пол",),
+            names=("Кастомное имя",),
+            surnames=("Кастомная фамилия",),
+            appearances=("Кастомная внешность",),
+            clothing=("Кастомная одежда",),
             weaknesses=("Кастомная слабость",),
             phobias=("Кастомная фобия",),
             skills=("Кастомный навык",),
             items=("Кастомный предмет",),
+            large_items=("Кастомный крупный предмет",),
             secrets=("Кастомный секрет",),
             funny_traits=("Кастомная черта",),
             biology=("Кастомная биология",),
@@ -104,9 +154,37 @@ class BunkerEngineTests(unittest.TestCase):
         self.assertEqual(cards[1].profession, "Кастомный инженер")
         self.assertEqual(cards[1].age, "99 лет")
         self.assertEqual(cards[1].gender, "кастомный пол")
+        self.assertEqual(cards[1].first_name, "Кастомное имя")
+        self.assertEqual(cards[1].last_name, "Кастомная фамилия")
+        self.assertEqual(cards[1].appearance, "Кастомная внешность")
+        self.assertEqual(cards[1].clothing, "Кастомная одежда")
         self.assertEqual(cards[1].biology, "Кастомная биология")
         self.assertEqual(cards[2].inventory, "Кастомный предмет")
+        self.assertEqual(cards[2].large_item, "Кастомный крупный предмет")
         self.assertEqual(len(cards[2].special_abilities), 2)
+
+    def test_generate_card_can_roll_system_perfect_health(self) -> None:
+        card = generate_card(FixedHealthRng(0.1), _content_pack(weaknesses=("кашель",)))
+
+        self.assertEqual(card.health, SYSTEM_PERFECT_HEALTH)
+
+    def test_pick_health_adds_degree_to_pack_health(self) -> None:
+        health = pick_health(FixedHealthRng(0.5), _content_pack(weaknesses=("кашель",)))
+
+        self.assertEqual(health, f"кашель ({DISEASE_DEGREES[0]})")
+
+    def test_pick_health_keeps_existing_degree(self) -> None:
+        health = pick_health(FixedHealthRng(0.5), _content_pack(weaknesses=("астма легкой степени",)))
+
+        self.assertEqual(health, "астма легкой степени")
+
+    def test_pack_perfect_health_is_ignored_outside_system_roll(self) -> None:
+        health = pick_health(
+            FixedHealthRng(0.5),
+            _content_pack(weaknesses=(SYSTEM_PERFECT_HEALTH, "идеально здоров", "кашель")),
+        )
+
+        self.assertEqual(health, f"кашель ({DISEASE_DEGREES[0]})")
 
     def test_selectable_reveal_stats_excludes_revealed_values(self) -> None:
         player = _player(1)
@@ -174,6 +252,11 @@ class BunkerEngineTests(unittest.TestCase):
         assert card is not None
         self.assertEqual(card.hobby, "садоводство")
         self.assertEqual(card.baggage, "аптечка")
+        self.assertEqual(card.first_name, "не указано")
+        self.assertEqual(card.last_name, "не указано")
+        self.assertEqual(card.appearance, "не указано")
+        self.assertEqual(card.clothing, "не указано")
+        self.assertEqual(card.large_item, "не указано")
         self.assertEqual(card.extra_fact, "знает склад еды")
         self.assertEqual(card.character_trait, "выдерживает изоляцию")
 

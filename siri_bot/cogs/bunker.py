@@ -30,6 +30,7 @@ from siri_bot.bunker.engine import (
     generate_profile,
     normalize_settings,
     phase_deadline,
+    pick_health,
     pick_chaos_event,
     apply_chaos_to_resources,
     recommended_rounds,
@@ -3148,13 +3149,21 @@ class Bunker(commands.Cog):
 
         if ability.effect == "reroll_stat" and player.card is not None:
             content_pack = await self._content_pack_for_game(game)
+            if stat == "health":
+                await self.repository.assign_cards(game.id, {player.user_id: replace(player.card, health=pick_health(rng, content_pack))})
+                return f"{player.display_name} меняет свою характеристику: {CARD_STAT_LABELS[stat]}."
+
             values = {
                 "age": content_pack.ages,
                 "gender": content_pack.genders,
-                "health": content_pack.weaknesses,
+                "first_name": content_pack.names,
+                "last_name": content_pack.surnames,
+                "appearance": content_pack.appearances,
+                "clothing": content_pack.clothing,
                 "hobby": content_pack.skills,
                 "phobia": content_pack.phobias,
                 "baggage": content_pack.items,
+                "large_item": content_pack.large_items,
                 "extra_fact": content_pack.secrets,
                 "profession": content_pack.professions,
                 "character_trait": content_pack.funny_traits,
@@ -5254,6 +5263,9 @@ class BunkerAbilityTargetView(SafeView):
         targets: list[BunkerPlayer],
     ) -> None:
         super().__init__(timeout=PRIVATE_VIEW_TIMEOUT_SECONDS)
+        self.cog = cog
+        self.game_id = game_id
+        self.user_id = user_id
         for index, target in enumerate(targets[:20]):
             button = discord.ui.Button(
                 label=target.display_name[:80],
@@ -5267,6 +5279,29 @@ class BunkerAbilityTargetView(SafeView):
 
             button.callback = callback
             self.add_item(button)
+
+        cancel = discord.ui.Button(
+            label="Отмена",
+            style=discord.ButtonStyle.secondary,
+            custom_id=_bunker_button_id("g", user_id, game_id, "action"),
+            row=4,
+        )
+        cancel.callback = self.cancel
+        self.add_item(cancel)
+
+    async def cancel(self, interaction: discord.Interaction) -> None:
+        game = await self.cog.repository.get_game(self.game_id)
+        player = await self.cog.repository.get_player(self.game_id, self.user_id)
+        if game is None or player is None:
+            await interaction.response.edit_message(embed=_status_embed("Партия не найдена."), view=None)
+            return
+        if not await self.cog._can_act_as_public_player(interaction, game, player):
+            await interaction.response.edit_message(
+                embed=_status_embed("Это действие не для тебя."),
+                view=BunkerPanelBackView(self.cog, self.game_id),
+            )
+            return
+        await self.cog.update_current_game_panel(interaction, game, screen="action")
 
 
 def _phase_label(state: GameState) -> str:
@@ -5839,7 +5874,7 @@ def _builder_tutorial_embed(screen: str, *, status: str | None = None) -> discor
         ),
         "usage": (
             "В приложении создай новый `.bunker-pack.json` или открой существующий файл. "
-            "Заполняй категории пака: профессии, возраст, здоровье, багаж, фобии, факты, события и другие поля. "
+            "Заполняй категории пака: профессии, имена, внешность, одежду, здоровье, багаж, крупный инвентарь, фобии, факты, события и другие поля. "
             "Сохрани результат как UTF-8 JSON с расширением `.bunker-pack.json`."
         ),
         "upload": (

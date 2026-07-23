@@ -23,8 +23,13 @@ class BunkerPackFormatTests(unittest.TestCase):
                 "professions": ["  Инженер  ", "Инженер", ""],
                 "ages": ["42 года"],
                 "genders": ["женщина"],
+                "names": ["Мария"],
+                "surnames": ["Морозова"],
+                "appearances": ["спокойное лицо"],
+                "clothing": ["рабочая куртка"],
                 "biology": ["может иметь детей"],
                 "items": ["Фильтр воды"],
+                "large_items": ["переносной генератор"],
             },
         )
 
@@ -38,8 +43,13 @@ class BunkerPackFormatTests(unittest.TestCase):
         self.assertEqual(parsed.content["professions"], ("Инженер",))
         self.assertEqual(parsed.content["ages"], ("42 года",))
         self.assertEqual(parsed.content["genders"], ("женщина",))
+        self.assertEqual(parsed.content["names"], ("Мария",))
+        self.assertEqual(parsed.content["surnames"], ("Морозова",))
+        self.assertEqual(parsed.content["appearances"], ("спокойное лицо",))
+        self.assertEqual(parsed.content["clothing"], ("рабочая куртка",))
         self.assertEqual(parsed.content["biology"], ("может иметь детей",))
         self.assertEqual(parsed.content["items"], ("Фильтр воды",))
+        self.assertEqual(parsed.content["large_items"], ("переносной генератор",))
         self.assertTrue(all(field in parsed.content for field in PACK_FIELDS))
 
     def test_legacy_named_content_payload_is_accepted(self) -> None:
